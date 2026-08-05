@@ -126,12 +126,12 @@ irm https://raw.githubusercontent.com/ix-infrastructure/ix-cursor-plugin/main/in
 
 The install script sets up everything for you on macOS and Linux. It checks for and installs anything that is missing:
 
-- Node.js 20 or newer
+- Node.js 22 or newer
 - Git
 - ripgrep (powers `ix text`)
 - Docker and Docker Compose (for the local backend)
 
-All you need beforehand is a terminal with `curl` (or `wget`). On Windows, install Node.js 20+ and Docker Desktop first, then run the installer.
+All you need beforehand is a terminal with `curl` (or `wget`). On Windows, install Node.js 22+ and Docker Desktop first, then run the installer.
 
 Works on macOS, Linux, and Windows, on both x86-64 and arm64.
 
