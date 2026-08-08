@@ -32,10 +32,10 @@ if (Test-Path "$ComposeDir\docker-compose.yml") {
             Write-Ok "Stopped backend and removed data"
         }
     } catch {
-        Write-Host "  (could not stop containers — Docker may not be running)"
+        Write-Host "  (could not stop containers - Docker may not be running)"
     }
 } else {
-    Write-Host "  (no backend found — skipping)"
+    Write-Host "  (no backend found - skipping)"
 }
 
 # ── 2. Remove CLI ───────────────────────────────────────────────────────────

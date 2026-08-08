@@ -134,11 +134,78 @@ if (Test-Healthy) {
     Write-Ok "Compose ready"
 
     Write-Host "Starting backend..."
-    docker compose -f "$composeFile" up -d --pull always
+
+    # Capture the compose output so a failed pull can be diagnosed instead of
+    # reported as a bare "Docker compose failed". Tee keeps it on screen too.
+    $pullLog = Join-Path $env:TEMP "ix-pull-$PID.log"
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        # ForEach-Object stringifies before Tee: on Windows PowerShell 5.1
+        # docker writes progress to stderr, and `2>&1` turns those lines into
+        # ErrorRecords, which the host renders as red NativeCommandError blocks
+        # even on a successful install. "$_" flattens them to plain strings;
+        # $LASTEXITCODE and docker's own text in the log are unaffected (the
+        # log actually gets cleaner -- PowerShell's error framing stops being
+        # written into it alongside docker's lines).
+        docker compose -f "$composeFile" up -d --pull always 2>&1 |
+            ForEach-Object { "$_" } |
+            Tee-Object -FilePath $pullLog
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
 
     if ($LASTEXITCODE -ne 0) {
+        $pullOut = ""
+        if (Test-Path $pullLog) { $pullOut = Get-Content $pullLog -Raw }
+        Remove-Item $pullLog -Force -ErrorAction SilentlyContinue
+
+        Write-Host ""
+        # Match 429 only where it is HTTP status text. A bare 429 also matches
+        # ordinary pull progress -- "429.4MB/1.02GB" -- which would send a GHCR
+        # denial to the Docker Hub branch and give exactly the wrong advice,
+        # the bug this whole change exists to fix. Both spellings are needed:
+        # Docker Hub's edge limiter can surface as "error parsing HTTP 429
+        # response body: ... Too Many Requests (HAP429)", which carries neither
+        # "toomanyrequests" nor a spaceless "429 Too Many Requests".
+        if ($pullOut -match "(?i)toomanyrequests|rate limit|429 too many requests|http 429") {
+            Write-Host "  +-------------------------------------------------------------+"
+            Write-Host "  |  Docker Hub rate-limited the pull.                          |"
+            Write-Host "  |                                                             |"
+            Write-Host "  |  Docker Hub limits unauthenticated pulls to 100 per 6hrs.   |"
+            Write-Host "  |  Sign in to Docker Hub (free account) to raise the limit:   |"
+            Write-Host "  |                                                             |"
+            Write-Host "  |    docker login                                             |"
+            Write-Host "  |                                                             |"
+            Write-Host "  |  Then re-run this installer.                                |"
+            Write-Host "  +-------------------------------------------------------------+"
+        } elseif ($pullOut -match "(?i)denied|unauthorized") {
+            Write-Host "  +-------------------------------------------------------------+"
+            Write-Host "  |  Docker was denied access to the Ix backend image.          |"
+            Write-Host "  |                                                             |"
+            Write-Host "  |  This image is public and needs no login. This error        |"
+            Write-Host "  |  usually means Docker is sending stale ghcr.io              |"
+            Write-Host "  |  credentials from an earlier login, and GHCR rejects        |"
+            Write-Host "  |  them instead of falling back to an anonymous pull.         |"
+            Write-Host "  |                                                             |"
+            Write-Host "  |    docker logout ghcr.io                                    |"
+            Write-Host "  |                                                             |"
+            Write-Host "  |  Then re-run this installer.                                |"
+            Write-Host "  +-------------------------------------------------------------+"
+        } else {
+            # Fail safe, the way install.sh already does: if neither pattern
+            # matched, show the output rather than swallowing it behind a bare
+            # "Docker compose failed". $pullLog is gone by here, so use $pullOut.
+            Write-Host "  Image pull failed. Error output:"
+            ($pullOut -split "`r?`n" | Select-Object -First 20) | ForEach-Object { Write-Host "  $_" }
+            Write-Host ""
+            Write-Host "  If Docker just started, it may need a moment - try again."
+        }
+
         Write-Err "Docker compose failed"
     }
+
+    Remove-Item $pullLog -Force -ErrorAction SilentlyContinue
 
     Write-Ok "Backend started"
 }

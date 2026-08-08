@@ -714,14 +714,35 @@ else
     echo ""
     if ! wait "$PULL_PID"; then
       echo ""
-      if grep -qi "toomanyrequests\|rate limit\|429\|unauthorized\|denied" "$PULL_LOG" 2>/dev/null; then
+      # Match 429 only where it is HTTP status text. A bare "429" also matches
+      # ordinary pull progress ("429.4MB/1.02GB") and hex layer IDs
+      # ("8f4291f2b1a0"), either of which would route a GHCR denial into the
+      # Docker Hub branch below and hand back exactly the wrong fix -- the bug
+      # this change exists to fix. Both spellings are needed: Docker Hub's edge
+      # limiter can surface as "error parsing HTTP 429 response body: ... Too
+      # Many Requests (HAP429)", carrying neither "toomanyrequests" nor a
+      # spaceless "429 Too Many Requests".
+      if grep -qi "toomanyrequests\|rate limit\|429 too many requests\|http 429" "$PULL_LOG" 2>/dev/null; then
         echo "  ┌─────────────────────────────────────────────────────────────┐"
-        echo "  │  Docker image pull was rate-limited or denied.              │"
+        echo "  │  Docker Hub rate-limited the pull.                          │"
         echo "  │                                                             │"
-        echo "  │  Docker Hub limits unauthenticated pulls to 100 per 6hrs.  │"
-        echo "  │  Sign in to Docker Hub (free account) to raise the limit:  │"
+        echo "  │  Docker Hub limits unauthenticated pulls to 100 per 6hrs.   │"
+        echo "  │  Sign in to Docker Hub (free account) to raise the limit:   │"
         echo "  │                                                             │"
         echo "  │    docker login                                             │"
+        echo "  │                                                             │"
+        echo "  │  Then re-run this installer.                                │"
+        echo "  └─────────────────────────────────────────────────────────────┘"
+      elif grep -qi "denied\|unauthorized" "$PULL_LOG" 2>/dev/null; then
+        echo "  ┌─────────────────────────────────────────────────────────────┐"
+        echo "  │  Docker was denied access to the Ix backend image.          │"
+        echo "  │                                                             │"
+        echo "  │  This image is public and needs no login. This error        │"
+        echo "  │  usually means Docker is sending stale ghcr.io              │"
+        echo "  │  credentials from an earlier login, and GHCR rejects        │"
+        echo "  │  them instead of falling back to an anonymous pull.         │"
+        echo "  │                                                             │"
+        echo "  │    docker logout ghcr.io                                    │"
         echo "  │                                                             │"
         echo "  │  Then re-run this installer.                                │"
         echo "  └─────────────────────────────────────────────────────────────┘"
