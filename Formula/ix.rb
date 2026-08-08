@@ -50,6 +50,11 @@ class Ix < Formula
   end
 
   test do
-    assert_match "Usage:", shell_output("#{bin}/ix --help")
+    # `ix --help` renders a custom help screen (buildHelpText) that has never
+    # contained the word "Usage:", so the previous assertion could only fail.
+    # --version is both stable and meaningful: the install step above syncs
+    # package.json to the formula version, so this proves the built CLI runs
+    # *and* that it is the version brew thinks it installed.
+    assert_match version.to_s, shell_output("#{bin}/ix --version")
   end
 end
