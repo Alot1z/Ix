@@ -1,19 +1,34 @@
-# Ix — System Prerequisites
+# System Prerequisites
+
+Everything the Ix installer checks for and installs, and the endpoints and
+directories it touches. Reference documentation — not a dependency manifest.
+
+> **Do not move this back to `requirements.txt`, and do not give it a `.txt` or
+> `.in` extension.**
+>
+> Every entry below is a *system* package — curl, git, node, docker, ripgrep —
+> and none is a PyPI dependency of this repo. While this file lived at
+> `requirements.txt`, GitHub's dependency graph parsed it as pip and recorded
+> nine phantom PyPI packages against the repo; seven of those (`arangodb`,
+> `docker`, `docker-compose`, `homebrew`, `node`, `npm`, `ripgrep`) are real
+> PyPI names owned by unrelated projects, so the SBOM asserted dependencies
+> that do not exist. The graph job then failed outright on
+> `ix-memory-layer==latest`, which pip cannot parse.
+>
+> The extension matters as much as the name: Dependabot's pip fetcher
+> enumerates `.txt` and `.in` files in the repo root *and one directory deep*,
+> then decides by filename or by whether every line parses as a requirement.
+> Keeping this as Markdown puts it outside that scan entirely, rather than
+> relying on one line staying unparseable.
+
+```
+# Ix — System Requirements
 #
 # Everything listed here is checked and installed by the install script:
 #   curl -fsSL https://ix-infra.com/install.sh | sh
 #
 # Fully automated on macOS and Linux.
 # Windows requires manual Docker Desktop install, then re-run.
-#
-# NOTE: this is documentation, not a pip manifest, and it is deliberately not
-# named requirements.txt. Everything below is a *system* package — curl, git,
-# node, docker, ripgrep — none of them PyPI ones. While this file was named
-# requirements.txt, GitHub's dependency graph parsed it as pip and recorded
-# nine phantom PyPI dependencies, several of which (docker, docker-compose,
-# npm) are real PyPI names belonging to unrelated projects. The graph update
-# then failed outright on "ix-memory-layer==latest", which pip cannot parse.
-# Please don't rename it back.
 #
 # ============================================================================
 #  STEP 0: System prerequisites (auto-installed if missing)
@@ -123,3 +138,4 @@ ripgrep>=13
 #
 # Wrapper: /usr/local/bin/ix (if writable) or ~/.local/bin/ix (fallback)
 # Ports: 8090 (Memory Layer), 8529 (ArangoDB) — localhost only
+```

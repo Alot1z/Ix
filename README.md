@@ -159,6 +159,8 @@ All you need beforehand is a terminal with `curl` (or `wget`). On Windows, insta
 
 Works on macOS, Linux, and Windows, on both x86-64 and arm64.
 
+For the full list, including the endpoints the installer reaches and the directories it creates, see [docs/prerequisites.md](docs/prerequisites.md).
+
 ## Supported Languages
 
 Ix parses and extracts symbols, calls, and imports across 26 languages, and recognizes several more config and data formats.
