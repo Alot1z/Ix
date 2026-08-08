@@ -107,10 +107,14 @@ if ($node) {
     # line, -match becomes the filter operator and leaves $Matches untouched --
     # which either throws on a null index, or silently reuses a stale $Matches
     # from the caller's scope, since README ships this as `irm ... | iex`.
-    $nodeVer = & node -v | Select-Object -First 1
-    # "$nodeVer", not [string]$nodeVer: the cast passes $null straight through
-    # to Match() and throws, which a node that exits printing nothing hits.
-    $nodeMatch = [regex]::Match("$nodeVer", '^v?(\d+)')
+    # @(...) rather than `| Select-Object -First 1`: -First halts the native
+    # command with StopUpstreamCommandsException, which loses $LASTEXITCODE on
+    # 7 and sets it to -1 on 5.1. Array-wrapping keeps the exit code, and
+    # yields "" rather than AutomationNull when node prints nothing -- casting
+    # AutomationNull to [string] hands Match() a real null, which throws.
+    $nodeLines = @(& node -v)
+    $nodeVer = if ($nodeLines.Count -gt 0) { $nodeLines[0] } else { "" }
+    $nodeMatch = [regex]::Match($nodeVer, '^v?(\d+)')
     if (-not $nodeMatch.Success) {
         Write-Err "Could not read the Node version (node -v printed '$nodeVer'). Ix requires Node $NodeMinMajor or newer: https://nodejs.org/"
     }
