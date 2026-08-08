@@ -12,7 +12,7 @@ import { fileURLToPath } from "url";
 // Runtime Node version guard. Runs before any command work so users on an
 // unsupported Node get an actionable message instead of a cryptic "fetch
 // failed" deep inside undici.
-const MIN_NODE_MAJOR = 20;
+const MIN_NODE_MAJOR = 22;
 {
   const current = process.versions.node;
   const major = parseInt(current.split(".")[0] ?? "0", 10);

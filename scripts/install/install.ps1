@@ -15,7 +15,7 @@ $IxBin = "$IxHome\bin"
 $ComposeDir = "$IxHome\backend"
 $HealthUrl = "http://localhost:8090/v1/health"
 $ArangoUrl = "http://localhost:8529/_api/version"
-$NodeMinMajor = 20
+$NodeMinMajor = 22
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -99,9 +99,32 @@ Write-Host "`n-- Node.js --"
 
 $node = Get-Command node -ErrorAction SilentlyContinue
 if ($node) {
-    Write-Ok "Node $(& node -v)"
+    # Actually enforce $NodeMinMajor. Until now this check was existence-only,
+    # so $NodeMinMajor was dead and a Windows user on an unsupported Node got
+    # through the installer cleanly, then hit the CLI's own runtime guard on
+    # their first `ix` command. install.sh has always enforced its floor.
+    # [regex]::Match rather than -match: if `node -v` ever prints more than one
+    # line, -match becomes the filter operator and leaves $Matches untouched --
+    # which either throws on a null index, or silently reuses a stale $Matches
+    # from the caller's scope, since README ships this as `irm ... | iex`.
+    # @(...) rather than `| Select-Object -First 1`: -First halts the native
+    # command with StopUpstreamCommandsException, which loses $LASTEXITCODE on
+    # 7 and sets it to -1 on 5.1. Array-wrapping keeps the exit code, and
+    # yields "" rather than AutomationNull when node prints nothing -- casting
+    # AutomationNull to [string] hands Match() a real null, which throws.
+    $nodeLines = @(& node -v)
+    $nodeVer = if ($nodeLines.Count -gt 0) { $nodeLines[0] } else { "" }
+    $nodeMatch = [regex]::Match($nodeVer, '^v?(\d+)')
+    if (-not $nodeMatch.Success) {
+        Write-Err "Could not read the Node version (node -v printed '$nodeVer'). Ix requires Node $NodeMinMajor or newer: https://nodejs.org/"
+    }
+    $nodeMajor = [int]$nodeMatch.Groups[1].Value
+    if ($nodeMajor -lt $NodeMinMajor) {
+        Write-Err "Node $nodeVer is too old. Ix requires Node $NodeMinMajor or newer: https://nodejs.org/"
+    }
+    Write-Ok "Node $nodeVer"
 } else {
-    Write-Err "Node not installed"
+    Write-Err "Node not installed. Ix requires Node $NodeMinMajor or newer: https://nodejs.org/"
 }
 
 # ── Docker ──

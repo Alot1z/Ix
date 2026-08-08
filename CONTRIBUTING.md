@@ -4,7 +4,7 @@
 
 ### Prerequisites
 
-- Node.js 20+
+- Node.js 22+
 - Docker and Docker Compose
 
 ### Local Setup
