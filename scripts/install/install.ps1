@@ -99,9 +99,18 @@ Write-Host "`n-- Node.js --"
 
 $node = Get-Command node -ErrorAction SilentlyContinue
 if ($node) {
-    Write-Ok "Node $(& node -v)"
+    # Actually enforce $NodeMinMajor. Until now this check was existence-only,
+    # so $NodeMinMajor was dead and a Windows user on an unsupported Node got
+    # through the installer cleanly, then hit the CLI's own runtime guard on
+    # their first `ix` command. install.sh has always enforced its floor.
+    $nodeVer = & node -v
+    $nodeMajor = if ($nodeVer -match '^v?(\d+)') { [int]$Matches[1] } else { 0 }
+    if ($nodeMajor -lt $NodeMinMajor) {
+        Write-Err "Node $nodeVer is too old. Ix requires Node $NodeMinMajor or newer: https://nodejs.org/"
+    }
+    Write-Ok "Node $nodeVer"
 } else {
-    Write-Err "Node not installed"
+    Write-Err "Node not installed. Ix requires Node $NodeMinMajor or newer: https://nodejs.org/"
 }
 
 # ── Docker ──
