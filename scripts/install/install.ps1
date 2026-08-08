@@ -103,8 +103,18 @@ if ($node) {
     # so $NodeMinMajor was dead and a Windows user on an unsupported Node got
     # through the installer cleanly, then hit the CLI's own runtime guard on
     # their first `ix` command. install.sh has always enforced its floor.
-    $nodeVer = & node -v
-    $nodeMajor = if ($nodeVer -match '^v?(\d+)') { [int]$Matches[1] } else { 0 }
+    # [regex]::Match rather than -match: if `node -v` ever prints more than one
+    # line, -match becomes the filter operator and leaves $Matches untouched --
+    # which either throws on a null index, or silently reuses a stale $Matches
+    # from the caller's scope, since README ships this as `irm ... | iex`.
+    $nodeVer = & node -v | Select-Object -First 1
+    # "$nodeVer", not [string]$nodeVer: the cast passes $null straight through
+    # to Match() and throws, which a node that exits printing nothing hits.
+    $nodeMatch = [regex]::Match("$nodeVer", '^v?(\d+)')
+    if (-not $nodeMatch.Success) {
+        Write-Err "Could not read the Node version (node -v printed '$nodeVer'). Ix requires Node $NodeMinMajor or newer: https://nodejs.org/"
+    }
+    $nodeMajor = [int]$nodeMatch.Groups[1].Value
     if ($nodeMajor -lt $NodeMinMajor) {
         Write-Err "Node $nodeVer is too old. Ix requires Node $NodeMinMajor or newer: https://nodejs.org/"
     }
