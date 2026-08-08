@@ -145,7 +145,9 @@ if (Test-Healthy) {
         # docker writes progress to stderr, and `2>&1` turns those lines into
         # ErrorRecords, which the host renders as red NativeCommandError blocks
         # even on a successful install. "$_" flattens them to plain strings;
-        # $LASTEXITCODE and the log contents are unaffected.
+        # $LASTEXITCODE and docker's own text in the log are unaffected (the
+        # log actually gets cleaner -- PowerShell's error framing stops being
+        # written into it alongside docker's lines).
         docker compose -f "$composeFile" up -d --pull always 2>&1 |
             ForEach-Object { "$_" } |
             Tee-Object -FilePath $pullLog
@@ -159,11 +161,14 @@ if (Test-Healthy) {
         Remove-Item $pullLog -Force -ErrorAction SilentlyContinue
 
         Write-Host ""
-        # Match "429" only as part of the HTTP status text. A bare 429 also
-        # matches ordinary pull progress -- "429.4MB/1.02GB" -- which would
-        # send a GHCR denial to the Docker Hub branch and give exactly the
-        # wrong advice, which is the bug this whole change exists to fix.
-        if ($pullOut -match "(?i)toomanyrequests|rate limit|429 too many requests") {
+        # Match 429 only where it is HTTP status text. A bare 429 also matches
+        # ordinary pull progress -- "429.4MB/1.02GB" -- which would send a GHCR
+        # denial to the Docker Hub branch and give exactly the wrong advice,
+        # the bug this whole change exists to fix. Both spellings are needed:
+        # Docker Hub's edge limiter can surface as "error parsing HTTP 429
+        # response body: ... Too Many Requests (HAP429)", which carries neither
+        # "toomanyrequests" nor a spaceless "429 Too Many Requests".
+        if ($pullOut -match "(?i)toomanyrequests|rate limit|429 too many requests|http 429") {
             Write-Host "  +-------------------------------------------------------------+"
             Write-Host "  |  Docker Hub rate-limited the pull.                          |"
             Write-Host "  |                                                             |"
@@ -187,6 +192,14 @@ if (Test-Healthy) {
             Write-Host "  |                                                             |"
             Write-Host "  |  Then re-run this installer.                                |"
             Write-Host "  +-------------------------------------------------------------+"
+        } else {
+            # Fail safe, the way install.sh already does: if neither pattern
+            # matched, show the output rather than swallowing it behind a bare
+            # "Docker compose failed". $pullLog is gone by here, so use $pullOut.
+            Write-Host "  Image pull failed. Error output:"
+            ($pullOut -split "`r?`n" | Select-Object -First 20) | ForEach-Object { Write-Host "  $_" }
+            Write-Host ""
+            Write-Host "  If Docker just started, it may need a moment - try again."
         }
 
         Write-Err "Docker compose failed"

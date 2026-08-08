@@ -714,11 +714,15 @@ else
     echo ""
     if ! wait "$PULL_PID"; then
       echo ""
-      # Match 429 only as HTTP status text. A bare "429" also matches ordinary
-      # pull progress ("429.4MB/1.02GB") and hex layer IDs ("8f4291f2b1a0"), any
-      # of which would route a GHCR denial into the Docker Hub branch below and
-      # hand back exactly the wrong fix -- the bug this change exists to fix.
-      if grep -qi "toomanyrequests\|rate limit\|429 too many requests" "$PULL_LOG" 2>/dev/null; then
+      # Match 429 only where it is HTTP status text. A bare "429" also matches
+      # ordinary pull progress ("429.4MB/1.02GB") and hex layer IDs
+      # ("8f4291f2b1a0"), either of which would route a GHCR denial into the
+      # Docker Hub branch below and hand back exactly the wrong fix -- the bug
+      # this change exists to fix. Both spellings are needed: Docker Hub's edge
+      # limiter can surface as "error parsing HTTP 429 response body: ... Too
+      # Many Requests (HAP429)", carrying neither "toomanyrequests" nor a
+      # spaceless "429 Too Many Requests".
+      if grep -qi "toomanyrequests\|rate limit\|429 too many requests\|http 429" "$PULL_LOG" 2>/dev/null; then
         echo "  ┌─────────────────────────────────────────────────────────────┐"
         echo "  │  Docker Hub rate-limited the pull.                          │"
         echo "  │                                                             │"
