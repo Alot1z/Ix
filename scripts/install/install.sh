@@ -459,7 +459,25 @@ install_docker() {
       ;;
     Linux)
       echo "  Installing Docker Engine via get.docker.com..."
-      _fetch https://get.docker.com | sh < /dev/null
+      # Download to a file instead of piping into `sh`. This installer is
+      # normally run as `curl ... | sh`, so commands get `< /dev/null` to stop
+      # them consuming the piped installer off stdin. On a *pipe into* `sh`
+      # that redirect wins over the pipe: sh read the install script from
+      # /dev/null, did nothing, and exited 0 — so Docker was never installed
+      # and the failure was silent. (The Homebrew call above is safe: it uses
+      # command substitution, not a pipe.)
+      get_docker=$(mktemp /tmp/get-docker-XXXXXX.sh)
+      if ! _download https://get.docker.com "$get_docker"; then
+        rm -f "$get_docker"
+        err "Could not download the Docker install script from get.docker.com.
+  Install Docker manually: https://docs.docker.com/engine/install/"
+      fi
+      if ! sh "$get_docker" < /dev/null; then
+        rm -f "$get_docker"
+        err "Docker Engine install failed.
+  Install Docker manually: https://docs.docker.com/engine/install/"
+      fi
+      rm -f "$get_docker"
       if ! id -nG "$USER" 2>/dev/null | grep -qw docker; then
         echo "  Adding $USER to the docker group..."
         sudo usermod -aG docker "$USER" < /dev/null 2>/dev/null || true
