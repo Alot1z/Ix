@@ -32,6 +32,28 @@
 
 <br/>
 
+## What Ix is
+
+**Ix is a command-line tool that turns a codebase into a queryable map.**
+
+It parses your repository with [tree-sitter](https://tree-sitter.github.io/) across 26
+languages and builds a graph of the symbols, calls and imports it finds, stored in a
+local backend (ArangoDB, run for you via Docker). You and your AI assistant then ask
+bounded, structural questions instead of grepping and guessing:
+
+```bash
+ix map .                      # build the graph for this repo
+ix explain IngestionService   # what is this, and what does it touch?
+ix impact verify_token        # what breaks if I change this?
+ix trace user_login_flow      # how does this actually flow?
+```
+
+The graph lives on your machine, and it persists — so context survives between
+sessions, and your assistant can navigate a real map of your system instead of
+re-deriving it from whatever fits in a prompt.
+
+<br/>
+
 ## Sign up for Kartr
 
 We built Kartr on top of this technology.
@@ -163,6 +185,20 @@ have no pre-built package — install with Homebrew, which builds from
 source: `brew tap ix-infrastructure/ix https://github.com/ix-infrastructure/Ix && brew install ix`.
 
 For the full list, including the endpoints the installer reaches and the directories it creates, see [docs/prerequisites.md](docs/prerequisites.md).
+
+## Troubleshooting
+
+Ix talks to a backend that runs locally in Docker, so most first-run problems are the
+backend not being up yet:
+
+```bash
+ix status          # is the backend reachable?
+ix docker start    # start the backend (ArangoDB + memory layer)
+ix doctor          # check system health — server, database, graph integrity
+```
+
+If a command reports `Ix backend not reachable`, run `ix docker start` and try again.
+Set `IX_DEBUG=1` to get full stack traces on any error.
 
 ## Supported Languages
 
