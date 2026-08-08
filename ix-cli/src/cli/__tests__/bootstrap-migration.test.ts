@@ -40,12 +40,23 @@ function writeConfig(workspaces: object[]) {
     workspaces.map((w: any) =>
       `  - workspace_id: "${w.workspace_id}"\n    workspace_name: ${w.workspace_name}\n    root_path: ${w.root_path}\n    default: ${w.default ?? false}\n`).join("");
 
-  // Enforce it rather than trusting the template: an unquoted id reintroduces
-  // a 1-in-60 heisenbug, and this turns that into a deterministic failure.
-  const parsed = parse(body) as { workspaces?: { workspace_id: unknown }[] };
+  // Enforce it rather than trusting the template. Two checks, deliberately:
+  //
+  // The text check fires 100% of the time, because it does not depend on which
+  // id this run's temp path happened to produce. Checking only the parsed value
+  // would reproduce the bug's own trigger condition and so fire at the same
+  // ~1.6% -- self-diagnosing when it happens, but still a heisenbug.
+  workspaces.forEach((w: any) => {
+    expect(body, "workspace_id must be quoted in the fixture").toContain(`workspace_id: "${w.workspace_id}"`);
+  });
+
+  // And the parse check, which catches the wider class: any field whose value
+  // YAML would reinterpret (a workspace_name of `true`, `007` or `null`).
+  const parsed = parse(body) as { workspaces?: { workspace_id: unknown; workspace_name: unknown }[] };
   (parsed.workspaces ?? []).forEach((w, i) => {
     expect(typeof w.workspace_id, "workspace_id must survive YAML as a string").toBe("string");
     expect(w.workspace_id).toBe((workspaces[i] as any).workspace_id);
+    expect(String(w.workspace_name)).toBe(String((workspaces[i] as any).workspace_name));
   });
 
   fs.writeFileSync(nodePath.join(home, ".ix", "config.yaml"), body);
