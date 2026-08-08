@@ -63,7 +63,22 @@ async function fetchLatestRelease(repo: string): Promise<string | null> {
 function readCache(): VersionCache | null {
   try {
     if (!existsSync(VERSION_CACHE)) return null;
-    return JSON.parse(readFileSync(VERSION_CACHE, "utf-8"));
+    const parsed = JSON.parse(readFileSync(VERSION_CACHE, "utf-8"));
+    // JSON.parse only proves it is JSON, not that it is *this* shape. A cache
+    // file holding `{"latest": 123}` used to reach isNewer() and throw
+    // "latest.split is not a function", which surfaced as a successful command
+    // exiting 1. Every field that reaches isNewer() has to be checked, not just
+    // `latest` — the optional two get there behind a bare truthiness test.
+    const optionalString = (v: unknown) => v === undefined || typeof v === "string";
+    if (
+      typeof parsed?.latest !== "string" ||
+      typeof parsed?.checkedAt !== "number" ||
+      !optionalString(parsed.compassLatest) ||
+      !optionalString(parsed.backendLatest)
+    ) {
+      return null;
+    }
+    return parsed as VersionCache;
   } catch {
     return null;
   }
@@ -163,6 +178,11 @@ export async function checkForUpdate(): Promise<void> {
     if (hasCliUpdate || hasCompassUpdate || hasBackendUpdate) {
       printUpdateNotice(current, latest, !!hasCompassUpdate, !!hasBackendUpdate);
     }
+  }).catch(() => {
+    // Best-effort background check: it must never affect the command the user
+    // actually ran. Without this catch the floating promise would reach the
+    // process-level unhandledRejection handler and abort an otherwise
+    // successful command.
   });
 }
 
