@@ -29,11 +29,12 @@ afterEach(() => {
 
 function writeConfig(workspaces: object[]) {
   // workspace_id MUST be quoted. It is 8 hex chars, so ~3.7% of ids are
-  // numeric-looking to YAML. loadConfig's String() normalization recovers the
-  // plain-integer ones, but not the other ~1.6% — "709e7420" parses as
-  // Infinity, "01311916" as 1311916 — because the original text is gone once
-  // the parser has coerced the value. An unquoted fixture then fires a
-  // spurious migration and fails "does NOT migrate" at that 1.6%.
+  // numeric-looking to YAML. loadConfig's String() normalization round-trips
+  // an integer that reprints identically ("12345678"), but not the other
+  // ~1.6% — "709e7420" parses as Infinity, and "01311916" comes back 1311916
+  // with the leading zero gone — because the original text is lost once the
+  // parser has coerced the value. An unquoted fixture then fires a spurious
+  // migration and fails "does NOT migrate" at that 1.6%.
   // saveConfig (yaml.stringify) quotes these for real, so quoting here is
   // also what makes the fixture faithful to a config the CLI actually wrote.
   const body = "endpoint: http://localhost:8090\n" +
