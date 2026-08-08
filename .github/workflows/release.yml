@@ -300,7 +300,14 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
         run: |
           TAG="${INPUT_TAG:-$REF_NAME}"
-          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          VERSION="${TAG#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          # A semver pre-release identifier (0.9.0-rc.1, 1.0.0-beta.2) marks this
+          # as not-for-general-consumption. Everything below keys off it.
+          case "$VERSION" in
+            *-*) echo "prerelease=true"  >> "$GITHUB_OUTPUT" ;;
+            *)   echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
 
       - name: Download all platform tarballs
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -319,6 +326,14 @@ jobs:
         with:
           tag_name: v${{ steps.version.outputs.version }}
           generate_release_notes: true
+          # Without these, a v0.9.0-rc.1 tag publishes as a normal release and
+          # becomes "latest" — and both install.sh's resolve_version() and the
+          # CLI's checkForUpdate() read /releases/latest, so an RC would install
+          # itself onto every new user and prompt every existing one to upgrade
+          # to it. GitHub excludes prereleases from /releases/latest, so this is
+          # what makes a release-candidate tag safe to push at all.
+          prerelease: ${{ steps.version.outputs.prerelease }}
+          make_latest: ${{ steps.version.outputs.prerelease == 'false' }}
           body: |
             ## Install
 
@@ -348,6 +363,9 @@ jobs:
             _artifacts/*.sbom.spdx.json
 
       - name: Update Homebrew formula
+        # Never point the formula at a release candidate — `brew install ix`
+        # should track stable versions only.
+        if: ${{ steps.version.outputs.prerelease == 'false' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
