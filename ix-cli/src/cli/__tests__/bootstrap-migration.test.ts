@@ -28,11 +28,12 @@ afterEach(() => {
 });
 
 function writeConfig(workspaces: object[]) {
-  // workspace_id MUST be quoted. It is 8 hex chars, so ~1.6% of ids are
-  // numeric-looking to YAML — "709e7420" parses as Infinity, "01311916" as
-  // 1311916 — and loadConfig's String() normalization cannot recover the
-  // original text once the parser has coerced it. An unquoted fixture then
-  // fires a spurious migration and fails "does NOT migrate" at that rate.
+  // workspace_id MUST be quoted. It is 8 hex chars, so ~3.7% of ids are
+  // numeric-looking to YAML. loadConfig's String() normalization recovers the
+  // plain-integer ones, but not the other ~1.6% — "709e7420" parses as
+  // Infinity, "01311916" as 1311916 — because the original text is gone once
+  // the parser has coerced the value. An unquoted fixture then fires a
+  // spurious migration and fails "does NOT migrate" at that 1.6%.
   // saveConfig (yaml.stringify) quotes these for real, so quoting here is
   // also what makes the fixture faithful to a config the CLI actually wrote.
   const body = "endpoint: http://localhost:8090\n" +
@@ -44,19 +45,23 @@ function writeConfig(workspaces: object[]) {
   //
   // The text check fires 100% of the time, because it does not depend on which
   // id this run's temp path happened to produce. Checking only the parsed value
-  // would reproduce the bug's own trigger condition and so fire at the same
-  // ~1.6% -- self-diagnosing when it happens, but still a heisenbug.
+  // would fire solely on ids YAML coerces -- self-diagnosing when it happens,
+  // but still a heisenbug, and silent on the run that reintroduces the quoting
+  // mistake.
   workspaces.forEach((w: any) => {
     expect(body, "workspace_id must be quoted in the fixture").toContain(`workspace_id: "${w.workspace_id}"`);
   });
 
   // And the parse check, which catches the wider class: any field whose value
   // YAML would reinterpret (a workspace_name of `true`, `007` or `null`).
+  // Compared strictly, NOT via String() on both sides -- that would cancel out
+  // exactly the boolean and null coercions, the ones with real consequences,
+  // since loadConfig normalizes workspace_id but never workspace_name.
   const parsed = parse(body) as { workspaces?: { workspace_id: unknown; workspace_name: unknown }[] };
   (parsed.workspaces ?? []).forEach((w, i) => {
     expect(typeof w.workspace_id, "workspace_id must survive YAML as a string").toBe("string");
     expect(w.workspace_id).toBe((workspaces[i] as any).workspace_id);
-    expect(String(w.workspace_name)).toBe(String((workspaces[i] as any).workspace_name));
+    expect(w.workspace_name, "workspace_name must survive YAML unchanged").toBe((workspaces[i] as any).workspace_name);
   });
 
   fs.writeFileSync(nodePath.join(home, ".ix", "config.yaml"), body);
