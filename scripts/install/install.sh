@@ -497,7 +497,10 @@ install_docker() {
         compose_arch="x86_64"
         if [ "$(uname -m)" = "aarch64" ]; then compose_arch="aarch64"; fi
         compose_url="https://github.com/docker/compose/releases/latest/download/docker-compose-linux-${compose_arch}"
-        sudo mkdir -p /usr/local/lib/docker/cli-plugins
+        if ! sudo mkdir -p /usr/local/lib/docker/cli-plugins; then
+          err "Could not create /usr/local/lib/docker/cli-plugins.
+  Install Docker Compose manually: https://docs.docker.com/compose/install/linux/"
+        fi
         # `_download` is a shell function, so it cannot be run through sudo:
         # sudo execs a program and functions do not survive the exec, so this
         # died with "sudo: _download: command not found". Fetch as the current
@@ -778,7 +781,8 @@ else
 
     # Start services
     printf "  Starting backend services..."
-    START_LOG=$(mktemp /tmp/ix-start-XXXXXX) || err "Could not create a temporary file for the startup log."
+    # The printf above left the cursor mid-line, so break it before erroring.
+    START_LOG=$(mktemp /tmp/ix-start-XXXXXX) || { echo ""; err "Could not create a temporary file for the startup log."; }
     if ! dc -f "$COMPOSE_DIR/docker-compose.yml" up -d < /dev/null >"$START_LOG" 2>&1; then
       echo ""
       echo "  Failed to start backend. Error output:"
