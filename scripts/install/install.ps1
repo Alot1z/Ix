@@ -141,7 +141,13 @@ if (Test-Healthy) {
     $prevEap = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
+        # ForEach-Object stringifies before Tee: on Windows PowerShell 5.1
+        # docker writes progress to stderr, and `2>&1` turns those lines into
+        # ErrorRecords, which the host renders as red NativeCommandError blocks
+        # even on a successful install. "$_" flattens them to plain strings;
+        # $LASTEXITCODE and the log contents are unaffected.
         docker compose -f "$composeFile" up -d --pull always 2>&1 |
+            ForEach-Object { "$_" } |
             Tee-Object -FilePath $pullLog
     } finally {
         $ErrorActionPreference = $prevEap
@@ -153,30 +159,34 @@ if (Test-Healthy) {
         Remove-Item $pullLog -Force -ErrorAction SilentlyContinue
 
         Write-Host ""
-        if ($pullOut -match "(?i)toomanyrequests|rate limit|\b429\b") {
-            Write-Host "  ┌─────────────────────────────────────────────────────────────┐"
-            Write-Host "  │  Docker Hub rate-limited the pull.                          │"
-            Write-Host "  │                                                             │"
-            Write-Host "  │  Docker Hub limits unauthenticated pulls to 100 per 6hrs.   │"
-            Write-Host "  │  Sign in to Docker Hub (free account) to raise the limit:   │"
-            Write-Host "  │                                                             │"
-            Write-Host "  │    docker login                                             │"
-            Write-Host "  │                                                             │"
-            Write-Host "  │  Then re-run this installer.                                │"
-            Write-Host "  └─────────────────────────────────────────────────────────────┘"
+        # Match "429" only as part of the HTTP status text. A bare 429 also
+        # matches ordinary pull progress -- "429.4MB/1.02GB" -- which would
+        # send a GHCR denial to the Docker Hub branch and give exactly the
+        # wrong advice, which is the bug this whole change exists to fix.
+        if ($pullOut -match "(?i)toomanyrequests|rate limit|429 too many requests") {
+            Write-Host "  +-------------------------------------------------------------+"
+            Write-Host "  |  Docker Hub rate-limited the pull.                          |"
+            Write-Host "  |                                                             |"
+            Write-Host "  |  Docker Hub limits unauthenticated pulls to 100 per 6hrs.   |"
+            Write-Host "  |  Sign in to Docker Hub (free account) to raise the limit:   |"
+            Write-Host "  |                                                             |"
+            Write-Host "  |    docker login                                             |"
+            Write-Host "  |                                                             |"
+            Write-Host "  |  Then re-run this installer.                                |"
+            Write-Host "  +-------------------------------------------------------------+"
         } elseif ($pullOut -match "(?i)denied|unauthorized") {
-            Write-Host "  ┌─────────────────────────────────────────────────────────────┐"
-            Write-Host "  │  Docker was denied access to the Ix backend image.          │"
-            Write-Host "  │                                                             │"
-            Write-Host "  │  This image is public and needs no login. This error        │"
-            Write-Host "  │  usually means Docker is sending stale ghcr.io              │"
-            Write-Host "  │  credentials from an earlier login, and GHCR rejects        │"
-            Write-Host "  │  them instead of falling back to an anonymous pull.         │"
-            Write-Host "  │                                                             │"
-            Write-Host "  │    docker logout ghcr.io                                    │"
-            Write-Host "  │                                                             │"
-            Write-Host "  │  Then re-run this installer.                                │"
-            Write-Host "  └─────────────────────────────────────────────────────────────┘"
+            Write-Host "  +-------------------------------------------------------------+"
+            Write-Host "  |  Docker was denied access to the Ix backend image.          |"
+            Write-Host "  |                                                             |"
+            Write-Host "  |  This image is public and needs no login. This error        |"
+            Write-Host "  |  usually means Docker is sending stale ghcr.io              |"
+            Write-Host "  |  credentials from an earlier login, and GHCR rejects        |"
+            Write-Host "  |  them instead of falling back to an anonymous pull.         |"
+            Write-Host "  |                                                             |"
+            Write-Host "  |    docker logout ghcr.io                                    |"
+            Write-Host "  |                                                             |"
+            Write-Host "  |  Then re-run this installer.                                |"
+            Write-Host "  +-------------------------------------------------------------+"
         }
 
         Write-Err "Docker compose failed"
