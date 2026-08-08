@@ -509,7 +509,11 @@ install_docker() {
           err "Could not download the Docker Compose plugin.
   Install it manually: https://docs.docker.com/compose/install/linux/"
         fi
-        sudo install -m 0755 "$compose_bin" /usr/local/lib/docker/cli-plugins/docker-compose
+        if ! sudo install -m 0755 "$compose_bin" /usr/local/lib/docker/cli-plugins/docker-compose; then
+          rm -f "$compose_bin"
+          err "Could not install the Docker Compose plugin.
+  Install it manually: https://docs.docker.com/compose/install/linux/"
+        fi
         rm -f "$compose_bin"
       fi
       ;;
@@ -739,7 +743,7 @@ else
 
     # Pull images first so we catch rate limits / auth errors clearly
     echo "  Pulling Docker images (this may take a few minutes on first run)..."
-    PULL_LOG=$(mktemp /tmp/ix-pull-XXXXXX.log)
+    PULL_LOG=$(mktemp /tmp/ix-pull-XXXXXX) || err "Could not create a temporary file for the image pull log."
     dc -f "$COMPOSE_DIR/docker-compose.yml" pull < /dev/null >"$PULL_LOG" 2>&1 &
     PULL_PID=$!
     while kill -0 "$PULL_PID" 2>/dev/null; do
@@ -774,7 +778,7 @@ else
 
     # Start services
     printf "  Starting backend services..."
-    START_LOG=$(mktemp /tmp/ix-start-XXXXXX.log)
+    START_LOG=$(mktemp /tmp/ix-start-XXXXXX) || err "Could not create a temporary file for the startup log."
     if ! dc -f "$COMPOSE_DIR/docker-compose.yml" up -d < /dev/null >"$START_LOG" 2>&1; then
       echo ""
       echo "  Failed to start backend. Error output:"
