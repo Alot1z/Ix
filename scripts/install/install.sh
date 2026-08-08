@@ -466,7 +466,13 @@ install_docker() {
       # /dev/null, did nothing, and exited 0 — so Docker was never installed
       # and the failure was silent. (The Homebrew call above is safe: it uses
       # command substitution, not a pipe.)
-      get_docker=$(mktemp /tmp/get-docker-XXXXXX.sh)
+      # No `.sh` suffix on the template: BusyBox mktemp (Alpine) passes the
+      # template straight to mkstemp() and rejects anything not ending in
+      # XXXXXX. `sh FILE` does not care about the extension. Handle a mktemp
+      # failure explicitly too — under `set -e` it would otherwise abort with
+      # just "mktemp: Invalid argument" and no hint at which step died.
+      get_docker=$(mktemp /tmp/get-docker-XXXXXX) || err "Could not create a temporary file for the Docker install script.
+  Install Docker manually: https://docs.docker.com/engine/install/"
       if ! _download https://get.docker.com "$get_docker"; then
         rm -f "$get_docker"
         err "Could not download the Docker install script from get.docker.com.
@@ -492,8 +498,19 @@ install_docker() {
         if [ "$(uname -m)" = "aarch64" ]; then compose_arch="aarch64"; fi
         compose_url="https://github.com/docker/compose/releases/latest/download/docker-compose-linux-${compose_arch}"
         sudo mkdir -p /usr/local/lib/docker/cli-plugins
-        sudo _download "$compose_url" /usr/local/lib/docker/cli-plugins/docker-compose
-        sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+        # `_download` is a shell function, so it cannot be run through sudo:
+        # sudo execs a program and functions do not survive the exec, so this
+        # died with "sudo: _download: command not found". Fetch as the current
+        # user, then place the binary with sudo.
+        compose_bin=$(mktemp /tmp/docker-compose-XXXXXX) || err "Could not create a temporary file for the Docker Compose plugin.
+  Install it manually: https://docs.docker.com/compose/install/linux/"
+        if ! _download "$compose_url" "$compose_bin"; then
+          rm -f "$compose_bin"
+          err "Could not download the Docker Compose plugin.
+  Install it manually: https://docs.docker.com/compose/install/linux/"
+        fi
+        sudo install -m 0755 "$compose_bin" /usr/local/lib/docker/cli-plugins/docker-compose
+        rm -f "$compose_bin"
       fi
       ;;
     MINGW*|MSYS*|CYGWIN*)
