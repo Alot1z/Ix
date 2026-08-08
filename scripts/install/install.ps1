@@ -134,11 +134,55 @@ if (Test-Healthy) {
     Write-Ok "Compose ready"
 
     Write-Host "Starting backend..."
-    docker compose -f "$composeFile" up -d --pull always
+
+    # Capture the compose output so a failed pull can be diagnosed instead of
+    # reported as a bare "Docker compose failed". Tee keeps it on screen too.
+    $pullLog = Join-Path $env:TEMP "ix-pull-$PID.log"
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        docker compose -f "$composeFile" up -d --pull always 2>&1 |
+            Tee-Object -FilePath $pullLog
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
 
     if ($LASTEXITCODE -ne 0) {
+        $pullOut = ""
+        if (Test-Path $pullLog) { $pullOut = Get-Content $pullLog -Raw }
+        Remove-Item $pullLog -Force -ErrorAction SilentlyContinue
+
+        Write-Host ""
+        if ($pullOut -match "(?i)toomanyrequests|rate limit|\b429\b") {
+            Write-Host "  ┌─────────────────────────────────────────────────────────────┐"
+            Write-Host "  │  Docker Hub rate-limited the pull.                          │"
+            Write-Host "  │                                                             │"
+            Write-Host "  │  Docker Hub limits unauthenticated pulls to 100 per 6hrs.   │"
+            Write-Host "  │  Sign in to Docker Hub (free account) to raise the limit:   │"
+            Write-Host "  │                                                             │"
+            Write-Host "  │    docker login                                             │"
+            Write-Host "  │                                                             │"
+            Write-Host "  │  Then re-run this installer.                                │"
+            Write-Host "  └─────────────────────────────────────────────────────────────┘"
+        } elseif ($pullOut -match "(?i)denied|unauthorized") {
+            Write-Host "  ┌─────────────────────────────────────────────────────────────┐"
+            Write-Host "  │  Docker was denied access to the Ix backend image.          │"
+            Write-Host "  │                                                             │"
+            Write-Host "  │  This image is public and needs no login. This error        │"
+            Write-Host "  │  usually means Docker is sending stale ghcr.io              │"
+            Write-Host "  │  credentials from an earlier login, and GHCR rejects        │"
+            Write-Host "  │  them instead of falling back to an anonymous pull.         │"
+            Write-Host "  │                                                             │"
+            Write-Host "  │    docker logout ghcr.io                                    │"
+            Write-Host "  │                                                             │"
+            Write-Host "  │  Then re-run this installer.                                │"
+            Write-Host "  └─────────────────────────────────────────────────────────────┘"
+        }
+
         Write-Err "Docker compose failed"
     }
+
+    Remove-Item $pullLog -Force -ErrorAction SilentlyContinue
 
     Write-Ok "Backend started"
 }
