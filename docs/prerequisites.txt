@@ -1,10 +1,19 @@
-# Ix — System Requirements
+# Ix — System Prerequisites
 #
 # Everything listed here is checked and installed by the install script:
 #   curl -fsSL https://ix-infra.com/install.sh | sh
 #
 # Fully automated on macOS and Linux.
 # Windows requires manual Docker Desktop install, then re-run.
+#
+# NOTE: this is documentation, not a pip manifest, and it is deliberately not
+# named requirements.txt. Everything below is a *system* package — curl, git,
+# node, docker, ripgrep — none of them PyPI ones. While this file was named
+# requirements.txt, GitHub's dependency graph parsed it as pip and recorded
+# nine phantom PyPI dependencies, several of which (docker, docker-compose,
+# npm) are real PyPI names belonging to unrelated projects. The graph update
+# then failed outright on "ix-memory-layer==latest", which pip cannot parse.
+# Please don't rename it back.
 #
 # ============================================================================
 #  STEP 0: System prerequisites (auto-installed if missing)
