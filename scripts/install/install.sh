@@ -459,7 +459,31 @@ install_docker() {
       ;;
     Linux)
       echo "  Installing Docker Engine via get.docker.com..."
-      _fetch https://get.docker.com | sh < /dev/null
+      # Download to a file instead of piping into `sh`. This installer is
+      # normally run as `curl ... | sh`, so commands get `< /dev/null` to stop
+      # them consuming the piped installer off stdin. On a *pipe into* `sh`
+      # that redirect wins over the pipe: sh read the install script from
+      # /dev/null, did nothing, and exited 0 — so Docker was never installed
+      # and the failure was silent. (The Homebrew call above is safe: it uses
+      # command substitution, not a pipe.)
+      # No `.sh` suffix on the template: BusyBox mktemp (Alpine) passes the
+      # template straight to mkstemp() and rejects anything not ending in
+      # XXXXXX. `sh FILE` does not care about the extension. Handle a mktemp
+      # failure explicitly too — under `set -e` it would otherwise abort with
+      # just "mktemp: Invalid argument" and no hint at which step died.
+      get_docker=$(mktemp /tmp/get-docker-XXXXXX) || err "Could not create a temporary file for the Docker install script.
+  Install Docker manually: https://docs.docker.com/engine/install/"
+      if ! _download https://get.docker.com "$get_docker"; then
+        rm -f "$get_docker"
+        err "Could not download the Docker install script from get.docker.com.
+  Install Docker manually: https://docs.docker.com/engine/install/"
+      fi
+      if ! sh "$get_docker" < /dev/null; then
+        rm -f "$get_docker"
+        err "Docker Engine install failed.
+  Install Docker manually: https://docs.docker.com/engine/install/"
+      fi
+      rm -f "$get_docker"
       if ! id -nG "$USER" 2>/dev/null | grep -qw docker; then
         echo "  Adding $USER to the docker group..."
         sudo usermod -aG docker "$USER" < /dev/null 2>/dev/null || true
@@ -473,9 +497,27 @@ install_docker() {
         compose_arch="x86_64"
         if [ "$(uname -m)" = "aarch64" ]; then compose_arch="aarch64"; fi
         compose_url="https://github.com/docker/compose/releases/latest/download/docker-compose-linux-${compose_arch}"
-        sudo mkdir -p /usr/local/lib/docker/cli-plugins
-        sudo _download "$compose_url" /usr/local/lib/docker/cli-plugins/docker-compose
-        sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+        if ! sudo mkdir -p /usr/local/lib/docker/cli-plugins; then
+          err "Could not create /usr/local/lib/docker/cli-plugins.
+  Install Docker Compose manually: https://docs.docker.com/compose/install/linux/"
+        fi
+        # `_download` is a shell function, so it cannot be run through sudo:
+        # sudo execs a program and functions do not survive the exec, so this
+        # died with "sudo: _download: command not found". Fetch as the current
+        # user, then place the binary with sudo.
+        compose_bin=$(mktemp /tmp/docker-compose-XXXXXX) || err "Could not create a temporary file for the Docker Compose plugin.
+  Install it manually: https://docs.docker.com/compose/install/linux/"
+        if ! _download "$compose_url" "$compose_bin"; then
+          rm -f "$compose_bin"
+          err "Could not download the Docker Compose plugin.
+  Install it manually: https://docs.docker.com/compose/install/linux/"
+        fi
+        if ! sudo install -m 0755 "$compose_bin" /usr/local/lib/docker/cli-plugins/docker-compose; then
+          rm -f "$compose_bin"
+          err "Could not install the Docker Compose plugin.
+  Install it manually: https://docs.docker.com/compose/install/linux/"
+        fi
+        rm -f "$compose_bin"
       fi
       ;;
     MINGW*|MSYS*|CYGWIN*)
@@ -704,7 +746,7 @@ else
 
     # Pull images first so we catch rate limits / auth errors clearly
     echo "  Pulling Docker images (this may take a few minutes on first run)..."
-    PULL_LOG=$(mktemp /tmp/ix-pull-XXXXXX.log)
+    PULL_LOG=$(mktemp /tmp/ix-pull-XXXXXX) || err "Could not create a temporary file for the image pull log."
     dc -f "$COMPOSE_DIR/docker-compose.yml" pull < /dev/null >"$PULL_LOG" 2>&1 &
     PULL_PID=$!
     while kill -0 "$PULL_PID" 2>/dev/null; do
@@ -760,7 +802,8 @@ else
 
     # Start services
     printf "  Starting backend services..."
-    START_LOG=$(mktemp /tmp/ix-start-XXXXXX.log)
+    # The printf above left the cursor mid-line, so break it before erroring.
+    START_LOG=$(mktemp /tmp/ix-start-XXXXXX) || { echo ""; err "Could not create a temporary file for the startup log."; }
     if ! dc -f "$COMPOSE_DIR/docker-compose.yml" up -d < /dev/null >"$START_LOG" 2>&1; then
       echo ""
       echo "  Failed to start backend. Error output:"
