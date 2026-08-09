@@ -11,6 +11,7 @@ import { ingestFiles } from "./ingest.js";
 import { detectSystem } from "../system.js";
 import { getRemoteRunner, isCloudReady } from "../remote.js";
 import { acquireMapLock } from "../single-flight.js";
+import { canRenderProgress } from "../stderr.js";
 
 // Hard wall-clock budget for a single `ix map`. Past this, the shared deadline
 // signal aborts every in-flight request and the command exits, so a single
@@ -275,7 +276,10 @@ Examples:
 
       const mapBarWidth = 25;
       const mapStart    = performance.now();
-      const mapInterval = (!machineFormat && !silent) ? setInterval(() => {
+      // Same gate as the ingest bar: --silent and the machine formats were the
+      // only ways to avoid this, and neither is available to something merely
+      // capturing normal output.
+      const mapInterval = (!machineFormat && !silent && canRenderProgress()) ? setInterval(() => {
         const elapsed  = performance.now() - mapStart;
         const pct      = 1 - Math.exp(-elapsed / 4000);
         const filled   = Math.round(pct * mapBarWidth);
