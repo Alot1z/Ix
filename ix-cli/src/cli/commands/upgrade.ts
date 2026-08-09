@@ -431,30 +431,110 @@ export function installStagedTree(
  *
  * Throws with the working compass still in place.
  */
+export interface TarAttempt {
+  bin: string;
+  file: string;
+  dest: string;
+}
+
+/**
+ * Windows' own bsdtar, or null if this box predates it.
+ *
+ * Present since Windows 10 1803. It takes native paths and is not reached
+ * through any MSYS argument rewriting, so it is the one combination on Windows
+ * that cannot be mismatched.
+ */
+export function systemTarPath(
+  env: NodeJS.ProcessEnv = process.env,
+  exists: (p: string) => boolean = existsSync
+): string | null {
+  const root = env.SystemRoot || env.windir;
+  if (!root) return null;
+  const candidate = join(root, "System32", "tar.exe");
+  return exists(candidate) ? candidate : null;
+}
+
+/**
+ * The ways to invoke tar, best first, as matched (binary, path-form) pairs.
+ *
+ * The binary and the shape of the paths handed to it have to be chosen
+ * together, and they used to be decided independently: the paths were rewritten
+ * to Cygwin form whenever `cygpath` existed, while the binary was left to
+ * whatever PATH resolved. Git for Windows supplies `cygpath`, and Windows 10
+ * 1803+ supplies System32\tar.exe, so on an ordinary Windows dev box the
+ * rewrite happened and then bsdtar — which has never heard of `/cygdrive/c` —
+ * was asked to open the result:
+ *
+ *     tar: Error opening archive: Failed to open '/cygdrive/c/Users/...'
+ *
+ * So: prefer the system tar with native paths, which is unambiguous. Fall back
+ * to PATH tar with native paths, then to PATH tar with converted paths for a
+ * genuine MSYS-only environment. Trying rather than detecting, because "which
+ * tar is this" has no reliable answer and the cost of being wrong is one failed
+ * extract into a scratch directory.
+ */
+export function cygpathToUnix(windowsPath: string): string | null {
+  try {
+    const converted = execFileSync("cygpath", ["-u", windowsPath], { encoding: "utf-8" }).trim();
+    return converted || null;
+  } catch {
+    // No cygpath: there is no MSYS tar to need the converted form either.
+    return null;
+  }
+}
+
+export function tarAttempts(
+  tarPath: string,
+  destDir: string,
+  // Injectable so the ordering can be tested off Windows, where cygpath does
+  // not exist and every attempt would otherwise collapse to the native form —
+  // hiding the very inversion this exists to prevent.
+  convert: (p: string) => string | null = cygpathToUnix
+): TarAttempt[] {
+  if (process.platform !== "win32") {
+    return [{ bin: "tar", file: tarPath, dest: destDir }];
+  }
+
+  const attempts: TarAttempt[] = [];
+  const systemTar = systemTarPath();
+  if (systemTar) attempts.push({ bin: systemTar, file: tarPath, dest: destDir });
+  attempts.push({ bin: "tar", file: tarPath, dest: destDir });
+
+  const file = convert(tarPath);
+  const dest = convert(destDir);
+  if (file && dest) attempts.push({ bin: "tar", file, dest });
+
+  return attempts;
+}
+
 export function installCompassBundle(
   tarPath: string,
   compassDir: string,
   stagingDir: string,
   backupDir: string
 ): void {
-  rmQuiet(stagingDir);
-  mkdirSync(stagingDir, { recursive: true });
-
-  let tarFile = tarPath;
-  let tarDest = stagingDir;
-  if (process.platform === "win32") {
+  let lastError: unknown = null;
+  for (const attempt of tarAttempts(tarPath, stagingDir)) {
+    // Each attempt gets a clean directory: a tar that fails partway still
+    // leaves files behind, and the index.html check below would then be
+    // answering about the wreckage of an earlier try.
+    rmQuiet(stagingDir);
+    mkdirSync(stagingDir, { recursive: true });
     try {
-      tarFile = execFileSync("cygpath", ["-u", tarPath], { encoding: "utf-8" }).trim();
-      tarDest = execFileSync("cygpath", ["-u", stagingDir], { encoding: "utf-8" }).trim();
-    } catch { /* use as-is */ }
+      execFileSync(
+        attempt.bin,
+        ["-xzf", attempt.file, "-C", attempt.dest, "--strip-components=1"],
+        // Capture stderr rather than discarding it: this is the step that failed
+        // on Windows and it left nothing behind to diagnose.
+        { stdio: ["ignore", "ignore", "pipe"] }
+      );
+      lastError = null;
+      break;
+    } catch (err) {
+      lastError = err;
+    }
   }
-  execFileSync(
-    "tar",
-    ["-xzf", tarFile, "-C", tarDest, "--strip-components=1"],
-    // Capture stderr rather than discarding it: this is the step that failed on
-    // Windows and it left nothing behind to diagnose.
-    { stdio: ["ignore", "ignore", "pipe"] }
-  );
+  if (lastError) throw lastError;
 
   // An extract that "succeeded" without producing index.html is not a compass.
   // Swapping it in would replace a working bundle with one findCompassDist

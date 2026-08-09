@@ -16,6 +16,8 @@ import {
   cleanupCompassSwap,
   installCompassBundle,
   sweepUpgradeOrphans,
+  systemTarPath,
+  tarAttempts,
 } from "../commands/upgrade.js";
 
 // The compass repair used to empty COMPASS_DIR and extract into the hole, so
@@ -208,5 +210,87 @@ describe("installCompassBundle", () => {
     // .cli-staging-*, and a leaked copy of the bundle stays there forever.
     expect(existsSync(staging())).toBe(false);
     expect(existsSync(backup())).toBe(false);
+  });
+});
+
+// The Windows compass extract converted its paths to Cygwin form whenever
+// `cygpath` was on the box, and then ran whatever `tar` PATH resolved to. Git
+// for Windows supplies cygpath; Windows 10 1803+ supplies System32\tar.exe. On
+// a machine with both — an ordinary Windows dev box — the rewrite happened and
+// bsdtar was handed the result:
+//
+//   tar: Error opening archive: Failed to open '/cygdrive/c/Users/...'
+//
+// The binary and the path form have to be chosen as a pair.
+describe("tarAttempts", () => {
+  const realPlatform = process.platform;
+  const setPlatform = (value: string) =>
+    Object.defineProperty(process, "platform", { value, configurable: true });
+
+  afterEach(() => setPlatform(realPlatform));
+
+  it("is a single native invocation off Windows", () => {
+    setPlatform("linux");
+    expect(tarAttempts("/tmp/c.tar.gz", "/tmp/dest")).toEqual([
+      { bin: "tar", file: "/tmp/c.tar.gz", dest: "/tmp/dest" },
+    ]);
+  });
+
+  // A box that has cygpath, which is what made the old code convert.
+  const cygpath = (p: string) =>
+    "/cygdrive/" + p[0].toLowerCase() + p.slice(2).replace(/\\/g, "/");
+
+  it("tries native Windows paths before any converted form", () => {
+    setPlatform("win32");
+    const attempts = tarAttempts("C:\\Temp\\c.tar.gz", "C:\\Users\\me\\.ix\\staging", cygpath);
+
+    // The whole bug: the only invocation used a converted path, so a tar taking
+    // native paths could never succeed. Native must come first.
+    expect(attempts[0].file).toBe("C:\\Temp\\c.tar.gz");
+    expect(attempts[0].dest).toBe("C:\\Users\\me\\.ix\\staging");
+
+    // ...and the converted form must still be offered, for a real MSYS-only box.
+    expect(attempts.some(a => a.file.startsWith("/cygdrive/"))).toBe(true);
+
+    const firstConverted = attempts.findIndex(a => a.file.startsWith("/cygdrive/"));
+    const lastNative = attempts.map(a => a.file.startsWith("/cygdrive/")).lastIndexOf(false);
+    expect(firstConverted).toBeGreaterThan(lastNative);
+  });
+
+  it("offers only native paths when there is no cygpath", () => {
+    setPlatform("win32");
+    const attempts = tarAttempts("C:\\Temp\\c.tar.gz", "C:\\dest", () => null);
+    expect(attempts.every(a => a.file === "C:\\Temp\\c.tar.gz")).toBe(true);
+  });
+
+  it("never pairs a converted path with the system tar", () => {
+    setPlatform("win32");
+    for (const attempt of tarAttempts("C:\\Temp\\c.tar.gz", "C:\\dest", cygpath)) {
+      // bsdtar cannot open a cygdrive path; pairing the two is the failure.
+      if (attempt.bin.toLowerCase().includes("system32")) {
+        expect(attempt.file.startsWith("/cygdrive/")).toBe(false);
+      }
+    }
+  });
+});
+
+describe("systemTarPath", () => {
+  it("finds bsdtar under SystemRoot", () => {
+    expect(systemTarPath({ SystemRoot: "C:\\Windows" }, () => true))
+      .toBe(join("C:\\Windows", "System32", "tar.exe"));
+  });
+
+  it("falls back to windir when SystemRoot is unset", () => {
+    expect(systemTarPath({ windir: "D:\\Win" }, () => true))
+      .toBe(join("D:\\Win", "System32", "tar.exe"));
+  });
+
+  it("is null when the binary is not there", () => {
+    // Windows before 1803. The PATH fallbacks are the only option.
+    expect(systemTarPath({ SystemRoot: "C:\\Windows" }, () => false)).toBeNull();
+  });
+
+  it("is null with no Windows root in the environment", () => {
+    expect(systemTarPath({}, () => true)).toBeNull();
   });
 });
