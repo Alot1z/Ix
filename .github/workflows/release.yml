@@ -264,6 +264,8 @@ jobs:
             node -e "const c=require('crypto'),f=require('fs'),p=process.argv[1];process.stdout.write(c.createHash('sha256').update(f.readFileSync(p)).digest('hex')+'  '+p+'\n')" "$1"
           }
           COMPASS_STAGED=0
+          ARCHIVE_LIST="$(mktemp)"
+          trap 'rm -f "$ARCHIVE_LIST"' EXIT
           mkdir -p "$STAGING/cli" "$STAGING/core-ingestion" "$STAGING/compass"
           cp -rL ix-cli/dist ix-cli/node_modules ix-cli/package.json "$STAGING/cli/"
           cp -rL core-ingestion/dist core-ingestion/node_modules core-ingestion/package.json "$STAGING/core-ingestion/"
@@ -312,7 +314,14 @@ jobs:
             # Verify the stamp survived archiving rather than trusting the tool
             # to carry a dot-named file. If it is ever dropped, every upgrade
             # silently reverts the compass — a failure with no error to notice.
-            if [ "$COMPASS_STAGED" = "1" ] && ! 7z l "$STAGING.zip" | grep -q '\.version'; then
+            #
+            # Listed to a file rather than piped into `grep -q`: this shell runs
+            # with `pipefail`, and grep -q exits at the first match, so the
+            # lister gets SIGPIPE and the pipeline reports *its* failure. That
+            # turns the check into a race the archiver usually wins and
+            # sometimes does not — it failed exactly once across four platforms.
+            7z l "$STAGING.zip" > "$ARCHIVE_LIST"
+            if [ "$COMPASS_STAGED" = "1" ] && ! grep -q '\.version' "$ARCHIVE_LIST"; then
               echo "::error::compass/.version is missing from $STAGING.zip — 7z dropped the dot-named stamp, which makes every 'ix upgrade' replace the bundled compass with an older one."
               exit 1
             fi
@@ -325,7 +334,11 @@ jobs:
           WRAPPER
             chmod +x "$STAGING/ix"
             tar -czf "$STAGING.tar.gz" "$STAGING"
-            if [ "$COMPASS_STAGED" = "1" ] && ! tar -tzf "$STAGING.tar.gz" | grep -q 'compass/\.version'; then
+            # See the note on the zip branch: listed to a file, not piped into
+            # `grep -q`, because pipefail turns the lister's SIGPIPE into a
+            # spurious failure of this check.
+            tar -tzf "$STAGING.tar.gz" > "$ARCHIVE_LIST"
+            if [ "$COMPASS_STAGED" = "1" ] && ! grep -q 'compass/\.version' "$ARCHIVE_LIST"; then
               echo "::error::compass/.version is missing from $STAGING.tar.gz — without it every 'ix upgrade' replaces the bundled compass with an older one."
               exit 1
             fi
