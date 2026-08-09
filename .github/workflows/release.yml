@@ -263,12 +263,39 @@ jobs:
           sha256file() {
             node -e "const c=require('crypto'),f=require('fs'),p=process.argv[1];process.stdout.write(c.createHash('sha256').update(f.readFileSync(p)).digest('hex')+'  '+p+'\n')" "$1"
           }
+          COMPASS_STAGED=0
+          ARCHIVE_LIST="$(mktemp)"
+          trap 'rm -f "$ARCHIVE_LIST"' EXIT
           mkdir -p "$STAGING/cli" "$STAGING/core-ingestion" "$STAGING/compass"
           cp -rL ix-cli/dist ix-cli/node_modules ix-cli/package.json "$STAGING/cli/"
           cp -rL core-ingestion/dist core-ingestion/node_modules core-ingestion/package.json "$STAGING/core-ingestion/"
           if [ -f compass-dist/index.html ]; then
             cp -r compass-dist/* "$STAGING/compass/"
-            echo "compass: $(find "$STAGING/compass" -type f | wc -l) files staged"
+            # Stamp the bundle with the release it ships in, so it declares its
+            # own provenance instead of relying on whoever unpacks it to guess.
+            #
+            # Without this the bundled compass is unversioned, so
+            # getInstalledCompassVersion() reads 0.0.0 and `ix upgrade` treats a
+            # compass it just shipped as "not installed" — then replaces it with
+            # whatever ix-compass-dist has, which is older than the bundle built
+            # from compass main at release time. v0.9.0 shipped exactly that: on
+            # Windows an unrelated tar failure masked it, and everywhere else the
+            # swap succeeded and silently reverted the map to a June build.
+            #
+            # The Ix version rather than a compass version: the bundle is built
+            # from compass main at release time, so it is always at least as new
+            # as any ix-compass-dist release cut before it. That makes the Ix
+            # version a monotonic stand-in, and isNewer() still offers a genuine
+            # dist upgrade published later at a higher number.
+            #
+            # install.sh writes this same file after extracting, using the dist
+            # release number. Either value suppresses the spurious update; the
+            # stamp being present at all is what matters.
+            printf '%s' "$VERSION" > "$STAGING/compass/.version"
+            test -s "$STAGING/compass/.version" \
+              || { echo "::error::failed to stamp $STAGING/compass/.version"; exit 1; }
+            COMPASS_STAGED=1
+            echo "compass: $(find "$STAGING/compass" -type f | wc -l) files staged, stamped $VERSION"
           elif [ "$REQUIRE_COMPASS" = "true" ]; then
             # v0.7.0 through v0.8.1 all shipped an empty compass/ because this
             # was a silent no-op. `ix view` then fails for every user with
@@ -284,6 +311,20 @@ jobs:
           node "%~dp0cli\dist\cli\main.js" %*
           WRAPPER
             7z a -tzip "$STAGING.zip" "$STAGING" >/dev/null
+            # Verify the stamp survived archiving rather than trusting the tool
+            # to carry a dot-named file. If it is ever dropped, every upgrade
+            # silently reverts the compass — a failure with no error to notice.
+            #
+            # Listed to a file rather than piped into `grep -q`: this shell runs
+            # with `pipefail`, and grep -q exits at the first match, so the
+            # lister gets SIGPIPE and the pipeline reports *its* failure. That
+            # turns the check into a race the archiver usually wins and
+            # sometimes does not — it failed exactly once across four platforms.
+            7z l "$STAGING.zip" > "$ARCHIVE_LIST"
+            if [ "$COMPASS_STAGED" = "1" ] && ! grep -q '\.version' "$ARCHIVE_LIST"; then
+              echo "::error::compass/.version is missing from $STAGING.zip — 7z dropped the dot-named stamp, which makes every 'ix upgrade' replace the bundled compass with an older one."
+              exit 1
+            fi
             sha256file "$STAGING.zip" > "$STAGING.zip.sha256"
           else
             cat > "$STAGING/ix" <<'WRAPPER'
@@ -293,6 +334,14 @@ jobs:
           WRAPPER
             chmod +x "$STAGING/ix"
             tar -czf "$STAGING.tar.gz" "$STAGING"
+            # See the note on the zip branch: listed to a file, not piped into
+            # `grep -q`, because pipefail turns the lister's SIGPIPE into a
+            # spurious failure of this check.
+            tar -tzf "$STAGING.tar.gz" > "$ARCHIVE_LIST"
+            if [ "$COMPASS_STAGED" = "1" ] && ! grep -q 'compass/\.version' "$ARCHIVE_LIST"; then
+              echo "::error::compass/.version is missing from $STAGING.tar.gz — without it every 'ix upgrade' replaces the bundled compass with an older one."
+              exit 1
+            fi
             sha256file "$STAGING.tar.gz" > "$STAGING.tar.gz.sha256"
           fi
 
