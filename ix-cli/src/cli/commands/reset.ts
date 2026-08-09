@@ -3,6 +3,7 @@ import chalk from "chalk";
 import { spawnSync } from "child_process";
 import { IxClient } from "../../client/api.js";
 import { getEndpoint, clearIngestMtimeCache } from "../config.js";
+import { canRenderProgress } from "../stderr.js";
 
 export function registerResetCommand(program: Command): void {
   program
@@ -35,28 +36,36 @@ export function registerResetCommand(program: Command): void {
       const label = opts.code ? "Wiping code graph..." : "Wiping graph...";
       const spinnerFrames = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
       let spinIdx = 0;
-      const interval = setInterval(() => {
+      // This spinner ran unconditionally, so a redirected `ix reset` collected a
+      // frame every 80 ms for as long as the wipe took.
+      const spinner = canRenderProgress() ? setInterval(() => {
         process.stderr.write(`\r${chalk.cyan(spinnerFrames[spinIdx++ % spinnerFrames.length])} ${chalk.dim(label)}`);
-      }, 80);
+      }, 80) : null;
+      // One teardown for all three exits rather than the pair repeated at each.
+      // Clearing an interval that was never started is harmless, but writing the
+      // erase sequence is not: with no spinner to erase it just deposits literal
+      // escape bytes in whatever captured the output.
+      const stopSpinner = () => {
+        if (!spinner) return;
+        clearInterval(spinner);
+        process.stderr.write("\r\x1b[K");
+      };
       try {
         if (opts.code) {
           await client.resetCode();
-          clearInterval(interval);
-          process.stderr.write("\r\x1b[K");
+          stopSpinner();
           // Clear the mtime cache so the next ix map re-ingests all files
           clearIngestMtimeCache(process.cwd());
           console.log(chalk.green("✓") + " Code graph wiped. Planning artifacts preserved.");
           console.log(chalk.dim("  Run `ix map` to rebuild the code graph."));
         } else {
           await client.reset();
-          clearInterval(interval);
-          process.stderr.write("\r\x1b[K");
+          stopSpinner();
           clearIngestMtimeCache(process.cwd());
           console.log(chalk.green("✓") + " Graph wiped.");
         }
       } catch (err: any) {
-        clearInterval(interval);
-        process.stderr.write("\r\x1b[K");
+        stopSpinner();
         console.error(chalk.red("Error:"), err.message);
         process.exitCode = 1;
         return;

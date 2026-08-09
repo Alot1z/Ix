@@ -19,6 +19,7 @@ import { ensureWorkspaceIdState } from '../bootstrap.js';
 import { detectSystem, repoWorkspaceIdFor, lookupPackage, readPackageNames, readPackageDeps } from '../system.js';
 import { CLIENT_EXPECTED_SCHEMA_VERSION } from '../backend-status.js';
 import { SUPPORTED_EXTENSIONS } from '../supported-extensions.js';
+import { canRenderProgress } from '../stderr.js';
 import {
   deterministicId,
   transformIssue,
@@ -691,7 +692,16 @@ export async function ingestFiles(
   let progressTotal   = 0;
   let progressStart   = performance.now();
 
-  const interval = opts.format === 'text' ? setInterval(() => {
+  // canRenderProgress, not just the format: `ix map` redirected to a file or
+  // captured by an agent is still format 'text', and every 80 ms frame is
+  // retained rather than overwritten.
+  //
+  // Kept as two conditions rather than folded into one flag because they gate
+  // different things below. `interval` gates the redrawing writes; the text
+  // format alone still gates the newline-terminated summary, which redirected
+  // output should keep — that is the "final summary" the bar was drowning.
+  const wantsTextProgress = opts.format === 'text';
+  const interval = (wantsTextProgress && canRenderProgress()) ? setInterval(() => {
     if (debug && currentWorkLabel) {
       const workElapsed = performance.now() - currentWorkStart;
       if (workElapsed >= SLOW_WORK_LOG_MS && (lastSlowWorkNotice === 0 || workElapsed - lastSlowWorkNotice >= SLOW_WORK_REPEAT_MS)) {
@@ -1445,6 +1455,13 @@ export async function ingestFiles(
         process.stderr.write('\r' + renderProgressLine(progressPhase, progressTotal, progressTotal));
       }
       process.stderr.write('\r' + ' '.repeat(PROG_LINE_WIDTH) + '\r');
+    }
+    // Outside the interval guard, on the format instead. This line is
+    // newline-terminated output, not a progress frame, and it is the only
+    // timing the user ever sees — leaving it keyed to the bar would have made
+    // silencing the bar silently drop it too, turning a fix for noisy output
+    // into a loss of the summary that output is for.
+    if (wantsTextProgress) {
       const elapsedSec = ((performance.now() - start) / 1000).toFixed(1);
       process.stderr.write(chalk.dim(`  Ingested in ${elapsedSec}s\n`));
     }

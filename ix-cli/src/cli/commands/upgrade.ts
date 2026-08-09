@@ -6,6 +6,7 @@ import { fileURLToPath } from "url";
 import { homedir, tmpdir } from "os";
 import chalk from "chalk";
 import { BACKEND_IMAGE, checkBackendImage, isNonStandardBackend } from "../backend-status.js";
+import { canRenderProgress } from "../stderr.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -716,7 +717,12 @@ function printUpdateNotice(
   compassUpdate?: boolean,
   backendUpdate?: boolean
 ): void {
-  process.stderr.write("\r" + " ".repeat(80) + "\r");
+  // Erase whatever progress frame is mid-render before printing over it. There
+  // is no such frame when stderr is not a terminal, so this would be 82 bytes
+  // of padding and two carriage returns deposited straight into the captured
+  // output — and this notice fires on ordinary commands, so it leaked into
+  // redirected output that had no progress bar to begin with.
+  if (canRenderProgress()) process.stderr.write("\r" + " ".repeat(80) + "\r");
   console.error("");
   if (isNewer(latest, current)) {
     console.error(chalk.yellow(`  Update available: ${current} → ${latest}`));
