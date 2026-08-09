@@ -22,6 +22,30 @@ $HealthUrl = "http://localhost:8090/v1/health"
 $ArangoUrl = "http://localhost:8529/_api/version"
 $NodeMinMajor = 22
 
+# Installer scratch files live under $IxHome, never under $env:TEMP.
+#
+# Windows sets TEMP to the 8.3 short form of the profile path when that path
+# contains a space -- `C:\Users\Win 10` becomes `C:\Users\WIN10~1` -- and
+# PowerShell's FileSystem provider cannot resolve a short-name segment. Any
+# provider cmdlet handed such a path fails with "An object at the specified
+# path C:\Users\WIN10~1 does not exist", naming the first segment it could not
+# resolve rather than the file it was actually given, which is why the error
+# reads as though it were about the profile rather than the file being written.
+# curl.exe and Expand-Archive go straight to Win32 and succeed on that very same
+# path, so the install got all the way through downloading and extracting before
+# falling over.
+#
+# $IxHome comes from USERPROFILE, which is the long form, so routing scratch
+# through it sidesteps the whole class rather than expanding short names at each
+# call site.
+#
+# The `.cli-staging-` prefix on both scratch names is deliberate:
+# sweepUpgradeOrphans in upgrade.ts reclaims `.cli-staging-*` out of IX_HOME, so
+# an installer killed mid-run still leaves nothing permanent behind -- the one
+# property TEMP was giving us for free. It must not be `.cli-backup-`: that
+# prefix is a *recovery* candidate there, and a leftover zip would be renamed
+# over the install directory on the next upgrade.
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 function Pause-On-Failure {
@@ -182,7 +206,7 @@ if (Test-Healthy) {
 
     # Capture the compose output so a failed pull can be diagnosed instead of
     # reported as a bare "Docker compose failed". Tee keeps it on screen too.
-    $pullLog = Join-Path $env:TEMP "ix-pull-$PID.log"
+    $pullLog = Join-Path $IxHome ".cli-staging-pull-$PID.log"
     $prevEap = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
@@ -260,7 +284,7 @@ Write-Host "`n-- CLI --"
 
 $Tarball = "ix-$Version-windows-amd64.zip"
 $Url = "https://github.com/$GithubOrg/$GithubRepo/releases/download/v$Version/$Tarball"
-$tmp = "$env:TEMP\$Tarball"
+$tmp = "$IxHome\.cli-staging-$PID.zip"
 $InstallDir = "$IxHome\cli"
 
 New-Item -ItemType Directory -Force -Path $IxBin | Out-Null
