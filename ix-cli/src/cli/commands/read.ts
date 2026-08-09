@@ -44,8 +44,8 @@ interface AmbiguityResult {
   diagnostics?: Array<{ code: string; message: string }>;
 }
 
-async function checkStale(client: IxClient, filePath: string): Promise<boolean> {
-  try { return await isFileStale(client, filePath); } catch { return false; }
+function checkStale(filePath: string): boolean {
+  try { return isFileStale(filePath); } catch { return false; }
 }
 
 function readFileRange(filePath: string, start?: number, end?: number): { content: string; lineStart: number; lineEnd: number } {
@@ -130,7 +130,7 @@ Examples:
       // --- Step 2: Try exact file path ---
       const resolvedPath = path.isAbsolute(rawTarget) ? rawTarget : path.resolve(root, rawTarget);
       if (fs.existsSync(resolvedPath) && fs.statSync(resolvedPath).isFile()) {
-        const stale = await checkStale(client, resolvedPath);
+        const stale = checkStale(resolvedPath);
         const { content, lineStart, lineEnd } = readFileRange(resolvedPath, rangeStart, rangeEnd);
         const result: ReadResult = {
           targetType: lineRangeMatch ? "file-range" : "file",
@@ -152,7 +152,7 @@ Examples:
         if (filenameMatches.length === 1) {
           const matchPath = filenameMatches[0].path;
           if (matchPath && fs.existsSync(matchPath)) {
-            const stale = await checkStale(client, matchPath);
+            const stale = checkStale(matchPath);
             const { content, lineStart, lineEnd } = readFileRange(matchPath, rangeStart, rangeEnd);
             const result: ReadResult = {
               targetType: "filename-match",
@@ -185,7 +185,7 @@ Examples:
         // client-agnostic backend. Resolve it against the active workspace
         // root before any fs call.
         const absSourceUri = sourceUri ? absoluteFromSourceUri(sourceUri, opts.root) : null;
-        const stale = absSourceUri ? await checkStale(client, absSourceUri) : false;
+        const stale = absSourceUri ? checkStale(absSourceUri) : false;
 
         // If the source file exists, extract the symbol's lines
         if (absSourceUri && fs.existsSync(absSourceUri)) {

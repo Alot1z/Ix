@@ -95,7 +95,7 @@ export function registerLocateCommand(program: Command): void {
       // Check staleness
       let stale = false;
       if (nodePath) {
-        try { stale = await isFileStale(client, nodePath); } catch {}
+        try { stale = isFileStale(nodePath); } catch {}
       }
 
       // Container context (parent for callables)

@@ -1,6 +1,5 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { IxClient } from "../client/api.js";
 import { resolveWorkspaceRoot } from "./config.js";
 import { loadIngestBaseline } from "./ingest-baseline.js";
 import { SUPPORTED_EXTENSIONS } from "./supported-extensions.js";
@@ -74,12 +73,19 @@ function differsFromIngestBaseline(
 /**
  * Detect files that have been modified since the last ingest.
  * Uses the workspace-local ingest baseline so another workspace cannot advance it.
+ *
+ * Takes no client and is not async, by construction rather than by discipline.
+ * Staleness used to be decided from `listPatches({ limit: 1 })`, which carries
+ * no workspace, so it answered with whatever repo was mapped most recently
+ * anywhere on the machine (#353). Keeping an unused client parameter around
+ * left the door open to reaching for it again; without one there is nothing to
+ * reach for, and the local-only property holds because it is the only thing the
+ * signature permits.
  */
-export async function detectStaleFiles(
-  _client: IxClient,
+export function detectStaleFiles(
   root: string,
   maxSamples: number = 5
-): Promise<StaleInfo> {
+): StaleInfo {
   const workspaceRoot = path.resolve(root);
   const baseline = loadIngestBaseline(workspaceRoot);
   if (!baseline) {
@@ -114,11 +120,12 @@ export async function detectStaleFiles(
 
 /**
  * Check if a specific file path differs from the active workspace's ingest baseline.
+ *
+ * Synchronous now that it reads a local file instead of the patch log. It is
+ * called per result on `ix explain`, `ix locate` and `ix read`, so the `await`
+ * this used to need was once a backend round-trip per file.
  */
-export async function isFileStale(
-  _client: IxClient,
-  filePath: string
-): Promise<boolean> {
+export function isFileStale(filePath: string): boolean {
   if (!fs.existsSync(filePath)) return false;
 
   const workspaceRoot = path.resolve(resolveWorkspaceRoot());

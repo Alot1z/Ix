@@ -3,7 +3,6 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import type { IxClient } from "../../client/api.js";
 import { ingestMtimeCachePath } from "../config.js";
 import { loadIngestBaseline } from "../ingest-baseline.js";
 import { persistIngestBaselineIfClean } from "../commands/ingest.js";
@@ -12,15 +11,6 @@ import { detectStaleFiles } from "../stale.js";
 let home: string;
 let savedHome: string | undefined;
 let savedProfile: string | undefined;
-
-const noPatchReads = {
-  listPatches: async () => {
-    throw new Error("global patches must not be read");
-  },
-  stats: async () => {
-    throw new Error("global stats must not be read");
-  },
-} as unknown as IxClient;
 
 function writeSource(root: string, name: string, source: string): string {
   fs.mkdirSync(root, { recursive: true });
@@ -69,7 +59,7 @@ describe("workspace-scoped staleness", () => {
     ).toBe(true);
 
     moveMtimeForward(fileA);
-    const beforeB = await detectStaleFiles(noPatchReads, rootA);
+    const beforeB = detectStaleFiles(rootA);
     expect(beforeB).toEqual({
       lastIngestAt: ingestedA.toISOString(),
       currentRev: 11,
@@ -88,7 +78,7 @@ describe("workspace-scoped staleness", () => {
       ),
     ).toBe(true);
 
-    expect(await detectStaleFiles(noPatchReads, rootA)).toEqual(beforeB);
+    expect(detectStaleFiles(rootA)).toEqual(beforeB);
   });
 
   it("loads the legacy mtime-only cache and uses its own file timestamp", async () => {
@@ -108,7 +98,7 @@ describe("workspace-scoped staleness", () => {
     fs.utimesSync(cachePath, legacyTimestamp, legacyTimestamp);
     moveMtimeForward(filePath);
 
-    const result = await detectStaleFiles(noPatchReads, root);
+    const result = detectStaleFiles(root);
     expect(result.currentRev).toBe(0);
     expect(result.lastIngestAt).toBe(fs.statSync(cachePath).mtime.toISOString());
     expect(result.staleFiles).toBe(1);
@@ -119,7 +109,7 @@ describe("workspace-scoped staleness", () => {
     const root = path.join(home, "unmapped");
     writeSource(root, "new.js", "export const value = 1;\n");
 
-    expect(await detectStaleFiles(noPatchReads, root)).toEqual({
+    expect(detectStaleFiles(root)).toEqual({
       lastIngestAt: null,
       currentRev: 0,
       staleFiles: 0,
@@ -146,14 +136,14 @@ describe("workspace-scoped staleness", () => {
       ingestedAt,
     );
 
-    expect((await detectStaleFiles(noPatchReads, root)).staleFiles).toBe(0);
+    expect((detectStaleFiles(root)).staleFiles).toBe(0);
 
     fs.utimesSync(
       uncachedFile,
       new Date(ingestedAt.getTime() + 1_000),
       new Date(ingestedAt.getTime() + 1_000),
     );
-    expect(await detectStaleFiles(noPatchReads, root)).toMatchObject({
+    expect(detectStaleFiles(root)).toMatchObject({
       staleFiles: 1,
       sampleChangedFiles: ["uncached.js"],
     });
@@ -185,6 +175,6 @@ describe("workspace-scoped staleness", () => {
     expect(baseline?.currentRev).toBe(7);
     expect(baseline?.lastIngestAt).toBe(oldTimestamp.toISOString());
     expect(baseline?.files.get(filePath)).toBe(oldMtime);
-    expect((await detectStaleFiles(noPatchReads, root)).staleFiles).toBe(1);
+    expect((detectStaleFiles(root)).staleFiles).toBe(1);
   });
 });
