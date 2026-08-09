@@ -45,7 +45,7 @@ interface AmbiguityResult {
 }
 
 async function checkStale(client: IxClient, filePath: string): Promise<boolean> {
-  try { return await isFileStale(client, filePath); } catch { return false; }
+  try { return isFileStale(filePath); } catch { return false; }
 }
 
 function readFileRange(filePath: string, start?: number, end?: number): { content: string; lineStart: number; lineEnd: number } {

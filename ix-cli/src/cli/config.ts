@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, rmSync, chmodSync, renameSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, rmSync, chmodSync, renameSync, statSync } from "node:fs";
 import { join, resolve as resolvePath } from "node:path";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
@@ -19,6 +19,49 @@ export function ingestMtimeCachePath(projectRoot: string): string {
 /** Remove the ingest mtime cache so the next map re-ingests every file. Best-effort. */
 export function clearIngestMtimeCache(projectRoot: string): void {
   try { rmSync(ingestMtimeCachePath(projectRoot), { force: true }); } catch { /* non-critical */ }
+}
+
+interface MtimeCache {
+  root: string;
+  files: Record<string, number>; // absolute path → mtime (ms) as of that ingest
+}
+
+/**
+ * The mtimes recorded the last time this project root was ingested, or an empty
+ * map if it never was.
+ *
+ * Lives here beside the path helper, and not privately in ingest.ts, because
+ * `ix status` reads it too: staleness has to be decided by the same record `ix
+ * map` writes, or the two commands disagree about the same file. The `root`
+ * check is what makes it workspace-scoped — a cache written for a different
+ * project is not this project's baseline even if the hash somehow collided.
+ */
+export function loadIngestMtimeCache(projectRoot: string): Map<string, number> {
+  try {
+    const raw = readFileSync(ingestMtimeCachePath(projectRoot), "utf-8");
+    const data = JSON.parse(raw) as MtimeCache;
+    if (data.root !== projectRoot) return new Map();
+    return new Map(Object.entries(data.files));
+  } catch {
+    return new Map();
+  }
+}
+
+/**
+ * When this project root was last ingested, from the cache file's own mtime, or
+ * null if it never was.
+ *
+ * The patch log cannot answer this: patches carry no workspace, so its newest
+ * entry is whatever workspace was mapped most recently anywhere on the machine.
+ * This file is written at the end of each ingest *for this root*, so its mtime
+ * is the one timestamp on the machine that means "this workspace, last ingest".
+ */
+export function lastIngestAtFor(projectRoot: string): Date | null {
+  try {
+    return statSync(ingestMtimeCachePath(projectRoot)).mtime;
+  } catch {
+    return null;
+  }
 }
 
 export interface WorkspaceConfig {

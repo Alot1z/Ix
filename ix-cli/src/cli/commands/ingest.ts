@@ -10,7 +10,7 @@ import { ParsePool } from './parse-pool.js';
 import chalk from 'chalk';
 import { IxClient } from '../../client/api.js';
 import type { GraphPatchPayload } from '../../client/types.js';
-import { getEndpoint, resolveWorkspaceRoot, ingestMtimeCachePath } from '../config.js';
+import { getEndpoint, resolveWorkspaceRoot, ingestMtimeCachePath, loadIngestMtimeCache } from '../config.js';
 import { resolveGitHubToken } from '../github/auth.js';
 import { parseGitHubRepo, fetchGitHubData } from '../github/fetch.js';
 import { loadIngestionModules } from './ingestion-loader.js';
@@ -309,17 +309,10 @@ interface MtimeCache {
   files: Record<string, number>; // absolute path → mtime (ms)
 }
 
-function loadMtimeCache(projectRoot: string): Map<string, number> {
-  try {
-    const raw = fs.readFileSync(ingestMtimeCachePath(projectRoot), 'utf-8');
-    const data = JSON.parse(raw) as MtimeCache;
-    if (data.root !== projectRoot) return new Map();
-    return new Map(Object.entries(data.files));
-  } catch {
-    return new Map();
-  }
-}
-
+// The loader moved to config.ts, beside the path helper, because `ix status`
+// now reads the same record: it decides staleness with the exact test this file
+// uses to decide what to re-ingest, so the two commands cannot disagree about
+// whether a given file is stale.
 function saveMtimeCache(projectRoot: string, mtimes: Map<string, number>): void {
   try {
     const dir = nodePath.join(os.homedir(), '.ix');
@@ -806,7 +799,7 @@ export async function ingestFiles(
     const projectRoot = fs.statSync(resolvedPath).isDirectory() ? resolvedPath : nodePath.dirname(resolvedPath);
     // A just-migrated workspace (new path-based id) has no nodes under the new id, so
     // skip the mtime pre-filter and re-ingest everything, exactly like --force.
-    const mtimeCache  = (opts.force || workspaceMigrated) ? new Map<string, number>() : loadMtimeCache(projectRoot);
+    const mtimeCache  = (opts.force || workspaceMigrated) ? new Map<string, number>() : loadIngestMtimeCache(projectRoot);
     const currentMtimes = new Map<string, number>();
 
     // DB-reset guard: if the mtime cache has entries but the server returns no hashes
