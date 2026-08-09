@@ -8,20 +8,28 @@ import { ingestMtimeCachePath } from "../config.js";
 import type { IxClient } from "../../client/api.js";
 
 let home: string;
-let realHome: string | undefined;
+const saved: Record<string, string | undefined> = {};
+
+// HOME *and* USERPROFILE: os.homedir() reads USERPROFILE on Windows and HOME on
+// POSIX, so overriding only one sends the Windows run at the real profile — where
+// ~/.ix may not exist and the seed write fails with ENOENT before any assertion
+// runs. Setting both keeps every platform inside the temp directory.
+const HOME_VARS = ["HOME", "USERPROFILE"] as const;
 
 beforeEach(() => {
-  // The cache path is derived from homedir() at call time, so pointing HOME at a
-  // temp directory keeps these tests off the developer's real ~/.ix.
-  realHome = process.env.HOME;
   home = mkdtempSync(join(tmpdir(), "ix-stale-home-"));
-  process.env.HOME = home;
+  for (const key of HOME_VARS) {
+    saved[key] = process.env[key];
+    process.env[key] = home;
+  }
   mkdirSync(join(home, ".ix"), { recursive: true });
 });
 
 afterEach(() => {
-  if (realHome === undefined) delete process.env.HOME;
-  else process.env.HOME = realHome;
+  for (const key of HOME_VARS) {
+    if (saved[key] === undefined) delete process.env[key];
+    else process.env[key] = saved[key];
+  }
   rmSync(home, { recursive: true, force: true });
 });
 
