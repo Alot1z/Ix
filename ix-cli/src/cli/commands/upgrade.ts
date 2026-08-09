@@ -43,7 +43,12 @@ function getCurrentVersion(): string {
 // download URLs, so it is validated here at the source: anything that isn't a
 // plain version is rejected (CodeQL js/http-to-file-access barrier + general
 // hardening against a tampered/unexpected tag).
-const VERSION_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
+// The pre-release and build parts are separate optional groups. Written as one
+// `(?:[-+]...)?` group, the character class had no `+`, so a tag carrying both
+// — `0.9.0-rc.1+abc1234`, valid semver — failed the test. fetchLatestRelease
+// then returned null and `ix upgrade` reported "Could not reach GitHub to check
+// for updates" and exited 1 against a perfectly reachable GitHub.
+export const VERSION_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 
 async function fetchLatestRelease(repo: string): Promise<string | null> {
   try {
@@ -96,12 +101,81 @@ function writeCache(latest: string, compassLatest?: string, backendLatest?: stri
   }
 }
 
-function isNewer(latest: string, current: string): boolean {
-  const l = latest.split(".").map(Number);
-  const c = current.split(".").map(Number);
+/**
+ * Split a version into its numeric release triple and its pre-release
+ * identifiers. `0.9.0-rc.1` -> `[[0,9,0], ["rc","1"]]`.
+ */
+function splitVersion(v: string): [number[], string[]] {
+  // Build metadata (`+sha`) never participates in precedence.
+  const withoutBuild = v.split("+")[0]!;
+  // Split at the FIRST hyphen and keep everything after it. `split("-", 2)`
+  // looks right and is not: the limit truncates rather than capturing the
+  // remainder, so `0.9.0-rc-1` would yield pre-release "rc" and drop the "-1"
+  // — making 0.9.0-rc-1 and 0.9.0-rc-2 compare equal, which is the same
+  // stranded-on-a-candidate bug this function exists to fix.
+  const hyphen = withoutBuild.indexOf("-");
+  const core = hyphen === -1 ? withoutBuild : withoutBuild.slice(0, hyphen);
+  const pre = hyphen === -1 ? "" : withoutBuild.slice(hyphen + 1);
+  const nums = core.split(".").map((n) => {
+    const parsed = Number(n);
+    return Number.isFinite(parsed) ? parsed : 0;
+  });
+  return [nums, pre ? pre.split(".") : []];
+}
+
+/**
+ * Is `latest` a higher version than `current`?
+ *
+ * The old implementation was `split(".").map(Number)`, which turns
+ * `0.9.0-rc.1` into `[0, 9, NaN, 1]`. Every NaN compared false and was then
+ * coerced to 0 by `(l[i] || 0)`, so `isNewer("0.9.0", "0.9.0-rc.1")` returned
+ * false: anyone running a release candidate was never told the GA shipped, and
+ * `ix upgrade` reported them already current. `0.9.0-rc.2` over `0.9.0-rc.1`
+ * failed the same way, so candidates could not even be updated to each other.
+ *
+ * Follows semver precedence: compare the release triple numerically; a version
+ * with no pre-release outranks one that has it; otherwise compare pre-release
+ * identifiers left to right, numeric ones numerically and below alphanumeric
+ * ones, and a longer identifier list wins when all preceding fields are equal.
+ */
+export function isNewer(latest: string, current: string): boolean {
+  const [lNums, lPre] = splitVersion(latest);
+  const [cNums, cPre] = splitVersion(current);
+
   for (let i = 0; i < 3; i++) {
-    if ((l[i] || 0) > (c[i] || 0)) return true;
-    if ((l[i] || 0) < (c[i] || 0)) return false;
+    const a = lNums[i] ?? 0;
+    const b = cNums[i] ?? 0;
+    if (a > b) return true;
+    if (a < b) return false;
+  }
+
+  // Same release triple. A release outranks any pre-release of itself.
+  if (lPre.length === 0 && cPre.length === 0) return false;
+  if (lPre.length === 0) return true;
+  if (cPre.length === 0) return false;
+
+  for (let i = 0; i < Math.max(lPre.length, cPre.length); i++) {
+    const a = lPre[i];
+    const b = cPre[i];
+    if (a === undefined) return false; // shorter list is lower
+    if (b === undefined) return true;
+    if (a === b) continue;
+
+    const aNum = /^\d+$/.test(a);
+    const bNum = /^\d+$/.test(b);
+    if (aNum && bNum) {
+      // Only return once the comparison is actually decided. Two identifiers
+      // can differ as text but not as numbers (`01` vs `1`), and returning
+      // here would end the whole comparison as "not newer" instead of moving
+      // on to the next identifier.
+      const na = Number(a);
+      const nb = Number(b);
+      if (na !== nb) return na > nb;
+      continue;
+    }
+    // Numeric identifiers always rank below alphanumeric ones.
+    if (aNum !== bNum) return bNum;
+    return a > b;
   }
   return false;
 }
