@@ -22,6 +22,11 @@ const PID_FILE = join(IX_HOME, "compass.pid");
 // `ix view` launched from a different workspace can warn instead of silently showing the
 // already-running (differently-scoped) instance.
 const SCOPE_FILE = join(IX_HOME, "compass.scope");
+// Records the port the running visualizer was launched on. The scope was tracked
+// this way from the start but the port was not, so the already-running branch had
+// nothing to report and printed the *current* invocation's -p instead — a URL that
+// refuses connections while the real server is up on another port.
+const PORT_FILE = join(IX_HOME, "compass.port");
 const BACKEND_URL = "http://localhost:8090";
 
 /** Resolve the compass dist directory — installed path first, then dev fallback. */
@@ -50,8 +55,53 @@ function readAlivePid(): number | null {
     // Stale PID file
     try { unlinkSync(PID_FILE); } catch { /* ignore */ }
     try { unlinkSync(SCOPE_FILE); } catch { /* ignore */ }
+    try { unlinkSync(PORT_FILE); } catch { /* ignore */ }
     return null;
   }
+}
+
+/**
+ * The port the running visualizer was launched on, or null if it is not
+ * recorded.
+ *
+ * Null is a real answer, not a failure: an instance started before this file
+ * existed is still running and still serving, we simply do not know where. The
+ * caller says so rather than guessing, because guessing the port is the entire
+ * bug — a confidently printed wrong URL is worse than an admitted unknown.
+ */
+function readRunningPort(): number | null {
+  if (!existsSync(PORT_FILE)) return null;
+  const parsed = parseInt(readFileSync(PORT_FILE, "utf-8").trim(), 10);
+  return Number.isInteger(parsed) && parsed > 0 && parsed <= 65535 ? parsed : null;
+}
+
+/**
+ * What to print under "already running", given where it is actually serving.
+ *
+ * Pulled out as a pure function because the bug lived entirely in this decision
+ * — the surrounding branch was correct — and inline in a command action it could
+ * only have been tested by launching a detached server.
+ *
+ * `requestedPort` is deliberately never used to build a URL. It appears only in
+ * the mismatch message, as the thing the user asked for and did not get.
+ */
+export function runningInstanceLines(
+  runningPort: number | null,
+  requestedPort: number,
+  portWasRequested: boolean
+): string[] {
+  if (runningPort === null) {
+    return [
+      "[!] Its port was not recorded, so the URL is unknown.",
+      "    Run 'ix view stop' then 'ix view' to restart it and record the port.",
+    ];
+  }
+  const lines = [`  http://localhost:${runningPort}`];
+  if (portWasRequested && runningPort !== requestedPort) {
+    lines.push(`[!] You asked for port ${requestedPort}, but it is serving on ${runningPort}.`);
+    lines.push(`    Run 'ix view stop' then 'ix view -p ${requestedPort}' to move it.`);
+  }
+  return lines;
 }
 
 /** Check whether a port is already in use. */
@@ -198,6 +248,12 @@ export function registerViewCommand(program: Command): void {
         console.error("[error] Invalid port number.");
         process.exit(1);
       }
+      // Distinguish "-p 19124" from the 8080 default, so the mismatch warning
+      // below fires only when the user actually asked for a port. Comparing
+      // against 8080 instead would stay silent for someone who explicitly passed
+      // `-p 8080` to a server running elsewhere — the exact case they typed the
+      // flag to find out about.
+      const portWasRequested = view.getOptionValueSource("port") === "cli";
 
       // Resolve the workspace this visualizer is scoped to. The proxy stamps it as
       // X-Ix-Workspace on every /v1 call so Compass isolates by workspace without any
@@ -243,7 +299,13 @@ export function registerViewCommand(program: Command): void {
       const existing = readAlivePid();
       if (existing) {
         console.log(`[ok] Visualizer is already running (PID ${existing})`);
-        console.log(`  http://localhost:${port}`);
+        // The running instance's port, never this invocation's. `-p` asks where to
+        // *start* a server; there is nothing to start here, so echoing it back
+        // printed a URL that refuses connections while the real one served fine
+        // elsewhere — and exited 0, so nothing suggested the URL was wrong.
+        for (const line of runningInstanceLines(readRunningPort(), port, portWasRequested)) {
+          console.log(line);
+        }
         // The running instance has a fixed scope (baked at launch). If this directory
         // maps to a different workspace, say so rather than silently showing the old one.
         const runningKey = existsSync(SCOPE_FILE) ? readFileSync(SCOPE_FILE, "utf-8").trim() : null;
@@ -299,10 +361,14 @@ export function registerViewCommand(program: Command): void {
         process.exit(1);
       }
 
-      // Save PID + the scope it was launched with (for the mismatch warning above).
+      // Save PID + the scope and port it was launched with (for the mismatch
+      // warnings above). The port is written here, beside the pid, so the two can
+      // only ever describe the same process — deriving it later from a live socket
+      // would reintroduce the guess this is replacing.
       mkdirSync(dirname(PID_FILE), { recursive: true });
       writeFileSync(PID_FILE, String(child.pid));
       writeFileSync(SCOPE_FILE, scopeKey);
+      writeFileSync(PORT_FILE, String(port));
 
       const url = `http://localhost:${port}`;
       console.log(`[ok] Visualizer started (PID ${child.pid})`);
@@ -338,6 +404,7 @@ export function registerViewCommand(program: Command): void {
 
       try { unlinkSync(PID_FILE); } catch { /* ignore */ }
       try { unlinkSync(SCOPE_FILE); } catch { /* ignore */ }
+      try { unlinkSync(PORT_FILE); } catch { /* ignore */ }
       console.log(`[ok] Visualizer stopped (PID ${pid})`);
     });
 
@@ -348,6 +415,11 @@ export function registerViewCommand(program: Command): void {
       const pid = readAlivePid();
       if (pid) {
         console.log(`[ok] Visualizer is running (PID ${pid})`);
+        // Now that the port is recorded, `status` can answer the question people
+        // actually run it to answer. It stays silent rather than guessing when the
+        // instance predates the port file.
+        const runningPort = readRunningPort();
+        if (runningPort !== null) console.log(`  http://localhost:${runningPort}`);
       } else {
         console.log("[--] Visualizer is not running.");
         console.log("  Run 'ix view' to start it.");
