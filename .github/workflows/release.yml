@@ -343,6 +343,7 @@ jobs:
         env:
           INPUT_TAG: ${{ github.event.inputs.tag }}
           REF_NAME: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
         run: |
           TAG="${INPUT_TAG:-$REF_NAME}"
           VERSION="${TAG#v}"
@@ -350,9 +351,47 @@ jobs:
           # A semver pre-release identifier (0.9.0-rc.1, 1.0.0-beta.2) marks this
           # as not-for-general-consumption. Everything below keys off it.
           case "$VERSION" in
-            *-*) echo "prerelease=true"  >> "$GITHUB_OUTPUT" ;;
-            *)   echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+            *-*) PRERELEASE=true  ;;
+            *)   PRERELEASE=false ;;
           esac
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+
+          # The banner that leads a release candidate's own release page.
+          #
+          # Built here rather than inline in the release body because it needs
+          # real newlines for the fenced blocks, and an Actions expression
+          # cannot produce one: `format()` strings have no escape sequences, so
+          # a `\n` in there is emitted as a literal backslash-n. Empty for a
+          # stable release, which leaves the body starting at "## Install".
+          {
+            echo "banner<<IX_BANNER_EOF"
+            if [ "$PRERELEASE" = "true" ]; then
+              cat <<EOF
+          > **Release candidate — the install commands further down will NOT give you this build.**
+          > \`/releases/latest\` deliberately excludes prereleases and still points
+          > at the last stable release, so both installers resolve to that unless
+          > you pin the version. Use one of these instead:
+          >
+          > \`\`\`bash
+          > # macOS / Linux
+          > curl -fsSL https://raw.githubusercontent.com/${REPO}/main/scripts/install/install.sh | IX_VERSION=${VERSION} bash
+          > \`\`\`
+          >
+          > \`\`\`powershell
+          > # Windows
+          > \$env:IX_VERSION="${VERSION}"; irm https://raw.githubusercontent.com/${REPO}/main/scripts/install/install.ps1 | iex
+          > \`\`\`
+          >
+          > On the bash line \`IX_VERSION=\` must sit on \`bash\`, not on \`curl\`: an
+          > assignment prefixing \`curl\` applies to that command alone and never
+          > reaches the installer on the other side of the pipe.
+          >
+          > Homebrew cannot install a release candidate — the formula tracks
+          > stable releases only.
+          EOF
+            fi
+            echo "IX_BANNER_EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Download all platform tarballs
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -371,15 +410,31 @@ jobs:
         with:
           tag_name: v${{ steps.version.outputs.version }}
           generate_release_notes: true
-          # Without these, a v0.9.0-rc.1 tag publishes as a normal release and
+          # Without this, a v0.9.0-rc.1 tag publishes as a normal release and
           # becomes "latest" — and both install.sh's resolve_version() and the
           # CLI's checkForUpdate() read /releases/latest, so an RC would install
           # itself onto every new user and prompt every existing one to upgrade
           # to it. GitHub excludes prereleases from /releases/latest, so this is
           # what makes a release-candidate tag safe to push at all.
+          #
+          # `legacy`, not `true` and not omitted.
+          #
+          # Omitting it does NOT mean "leave the pointer alone": the action's
+          # parseMakeLatest returns undefined for an absent input, the key is
+          # dropped from the payload, and GitHub's REST default of `true`
+          # applies on PATCH as well as POST. Since this job also runs on
+          # workflow_dispatch against an arbitrary tag — where the action
+          # *updates* an existing release — both `true` and omitted would
+          # re-point /releases/latest at whatever old tag was re-run.
+          #
+          # `legacy` asks GitHub to pick latest by date and semver instead, so
+          # re-running v0.8.1 after v0.9.0 has shipped leaves the pointer where
+          # it belongs. Prereleases stay pinned to `false`.
           prerelease: ${{ steps.version.outputs.prerelease }}
-          make_latest: ${{ steps.version.outputs.prerelease == 'false' }}
+          make_latest: ${{ steps.version.outputs.prerelease == 'true' && 'false' || 'legacy' }}
           body: |
+            ${{ steps.version.outputs.banner }}
+
             ## Install
 
             ### Quick install (no repo needed)
