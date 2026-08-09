@@ -860,8 +860,14 @@ done
 # On Windows, avoid invoking the shim (calls cmd.exe, hangs in sh subshell)
 check_installed_version() {
   if [ "$PLATFORM" = "windows-amd64" ]; then
-    if [ -d "$INSTALL_DIR/ix-${VERSION}-windows-amd64" ]; then
-      echo "$VERSION"
+    # Read the version out of the installed package rather than inferring it
+    # from a version-named directory. That directory no longer exists — the
+    # extract below collapses it — and probing for it would report "unknown"
+    # against a perfectly current install, wiping and re-laying it on every
+    # run, including one install.ps1 had just laid down correctly.
+    if [ -f "$INSTALL_DIR/cli/package.json" ]; then
+      sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "$INSTALL_DIR/cli/package.json" | head -1
     else
       echo "unknown"
     fi
@@ -953,7 +959,76 @@ if [ "$SKIP_CLI_INSTALL" = "0" ] && { [ ! -x "$IX_BIN/ix" ] || [ "$(check_instal
 
   # Extract
   if [ "$PLATFORM" = "windows-amd64" ]; then
-    unzip -q "$TMP_FILE" -d "$INSTALL_DIR"
+    # unzip has no --strip-components, and the zip nests everything under
+    # ix-<version>-windows-amd64/. Extracting straight into $INSTALL_DIR left a
+    # bundled compass at cli/ix-<version>-windows-amd64/compass while the CLI
+    # only ever reads cli/compass (COMPASS_DIR in upgrade.ts, findCompassDist in
+    # view.ts), so `ix view` was unavailable on every Windows install made from
+    # this script — the same break install.ps1 had.
+    #
+    # Unzip into staging and move the single top-level directory into place, so
+    # both installers and `ix upgrade` lay down one shape. Without this the two
+    # installers disagree on the same platform and half-break each other:
+    # check_installed_version below reads the flat entry point, so a nested
+    # tree reports "unknown" and gets replaced, and vice versa.
+    ZIP_STAGING="$TMP_DIR/staged"
+    mkdir -p "$ZIP_STAGING"
+    unzip -q "$TMP_FILE" -d "$ZIP_STAGING"
+    # Exactly one directory, matching soleChildDir in upgrade.ts and the guard
+    # in install.ps1. Anything else is not a release we recognise, and
+    # collapsing an arbitrary one of several would install the wrong tree.
+    ZIP_TOP_COUNT=$(find "$ZIP_STAGING" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
+    ZIP_TOP=$(find "$ZIP_STAGING" -mindepth 1 -maxdepth 1 -type d | head -1)
+    if [ "$ZIP_TOP_COUNT" != "1" ] || [ ! -f "$ZIP_TOP/ix.cmd" ]; then
+      rm -rf "$TMP_DIR"
+      err "Extracted archive is not an ix release: expected one top-level directory containing ix.cmd, found $ZIP_TOP_COUNT."
+    fi
+    # Move the old install aside rather than deleting it, then put it back if
+    # the swap fails — the same shape as install.ps1 and swapInStagedTree.
+    #
+    # $INSTALL_DIR is not reliably the empty directory `mkdir -p` just made. The
+    # `rm -rf "$INSTALL_DIR"` in the upgrade branch above only runs when
+    # `[ -x "$IX_BIN/ix" ]`, and install.ps1 writes %IX_HOME%\bin\ix.cmd rather
+    # than $IX_BIN/ix — so a populated install reaches here whenever the two
+    # installers are mixed, or pick_bin_dir() resolves differently than it did
+    # last run. Deleting that outright would destroy a working CLI with nothing
+    # to restore from, and `mv` onto a directory that survived the delete would
+    # silently nest the tree inside it, recreating the exact layout this is
+    # here to remove.
+    ZIP_BACKUP="$IX_HOME/.cli-backup-$$"
+    # `|| true` on every cleanup rm below. Under `set -e` a bare rm that fails
+    # aborts the script where it stands — verified — and the ones after the swap
+    # sit between the new tree and the shim write, so a locked leftover would
+    # install the CLI and then skip the launcher, ensure_path and both version
+    # stamps. That is the brick rmQuiet() exists to prevent on the TS side and
+    # that install.ps1 avoids with -ErrorAction SilentlyContinue.
+    if ! rm -rf "$ZIP_BACKUP" 2>/dev/null && [ -e "$ZIP_BACKUP" ]; then
+      rm -rf "$TMP_DIR" || true
+      err "Could not clear a leftover backup at $ZIP_BACKUP. Remove it and re-run. The existing install is untouched."
+    fi
+    # Drop the empty directory `mkdir -p` just made, so a first-time install has
+    # no backup at all and cannot report restoring a CLI that never existed.
+    # rmdir fails harmlessly on a populated install, which is the one we want to
+    # move aside.
+    rmdir "$INSTALL_DIR" 2>/dev/null || true
+    if [ -e "$INSTALL_DIR" ] && ! mv "$INSTALL_DIR" "$ZIP_BACKUP"; then
+      rm -rf "$TMP_DIR" || true
+      err "Could not move the existing install aside from $INSTALL_DIR. It is untouched."
+    fi
+    if mv "$ZIP_TOP" "$INSTALL_DIR"; then
+      rm -rf "$ZIP_BACKUP" || true
+    else
+      # if/else, not `mv ... && warn`: with && a *failed* restore short-circuits
+      # and says nothing at all, so the user is never told the only surviving
+      # copy is at $ZIP_BACKUP — which is the case the backup exists for.
+      if [ -d "$ZIP_BACKUP" ] && [ ! -e "$INSTALL_DIR" ] && mv "$ZIP_BACKUP" "$INSTALL_DIR"; then
+        warn "Restored the previous CLI after a failed update."
+      elif [ -d "$ZIP_BACKUP" ]; then
+        warn "Your previous CLI is at $ZIP_BACKUP — move it to $INSTALL_DIR to restore it."
+      fi
+      rm -rf "$TMP_DIR" || true
+      err "Could not install to $INSTALL_DIR."
+    fi
   else
     tar -xzf "$TMP_FILE" -C "$INSTALL_DIR" --strip-components=1
   fi
@@ -962,7 +1037,9 @@ if [ "$SKIP_CLI_INSTALL" = "0" ] && { [ ! -x "$IX_BIN/ix" ] || [ "$(check_instal
 
   # Create wrapper shim in bin dir
   if [ "$PLATFORM" = "windows-amd64" ]; then
-    IX_JS="$INSTALL_DIR/ix-${VERSION}-windows-amd64/cli/dist/cli/main.js"
+    # No version in the path any more: the tree is flat, and refreshLaunchers
+    # in upgrade.ts rewrites this shim to exactly this form after an upgrade.
+    IX_JS="$INSTALL_DIR/cli/dist/cli/main.js"
     cat > "$IX_BIN/ix" <<SHIM
 #!/bin/sh
 exec node "$IX_JS" "\$@"
@@ -992,13 +1069,13 @@ BACKEND_VER=$(resolve_backend_version)
 # stayed broken forever. The bundle ships inside the release tarball; if it is
 # absent, leaving the stamp off lets `ix upgrade` self-heal from ix-compass-dist.
 # This tests the path the CLI actually reads (COMPASS_DIR in upgrade.ts,
-# findCompassDist in view.ts), not wherever the archive happened to extract.
-# Those differ on Windows: the zip is expanded without stripping its top-level
-# directory, so a bundled compass lands in cli/ix-<version>-windows-amd64/ and
-# the CLI cannot see it. Do not "fix" this by pointing at that path — stamping a
-# version for a bundle `ix view` will never find re-creates the poisoned stamp
-# this change exists to remove. Leaving it unstamped lets `ix upgrade` install a
-# copy where the CLI does look.
+# findCompassDist in view.ts). The Windows extract above now collapses the
+# archive's top-level directory, so that is also where the bundled compass
+# lands and this branch stamps a bundle `ix view` can genuinely serve — the
+# warning below is a real failure signal on every platform, not the normal
+# Windows path. Keep the -f test on index.html: stamping a version for a
+# compass that is not on disk is what made `ix upgrade` skip the repair
+# download and break `ix view` permanently.
 COMPASS_VER=$(resolve_compass_version)
 if [ -n "$COMPASS_VER" ] && [ -f "$IX_HOME/cli/compass/index.html" ]; then
   printf '%s' "$COMPASS_VER" > "$IX_HOME/cli/compass/.version"

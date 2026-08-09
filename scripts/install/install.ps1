@@ -52,8 +52,15 @@ trap {
 
 function Test-Healthy {
     try {
-        $null = Invoke-WebRequest -Uri $HealthUrl -TimeoutSec 3 -ErrorAction Stop
-        $null = Invoke-WebRequest -Uri $ArangoUrl -TimeoutSec 3 -ErrorAction Stop
+        # -UseBasicParsing, or Windows PowerShell hands the response to the IE
+        # engine and stops the install on an interactive "Script Execution Risk"
+        # prompt that defaults to No. It only fires once a backend is actually
+        # up and returning a body — a first install has nothing listening, the
+        # request fails outright, and the parse never happens. So this bites on
+        # re-runs and upgrades, never on the machine you first tested. Both
+        # endpoints return JSON that nothing here reads; only the status matters.
+        $null = Invoke-WebRequest -Uri $HealthUrl -TimeoutSec 3 -UseBasicParsing -ErrorAction Stop
+        $null = Invoke-WebRequest -Uri $ArangoUrl -TimeoutSec 3 -UseBasicParsing -ErrorAction Stop
         return $true
     } catch { return $false }
 }
@@ -256,7 +263,6 @@ $Url = "https://github.com/$GithubOrg/$GithubRepo/releases/download/v$Version/$T
 $tmp = "$env:TEMP\$Tarball"
 $InstallDir = "$IxHome\cli"
 
-New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 New-Item -ItemType Directory -Force -Path $IxBin | Out-Null
 
 Write-Host "Downloading CLI..."
@@ -270,25 +276,125 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Ok "Downloaded to $tmp"
 
-if (-not (Test-Path $tmp)) {
+if (-not (Test-Path -LiteralPath $tmp)) {
     Write-Err "Zip missing"
 }
 
-$size = (Get-Item $tmp).Length
+$size = (Get-Item -LiteralPath $tmp).Length
 if ($size -lt 100000) {
     Write-Err "Downloaded file too small (likely failed)"
 }
 
 Write-Host "Extracting CLI..."
-Expand-Archive -Path $tmp -DestinationPath $InstallDir -Force
+
+# The zip nests everything under ix-<version>-windows-amd64\, and Expand-Archive
+# has no --strip-components. Extracting straight into cli\ therefore produced
+# cli\ix-<version>-windows-amd64\compass\, while the CLI only ever looks in
+# cli\compass (COMPASS_DIR in upgrade.ts, findCompassDist in view.ts). Every
+# Windows install shipped a Compass that `ix view` could not see and fell back
+# to a network repair that is not guaranteed to work — so `ix view` was broken
+# on Windows even when the release bundled Compass correctly.
+#
+# Collapse that directory here. install.sh has always stripped it via tar, and
+# `ix upgrade` already resolves either shape, so this makes a fresh Windows
+# install match both.
+# `.cli-staging-<pid>`, not a fixed name: sweepUpgradeOrphans in upgrade.ts
+# reclaims `.cli-staging-*` and `.cli-backup-*`, so an installer killed
+# mid-extract is cleaned up by the next `ix upgrade` instead of leaking a copy
+# of the release into IX_HOME forever. The pid also keeps two concurrent runs
+# from sharing a staging directory.
+$Staging = "$IxHome\.cli-staging-$PID"
+Remove-Item -Recurse -Force -LiteralPath $Staging -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $Staging | Out-Null
+# -LiteralPath: -Path glob-expands, so a home directory containing [ or ] takes
+# these off the real file — measured on 5.1, `Test-Path` returns False for a
+# file that exists and `Remove-Item` silently no-ops. extractZipOnWindows in
+# upgrade.ts already uses it for this reason. Applied to every path-taking
+# cmdlet from the download onwards, not just this block: the zip's own
+# Test-Path/Get-Item run first, so hardening only the extract would still have
+# left the installer dying at "Zip missing" on such a home.
+Expand-Archive -LiteralPath $tmp -DestinationPath $Staging -Force
+
+# Exactly one directory, not merely the first of several — the same rule
+# soleChildDir applies in upgrade.ts. `Select-Object -First 1` would pick one
+# of several arbitrarily and could collapse the wrong tree into cli\.
+# -Force counts hidden directories, so this stays the same test install.sh
+# makes with `find -type d`, which counts them too.
+$TopDirs = @(Get-ChildItem -LiteralPath $Staging -Directory -Force)
+if ($TopDirs.Count -ne 1 -or -not (Test-Path -LiteralPath (Join-Path $TopDirs[0].FullName "ix.cmd"))) {
+    Remove-Item -Recurse -Force -LiteralPath $Staging -ErrorAction SilentlyContinue
+    Write-Err "Extracted archive is not an ix release: expected one top-level directory containing ix.cmd, found $($TopDirs.Count). Left the existing install untouched."
+}
+$Extracted = $TopDirs[0]
+
+# Swap only once the new tree is known good, and move the old one aside instead
+# of deleting it so a failed move can be undone. Deleting first is what left
+# Windows users with no CLI at all in #337.
+$Backup = "$IxHome\.cli-backup-$PID"
+
+# Clear the backup path first, as swapInStagedTree does with rmQuiet(backupDir).
+# Directory::Move refuses to move onto an existing destination, so a stale
+# .cli-backup-<pid> — left by an earlier run that died mid-swap, on a pid Windows
+# has since reused — would abort the swap. Check it actually went: -ErrorAction
+# SilentlyContinue hides a removal that *failed* exactly as well as one that had
+# nothing to do, and a locked leftover would otherwise send the swap in blind.
+Remove-Item -Recurse -Force -LiteralPath $Backup -ErrorAction SilentlyContinue
+if (Test-Path -LiteralPath $Backup) {
+    Remove-Item -Recurse -Force -LiteralPath $Staging -ErrorAction SilentlyContinue
+    Write-Err "Could not clear a leftover backup at $Backup. Remove it and re-run. Left the existing install untouched."
+}
+
+# [System.IO.Directory]::Move, not Move-Item.
+#
+# Move-Item on a directory falls back to a recursive copy-then-delete whenever
+# the rename cannot be done, and then throws *part way through* — leaving the
+# tree split across both paths, ix.cmd in the backup and cli\dist\cli\main.js
+# still in cli\. The restore below cannot fire in that state, because it guards
+# on `-not (Test-Path $InstallDir)` and $InstallDir still exists. So the branch
+# written to protect the user's CLI is skipped in precisely the case that
+# destroyed it, and the installer exits reporting only the lock message.
+#
+# On Windows an open handle under cli\ is routine rather than exotic: a running
+# `ix view` serving compass out of cli\compass, `ix watch` holding tree-sitter's
+# .node addons mapped for the life of the process, or Defender scanning the
+# native modules the extract just wrote.
+#
+# Directory::Move is a plain rename — it either happens or the source is left
+# untouched, and it will not move a directory *inside* an existing destination
+# the way Move-Item does. That is the atomicity swapInStagedTree gets for free
+# from fs.renameSync, and which this block only claimed to match.
+try {
+    if (Test-Path -LiteralPath $InstallDir) { [System.IO.Directory]::Move($InstallDir, $Backup) }
+    [System.IO.Directory]::Move($Extracted.FullName, $InstallDir)
+    Remove-Item -Recurse -Force -LiteralPath $Backup -ErrorAction SilentlyContinue
+} catch {
+    # Capture before the nested try below rebinds $_, and unwrap the
+    # MethodInvocationException so the message is the IO error itself rather
+    # than 'Exception calling "Move" with "2" argument(s)'.
+    $failure = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+    if ((Test-Path -LiteralPath $Backup) -and -not (Test-Path -LiteralPath $InstallDir)) {
+        try {
+            [System.IO.Directory]::Move($Backup, $InstallDir)
+            Write-Warn "Restored the previous CLI after a failed update."
+        } catch {
+            # Name the surviving copy, the way upgrade.ts does when its own
+            # restore fails. Without this the user cannot tell that the install
+            # is gone rather than merely unchanged.
+            Write-Warn "Your previous CLI is still at $Backup — rename it to $InstallDir to restore it."
+        }
+    }
+    Remove-Item -Recurse -Force -LiteralPath $Staging -ErrorAction SilentlyContinue
+    Write-Err "Could not install to $InstallDir : $failure"
+}
+Remove-Item -Recurse -Force -LiteralPath $Staging -ErrorAction SilentlyContinue
 Write-Ok "Extraction complete"
 
-Remove-Item $tmp -Force
+Remove-Item -LiteralPath $tmp -Force
 
 @"
 @echo off
-"%~dp0..\cli\ix-$Version-windows-amd64\ix.cmd" %*
-"@ | Out-File "$IxBin\ix.cmd" -Encoding ascii
+"%~dp0..\cli\ix.cmd" %*
+"@ | Out-File -LiteralPath "$IxBin\ix.cmd" -Encoding ascii
 
 $userPath = [Environment]::GetEnvironmentVariable("PATH","User")
 if ($userPath -notlike "*$IxBin*") {
@@ -310,18 +416,18 @@ if ($BackendVer) {
 # stayed broken forever.
 #
 # This tests the path the CLI actually reads (COMPASS_DIR in upgrade.ts,
-# findCompassDist in view.ts), not where the archive extracted. They differ here:
-# Expand-Archive has no --strip-components, so a bundled compass lands in
-# cli\ix-<version>-windows-amd64\compass\ and the CLI cannot see it. Do not
-# "fix" this by pointing at that path — stamping a version for a bundle
-# `ix view` will never find re-creates the poisoned stamp this change removes.
-# Leaving it unstamped lets `ix upgrade` install a copy where the CLI looks.
+# findCompassDist in view.ts). The extraction above collapses the archive's
+# top-level directory, so that is now also where the bundled compass lands and
+# this branch stamps a bundle `ix view` can genuinely serve. Keep the Test-Path
+# on index.html: stamping a version for a compass that is not on disk is what
+# made `ix upgrade` skip the repair download and break `ix view` permanently.
+# The warning below is now a real failure signal, not the normal Windows path.
 $CompassVer = Get-CompassLatestVersion
 $CompassDir = Join-Path $IxHome "cli\compass"
 $CompassIndex = Join-Path $CompassDir "index.html"
-if ($CompassVer -and (Test-Path $CompassIndex)) {
+if ($CompassVer -and (Test-Path -LiteralPath $CompassIndex)) {
     [System.IO.File]::WriteAllText((Join-Path $CompassDir ".version"), $CompassVer)
-} elseif (-not (Test-Path $CompassIndex)) {
+} elseif (-not (Test-Path -LiteralPath $CompassIndex)) {
     Write-Warn "System Compass is not installed at $CompassDir — 'ix view' is unavailable until you run 'ix upgrade', which will fetch it."
 }
 
