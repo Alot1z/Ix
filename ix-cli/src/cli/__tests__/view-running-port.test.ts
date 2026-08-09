@@ -150,4 +150,65 @@ describe("view running port state", () => {
     expect(existsSync(scopeFile())).toBe(false);
     expect(existsSync(portFile())).toBe(false);
   });
+
+  it("says the requested port was not honoured", async () => {
+    seedRunningState(19123);
+    vi.spyOn(process, "kill").mockReturnValue(true);
+
+    const output = await runView(["-p", "19124", "start", "--no-open", "--all"]);
+
+    // Printing only the correct URL leaves the user believing -p moved the
+    // server. It did not, and the difference is one digit.
+    expect(output).toContain("You asked for port 19124");
+    expect(output).toContain("it is serving on 19123");
+  });
+
+  it("stays quiet when no port was asked for", async () => {
+    seedRunningState(19123);
+    vi.spyOn(process, "kill").mockReturnValue(true);
+
+    const output = await runView(["start", "--no-open", "--all"]);
+
+    expect(output).toContain("http://localhost:19123");
+    expect(output).not.toContain("You asked for port");
+  });
+
+  it("reports the URL from status", async () => {
+    seedRunningState(19123);
+    vi.spyOn(process, "kill").mockReturnValue(true);
+
+    expect(await runView(["status"])).toContain("http://localhost:19123");
+  });
+
+  it("omits the URL from status when the port is unknown", async () => {
+    seedRunningState();
+    vi.spyOn(process, "kill").mockReturnValue(true);
+
+    expect(await runView(["status"])).not.toContain("http://localhost");
+  });
+});
+
+describe("runningInstanceLines", () => {
+  it("never builds a URL from the requested port", async () => {
+    const { runningInstanceLines } = await import("../commands/view.js");
+    const lines = runningInstanceLines(19123, 19124, true);
+
+    expect(lines[0]).toBe("  http://localhost:19123");
+    expect(lines.some(l => l.includes("http://localhost:19124"))).toBe(false);
+  });
+
+  it("does not warn when the running port is the one that was asked for", async () => {
+    const { runningInstanceLines } = await import("../commands/view.js");
+    expect(runningInstanceLines(8080, 8080, true)).toEqual(["  http://localhost:8080"]);
+  });
+
+  it("admits it does not know rather than guessing", async () => {
+    const { runningInstanceLines } = await import("../commands/view.js");
+    const lines = runningInstanceLines(null, 8080, true);
+
+    // A confidently wrong URL is the bug #358 removed; do not reintroduce it
+    // through the warning path.
+    expect(lines.some(l => l.includes("http://localhost"))).toBe(false);
+    expect(lines.join("\n")).toContain("unknown");
+  });
 });
