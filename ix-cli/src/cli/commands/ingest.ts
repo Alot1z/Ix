@@ -264,6 +264,184 @@ function stripMapModeOps(patch: GraphPatchPayload): GraphPatchPayload {
   };
 }
 
+interface StoredPatchEntities {
+  nodeIds: string[];
+}
+
+function readStoredPatchEntities(raw: unknown): StoredPatchEntities | null {
+  const data = (raw as { data?: unknown } | null)?.data as {
+    entityIds?: unknown;
+    nodeOpCount?: unknown;
+    ops?: unknown;
+  } | undefined;
+  if (!data) return null;
+  if (Array.isArray(data.ops)) {
+    const ops = data.ops as Array<{ type?: unknown; id?: unknown }>;
+    return {
+      nodeIds: ops
+        .filter(op => op.type === 'UpsertNode' || op.type === 'DeleteNode')
+        .map(op => op.id)
+        .filter((id): id is string => typeof id === 'string'),
+    };
+  }
+  if (!Array.isArray(data.entityIds)) return null;
+  if (!Number.isInteger(data.nodeOpCount)) return null;
+
+  const nodeCount = data.nodeOpCount as number;
+  const entityIds = data.entityIds.filter((id): id is string => typeof id === 'string');
+  if (nodeCount < 0 || entityIds.length < nodeCount) return null;
+
+  return {
+    nodeIds: entityIds.slice(0, nodeCount),
+  };
+}
+
+async function loadStoredPatchEntities(
+  client: Pick<IxClient, 'getPatch'>,
+  patchIds: string[],
+): Promise<StoredPatchEntities> {
+  for (const patchId of patchIds) {
+    try {
+      const entities = readStoredPatchEntities(await client.getPatch(patchId));
+      if (entities) return entities;
+      throw new Error(`Patch ${patchId} has no entity manifest`);
+    } catch (err) {
+      if (!String(err).includes('404:')) throw err;
+    }
+  }
+  throw new Error('Previous source patch was not found');
+}
+
+export async function reconcileRemovedEntities(
+  client: Pick<IxClient, 'getPatch' | 'entity'>,
+  patch: GraphPatchPayload,
+  previousPatchIds: string[],
+  dependentSourceUris?: Set<string>,
+  // `ix map` does not write chunks: stripMapModeOps drops every chunk UpsertNode
+  // from the patch. It does NOT drop DeleteNode, and chunk ids hash the chunk's
+  // start line, so any edit that shifts lines makes every downstream chunk look
+  // removed. Reconciling without this flag therefore had `ix map` after an
+  // `ix ingest` delete the file's chunks and never recreate them — the cheaper
+  // command silently destroying embedding data the expensive one built. Chunks
+  // are not map mode's to reconcile, so in map mode they are left alone.
+  mapMode = false,
+): Promise<GraphPatchPayload> {
+  const previous = await loadStoredPatchEntities(client, previousPatchIds);
+  const currentNodeIds = new Set(
+    patch.ops
+      .filter(op => op.type === 'UpsertNode')
+      .map(op => op['id'])
+      .filter((id): id is string => typeof id === 'string'),
+  );
+  const currentEdgeIds = new Set(
+    patch.ops
+      .filter(op => op.type === 'UpsertEdge')
+      .map(op => op['id'])
+      .filter((id): id is string => typeof id === 'string'),
+  );
+  const candidateNodeIds = previous.nodeIds.filter(id => !currentNodeIds.has(id));
+  const removedNodeIds: string[] = [];
+  const removedEdgeIds = new Set<string>();
+  const CHUNK_PREDICATES = new Set(['CONTAINS_CHUNK', 'NEXT']);
+
+  for (const nodeId of candidateNodeIds) {
+    try {
+      const entity = await client.entity(nodeId);
+      // The lookup is already being made for the incident edges, so the kind
+      // costs nothing extra. A node whose kind cannot be read (404 — already
+      // gone) falls through to the delete, which is a no-op server-side.
+      if (mapMode && (entity.node as { kind?: unknown } | undefined)?.kind === 'chunk') {
+        continue;
+      }
+      removedNodeIds.push(nodeId);
+      for (const edge of entity.edges ?? []) {
+        const edgeRecord = edge as {
+          id?: unknown;
+          provenance?: { sourceUri?: unknown; source_uri?: unknown };
+        };
+        const edgeId = edgeRecord.id;
+        const predicate = (edge as { predicate?: unknown }).predicate;
+        const isChunkEdge = typeof predicate === 'string' && CHUNK_PREDICATES.has(predicate);
+        if (typeof edgeId === 'string' && !currentEdgeIds.has(edgeId) && !(mapMode && isChunkEdge)) {
+          removedEdgeIds.add(edgeId);
+        }
+        const sourceUri = edgeRecord.provenance?.sourceUri ?? edgeRecord.provenance?.source_uri;
+        if (
+          dependentSourceUris &&
+          typeof sourceUri === 'string' &&
+          sourceUri !== patch.source.uri
+        ) {
+          dependentSourceUris.add(sourceUri);
+        }
+      }
+    } catch (err) {
+      if (!String(err).includes('404:')) throw err;
+      // Already absent. Emitting the delete anyway keeps the patch a complete
+      // statement of intent and costs nothing.
+      removedNodeIds.push(nodeId);
+    }
+  }
+
+  const nodeOps = patch.ops.filter(op => op.type === 'UpsertNode' || op.type === 'DeleteNode');
+  const edgeOps = patch.ops.filter(op => op.type === 'UpsertEdge' || op.type === 'DeleteEdge');
+  const otherOps = patch.ops.filter(op =>
+    op.type !== 'UpsertNode' && op.type !== 'DeleteNode' &&
+    op.type !== 'UpsertEdge' && op.type !== 'DeleteEdge'
+  );
+
+  return {
+    ...patch,
+    ops: [
+      ...removedNodeIds.map(id => ({ type: 'DeleteNode', id })),
+      ...nodeOps,
+      ...[...removedEdgeIds].map(id => ({ type: 'DeleteEdge', id })),
+      ...edgeOps,
+      ...otherOps,
+    ],
+  };
+}
+
+export function patchRequiresPerFileCommit(patch: GraphPatchPayload): boolean {
+  return patch.ops.some(op => op.type === 'DeleteNode' || op.type === 'DeleteEdge');
+}
+
+export function planDeletedFileRecovery(
+  projectRoot: string,
+  filePaths: string[],
+  deletedFiles: Map<string, string[]>,
+): {
+  previousDeletedFiles: Map<string, string[]>;
+  nextDeletedFiles: Map<string, string[]>;
+  recreatedPaths: string[];
+  forceReingestPaths: Set<string>;
+} {
+  const previousDeletedFiles = new Map<string, string[]>();
+  for (const [deletedPath, dependents] of deletedFiles) {
+    const absolutePath = nodePath.isAbsolute(deletedPath)
+      ? nodePath.resolve(deletedPath)
+      : nodePath.resolve(projectRoot, deletedPath);
+    previousDeletedFiles.set(absolutePath, dependents);
+  }
+
+  const nextDeletedFiles = new Map(previousDeletedFiles);
+  const filePathSet = new Set(filePaths.map(filePath => nodePath.resolve(filePath)));
+  const recreatedPaths = [...previousDeletedFiles.keys()].filter(filePath =>
+    filePathSet.has(filePath)
+  );
+  const forceReingestPaths = new Set<string>();
+  for (const recreatedPath of recreatedPaths) {
+    for (const dependent of previousDeletedFiles.get(recreatedPath) ?? []) {
+      const absoluteDependent = nodePath.isAbsolute(dependent)
+        ? nodePath.resolve(dependent)
+        : nodePath.resolve(projectRoot, dependent);
+      if (filePathSet.has(absoluteDependent)) forceReingestPaths.add(absoluteDependent);
+    }
+    nextDeletedFiles.delete(recreatedPath);
+  }
+
+  return { previousDeletedFiles, nextDeletedFiles, recreatedPaths, forceReingestPaths };
+}
+
 const COMMIT_CONFLICT_RETRY_PATTERNS = [
   'write-write conflict',
   'timeout waiting to lock key',
@@ -310,10 +488,6 @@ async function retryOnConflict<T>(fn: () => Promise<T>, maxRetries: number): Pro
 // Mtime cache — skip readFileSync+sha256 for unchanged files
 // ---------------------------------------------------------------------------
 
-function loadMtimeCache(projectRoot: string): Map<string, number> {
-  return loadIngestBaseline(projectRoot)?.files ?? new Map();
-}
-
 export function persistIngestBaselineIfClean(
   projectRoot: string,
   mtimes: Map<string, number>,
@@ -321,9 +495,21 @@ export function persistIngestBaselineIfClean(
   parseErrors: number,
   commitErrors: number,
   now?: Date,
+  deletedFiles: Map<string, string[]> = new Map(),
 ): boolean {
-  if (!ingestCompletedCleanly(parseErrors, commitErrors) || mtimes.size === 0) return false;
-  saveIngestBaseline(projectRoot, mtimes, currentRev, now);
+  if (!ingestCompletedCleanly(parseErrors, commitErrors)) return false;
+  // An empty mtime map is normally a discovery failure, not an empty repo —
+  // an over-broad ignore rule, the wrong cwd, a glob that matched nothing —
+  // and persisting it silently discards the baseline, forcing a full re-ingest
+  // next run. The original guard rejected every empty map for that reason.
+  //
+  // But deleting the last mapped file legitimately produces one, and refusing
+  // to record that leaves the baseline claiming files that are gone. So the
+  // guard now asks *why* the map is empty: with deletions recorded this run,
+  // empty is a real state and is persisted; without them, it is still treated
+  // as discovery having gone wrong.
+  if (mtimes.size === 0 && deletedFiles.size === 0) return false;
+  saveIngestBaseline(projectRoot, mtimes, currentRev, now, deletedFiles);
   return true;
 }
 
@@ -484,7 +670,17 @@ export async function ingestFiles(
   const mapMode = opts.mapMode === true;
   const trueStart = performance.now();
 
-  const [{ parseFile, resolveEdges, isGrammarSupported }, { buildPatchWithResolution, fileNodeId, symbolNodeId }, { languageFromPath }] = await loadIngestionModules();
+  const [
+    { parseFile, resolveEdges, isGrammarSupported },
+    {
+      buildPatchWithResolution,
+      buildDeletionPatch,
+      sourcePatchIdCandidates,
+      fileNodeId,
+      symbolNodeId,
+    },
+    { languageFromPath },
+  ] = await loadIngestionModules();
   const moduleLoadMs = Math.round(performance.now() - trueStart);
 
 
@@ -847,7 +1043,20 @@ export async function ingestFiles(
     const projectRoot = fs.statSync(resolvedPath).isDirectory() ? resolvedPath : nodePath.dirname(resolvedPath);
     // A just-migrated workspace (new path-based id) has no nodes under the new id, so
     // skip the mtime pre-filter and re-ingest everything, exactly like --force.
-    const mtimeCache  = (opts.force || workspaceMigrated) ? new Map<string, number>() : loadMtimeCache(projectRoot);
+    const previousBaseline = loadIngestBaseline(projectRoot);
+    const previousMtimes = previousBaseline?.files ?? new Map<string, number>();
+    const {
+      previousDeletedFiles,
+      nextDeletedFiles,
+      forceReingestPaths,
+    } = planDeletedFileRecovery(
+      projectRoot,
+      filePaths,
+      previousBaseline?.deletedFiles ?? new Map(),
+    );
+    const mtimeCache = (opts.force || workspaceMigrated)
+      ? new Map<string, number>()
+      : new Map(previousMtimes);
     const currentMtimes = new Map<string, number>();
 
     // DB-reset guard: if the mtime cache has entries but the server returns no hashes
@@ -871,7 +1080,7 @@ export async function ingestFiles(
         if (st.size > MAX_FILE_BYTES) { tooLarge++; progressCurrent++; continue; }
         const mtime = st.mtimeMs;
         currentMtimes.set(filePath, mtime);
-        if (!opts.force && mtimeCache.get(filePath) === mtime) {
+        if (!opts.force && !forceReingestPaths.has(filePath) && mtimeCache.get(filePath) === mtime) {
           filesSkipped++;
           progressCurrent++;   // mtime clean — assume unchanged
         } else {
@@ -884,10 +1093,38 @@ export async function ingestFiles(
       }
     }
 
-    // Phase: hash lookup — only needed when mtime-changed files exist.
+    const deletedPaths = workspaceMigrated
+      ? []
+      : [...previousMtimes.keys()].filter(filePath =>
+          !currentMtimes.has(filePath) && !fs.existsSync(filePath)
+        );
+
+    // Phase: hash lookup — only needed when files changed or were deleted.
     let knownHashes: Map<string, string>;
-    if (opts.force || mtimeChangedPaths.length > 0) {
-      knownHashes = await loadExistingHashes(client, opts.force ? filePaths : mtimeChangedPaths, toWorkspaceRelative, sourceWorkspaceIdOf, debug);
+    const hashLookupPaths = opts.force
+      ? [...filePaths, ...deletedPaths]
+      : [...mtimeChangedPaths, ...deletedPaths];
+    // Deleting from an unreliable baseline is how data gets lost, so the lookup
+    // fails closed when deletions are pending — but only the *deletions* need
+    // that guarantee. Letting the throw escape aborted the entire map over one
+    // transient blip, taking the ordinary ingest of every changed file with it.
+    // So catch it here: drop the deletions for this run (they stay in the
+    // baseline and are retried next time) and let the rest proceed.
+    if (hashLookupPaths.length > 0) {
+      try {
+        knownHashes = await loadExistingHashes(
+          client,
+          hashLookupPaths,
+          toWorkspaceRelative,
+          sourceWorkspaceIdOf,
+          debug,
+          deletedPaths.length > 0,
+        );
+      } catch (err) {
+        if (debug) process.stderr.write(`\n  [deletion cleanup skipped] hash lookup failed: ${err}\n`);
+        deletedPaths.length = 0;
+        knownHashes = new Map();
+      }
       if (debug) process.stderr.write(`\n  Source hash lookup: ${knownHashes.size} known hashes (${mtimeChangedPaths.length} mtime-changed)\n`);
     } else {
       // All files are mtime-clean — skip server round-trip entirely.
@@ -952,14 +1189,30 @@ export async function ingestFiles(
     const commitPreparedPatches = async (
       preparedPatches: PreparedPatch[],
       totalFiles: number,
-      opts?: { updateProgress?: boolean },
+      opts?: {
+        updateProgress?: boolean;
+        onCommitted?: (item: PreparedPatch, rev: number) => void;
+      },
     ): Promise<number> => {
       if (preparedPatches.length === 0) return 0;
 
       const chunks: PreparedPatch[][] = [];
-      for (let i = 0; i < preparedPatches.length; i += COMMIT_HTTP_MAX_FILES) {
-        chunks.push(preparedPatches.slice(i, i + COMMIT_HTTP_MAX_FILES));
+      let bulkChunk: PreparedPatch[] = [];
+      const flushBulkChunk = (): void => {
+        if (bulkChunk.length === 0) return;
+        chunks.push(bulkChunk);
+        bulkChunk = [];
+      };
+      for (const item of preparedPatches) {
+        if (patchRequiresPerFileCommit(item.patch)) {
+          flushBulkChunk();
+          chunks.push([item]);
+        } else {
+          bulkChunk.push(item);
+          if (bulkChunk.length === COMMIT_HTTP_MAX_FILES) flushBulkChunk();
+        }
       }
+      flushBulkChunk();
 
       const commitMsPerChunk = new Array<number>(chunks.length).fill(0);
       let nextChunk = 0;
@@ -973,24 +1226,9 @@ export async function ingestFiles(
         const endFile = chunk[chunk.length - 1].fileNumber;
         const endingPath = nodePath.basename(chunk[chunk.length - 1].filePath);
         const patches = chunk.map(item => item.patch);
-
-        try {
-          setCurrentWork(`commit ${startFile}-${endFile} of ${totalFiles} ending ${endingPath}`);
-          const commitStart = performance.now();
-          const result = await retryOnConflict(() => client.commitPatchBulk(patches), COMMIT_CONFLICT_RETRIES);
-          const chunkMs = Math.round(performance.now() - commitStart);
-          commitMsPerChunk[ci] = chunkMs;
-          timings.bulkCommitMs += chunkMs;
-          if (result.rev > latestRev) latestRev = result.rev;
-          patchesApplied += patches.length;
-        } catch (err) {
-          if (debug) {
-            process.stderr.write(
-              `\n  [bulk failed, falling back to per-file] files ${startFile}-${endFile} (${patches.length} patches): ${err}\n`
-            );
-          }
+        const commitIndividually = async (): Promise<void> => {
           // Chain this chunk's fallback work onto the shared tail so that only one
-          // fallback loop runs at a time. This prevents concurrent commitPatch
+          // per-file loop runs at a time. This prevents concurrent commitPatch
           // transactions from racing on revisions.current (write-write conflict).
           const prev = fallbackTail;
           let resolveThis!: () => void;
@@ -1006,6 +1244,7 @@ export async function ingestFiles(
                 timings.fallbackCommitMs += chunkMs;
                 if (result.rev > latestRev) latestRev = result.rev;
                 patchesApplied++;
+                opts?.onCommitted?.(item, result.rev);
               } catch (commitErr) {
                 // Counted apart from parseErrors: a patch that parsed fine and
                 // failed to commit means the graph is now behind the working
@@ -1022,6 +1261,31 @@ export async function ingestFiles(
             }
           } finally {
             resolveThis();
+          }
+        };
+
+        const hasDeletion = patches.some(patchRequiresPerFileCommit);
+
+        if (hasDeletion) {
+          await commitIndividually();
+        } else {
+          try {
+            setCurrentWork(`commit ${startFile}-${endFile} of ${totalFiles} ending ${endingPath}`);
+            const commitStart = performance.now();
+            const result = await retryOnConflict(() => client.commitPatchBulk(patches), COMMIT_CONFLICT_RETRIES);
+            const chunkMs = Math.round(performance.now() - commitStart);
+            commitMsPerChunk[ci] = chunkMs;
+            timings.bulkCommitMs += chunkMs;
+            if (result.rev > latestRev) latestRev = result.rev;
+            patchesApplied += patches.length;
+            for (const item of chunk) opts?.onCommitted?.(item, result.rev);
+          } catch (err) {
+            if (debug) {
+              process.stderr.write(
+                `\n  [bulk failed, falling back to per-file] files ${startFile}-${endFile} (${patches.length} patches): ${err}\n`
+              );
+            }
+            await commitIndividually();
           }
         }
 
@@ -1078,7 +1342,17 @@ export async function ingestFiles(
         for (let j = 0; j < batch.length; j++) {
           const { parsed: p, hash, previousHash } = batch[j];
           try {
-            let patch = buildPatchFn!(p, hash, fileWorkspaceId(p.filePath), batchEdgesByFile.get(p.filePath) ?? emptyEdges, previousHash, fileMultiRepo(p.filePath));
+            const fileWorkspace = fileWorkspaceId(p.filePath);
+            let patch = buildPatchFn!(p, hash, fileWorkspace, batchEdgesByFile.get(p.filePath) ?? emptyEdges, previousHash, fileMultiRepo(p.filePath));
+            if (previousHash) {
+              patch = await reconcileRemovedEntities(
+                client,
+                patch,
+                sourcePatchIdCandidates(p.filePath, previousHash, fileWorkspace),
+                undefined,
+                mapMode,
+              );
+            }
             if (mapMode) patch = stripMapModeOps(patch);
             // source.uri (workspace-relative) and source.workspaceId are set
             // inside buildPatch; the backend stores both as opaque attributes.
@@ -1147,7 +1421,17 @@ export async function ingestFiles(
         for (let j = 0; j < allParsed.length; j++) {
           const { parsed: p, hash, previousHash } = allParsed[j];
           try {
-            let patch = buildPatchFn!(p, hash, fileWorkspaceId(p.filePath), edgesByFile.get(p.filePath) ?? emptyEdges, previousHash, fileMultiRepo(p.filePath));
+            const fileWorkspace = fileWorkspaceId(p.filePath);
+            let patch = buildPatchFn!(p, hash, fileWorkspace, edgesByFile.get(p.filePath) ?? emptyEdges, previousHash, fileMultiRepo(p.filePath));
+            if (previousHash) {
+              patch = await reconcileRemovedEntities(
+                client,
+                patch,
+                sourcePatchIdCandidates(p.filePath, previousHash, fileWorkspace),
+                undefined,
+                mapMode,
+              );
+            }
             if (mapMode) patch = stripMapModeOps(patch);
             // source.uri and source.workspaceId are set inside buildPatch (see flushBatch).
             preparedPatches.push(makePreparedPatch(patch, j + 1, p.filePath));
@@ -1192,7 +1476,11 @@ export async function ingestFiles(
         try {
           const bytes = fs.readFileSync(filePath);
           const hash = sha256(bytes);
-          if (knownHashes.get(filePath) === hash) { filesSkipped++; progressCurrent++; continue; }
+          if (!forceReingestPaths.has(filePath) && knownHashes.get(filePath) === hash) {
+            filesSkipped++;
+            progressCurrent++;
+            continue;
+          }
           const previousHash = knownHashes.get(filePath);
           changedPaths.push({ filePath, bytes, hash, previousHash: previousHash !== hash ? previousHash : undefined });
         } catch (err) {
@@ -1356,7 +1644,10 @@ export async function ingestFiles(
               await fh.close();
             }
             const hash = sha256(bytes);
-            if (!opts.force && knownHashes.get(absFilePath) === hash) { filesSkipped++; return; }
+            if (!opts.force && !forceReingestPaths.has(absFilePath) && knownHashes.get(absFilePath) === hash) {
+              filesSkipped++;
+              return;
+            }
             const previousHash = knownHashes.get(absFilePath);
             const sourceText = bytes.toString('utf-8');
             if (isLikelyMinifiedSource(sourceText)) {
@@ -1397,6 +1688,80 @@ export async function ingestFiles(
     // Clear the parse bar
     if (interval) process.stderr.write('\r' + ' '.repeat(PROG_LINE_WIDTH) + '\r');
 
+    if (deletedPaths.length > 0) {
+      progressPhase = 'Saving';
+      progressTotal = deletedPaths.length;
+      progressCurrent = 0;
+      const deletedPatches: PreparedPatch[] = [];
+      const durableDeletedFiles = new Map(previousDeletedFiles);
+      const pendingDeletionRecovery = new Map<
+        string,
+        { absolutePath: string; dependents: string[] }
+      >();
+
+      for (let i = 0; i < deletedPaths.length; i++) {
+        const absFilePath = deletedPaths[i];
+        const previousHash = knownHashes.get(absFilePath);
+        if (!previousHash) {
+          nextDeletedFiles.set(absFilePath, []);
+          progressCurrent++;
+          continue;
+        }
+
+        const relFilePath = toWorkspaceRelative(absFilePath);
+        const fileWorkspace = sourceWorkspaceIdOf(absFilePath);
+        const dependentSourceUris = new Set(nextDeletedFiles.get(absFilePath) ?? []);
+        try {
+          let patch = buildDeletionPatch(
+            relFilePath,
+            previousHash,
+            previousBaseline?.lastIngestAt ?? String(previousMtimes.get(absFilePath) ?? ''),
+            fileWorkspace,
+            [],
+            fileMultiRepo(relFilePath),
+          );
+          patch = await reconcileRemovedEntities(
+            client,
+            patch,
+            sourcePatchIdCandidates(relFilePath, previousHash, fileWorkspace),
+            dependentSourceUris,
+            mapMode,
+          );
+          if (mapMode) patch = stripMapModeOps(patch);
+          deletedPatches.push(makePreparedPatch(patch, i + 1, relFilePath));
+          const dependents = [...dependentSourceUris].sort();
+          nextDeletedFiles.set(absFilePath, dependents);
+          pendingDeletionRecovery.set(relFilePath, {
+            absolutePath: absFilePath,
+            dependents,
+          });
+        } catch (err) {
+          commitErrors++;
+          if (debug) process.stderr.write(`\n  [deletion error] ${relFilePath}: ${err}\n`);
+        }
+        progressCurrent++;
+      }
+
+      if (deletedPatches.length > 0) {
+        filesChanged += deletedPatches.length;
+        await commitPreparedPatches(deletedPatches, deletedPaths.length, {
+          updateProgress: true,
+          onCommitted: item => {
+            const recovery = pendingDeletionRecovery.get(item.filePath);
+            if (!recovery || !previousBaseline) return;
+            durableDeletedFiles.set(recovery.absolutePath, recovery.dependents);
+            saveIngestBaseline(
+              projectRoot,
+              previousMtimes,
+              previousBaseline.currentRev,
+              new Date(previousBaseline.lastIngestAt),
+              durableDeletedFiles,
+            );
+          },
+        });
+      }
+    }
+
     const committed = performance.now();
 
     // Persist mtime cache so next run can skip unchanged files quickly.
@@ -1412,6 +1777,8 @@ export async function ingestFiles(
       latestRev,
       parseErrors,
       commitErrors,
+      undefined,
+      nextDeletedFiles,
     );
 
     // Migration cleanup (Ix#225 gap 2): the re-ingest under the new path-based id has
@@ -1656,6 +2023,7 @@ export async function loadExistingHashes(
   toRelative: (absPath: string) => string,
   workspaceIdOf: (absPath: string) => string,
   debug = false,
+  throwOnError = false,
 ): Promise<Map<string, string>> {
   try {
     // Each file is matched against its OWN workspace's stored hash. The server keys
@@ -1677,6 +2045,7 @@ export async function loadExistingHashes(
     return out;
   } catch (err) {
     if (debug) process.stderr.write(`\n  [hash lookup failed] ${err}\n`);
+    if (throwOnError) throw err;
     return new Map();
   }
 }
