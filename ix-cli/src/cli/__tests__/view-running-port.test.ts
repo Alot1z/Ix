@@ -138,6 +138,64 @@ describe("view running port state", () => {
     expect(existsSync(portFile())).toBe(false);
   });
 
+  it("refuses to read an unreadable PID file as 'not running'", async () => {
+    // A directory where the PID file belongs: present, but the read fails. Only
+    // ENOENT means absent; anything else has to surface. Answering "not
+    // running" here would delete a live server's only record, because both
+    // callers of readAlivePid treat null as licence to act.
+    mkdirSync(pidFile(), { recursive: true });
+    writeFileSync(scopeFile(), "*all*");
+    writeFileSync(portFile(), "19123");
+
+    await expect(runView(["status"])).rejects.toThrow(/EISDIR|EPERM|EACCES/);
+
+    expect(existsSync(scopeFile())).toBe(true);
+    expect(existsSync(portFile())).toBe(true);
+  });
+
+  it("does not spawn a second server when the PID file is unreadable", async () => {
+    // The sharper half of the same bug: swallowing the read error let `start`
+    // run all the way to spawn(), and only then die writing the PID — leaving a
+    // detached visualizer with nothing recording it, which `ix view stop` then
+    // reports as not running and no later `ix view` can get past.
+    mkdirSync(pidFile(), { recursive: true });
+
+    await expect(
+      runView(["start", "--no-open", "--all"]),
+    ).rejects.toThrow(/EISDIR|EPERM|EACCES/);
+
+    expect(mocks.spawn).not.toHaveBeenCalled();
+  });
+
+  it("warns when the running instance is scoped to another workspace", async () => {
+    // Nothing in the suite reached this branch before: every case seeded the
+    // scope file as "*all*" and launched with --all, so the keys always matched
+    // and the warning block never ran.
+    writeFileSync(pidFile(), "4242");
+    writeFileSync(scopeFile(), "some-other-workspace");
+    writeFileSync(portFile(), "19123");
+    vi.spyOn(process, "kill").mockReturnValue(true);
+
+    const output = await runView(["start", "--no-open", "--all"]);
+
+    expect(output).toContain("It is scoped to");
+    expect(output).toContain("rescope");
+  });
+
+  it("treats an empty scope file as unknown, not as a workspace named ''", async () => {
+    // A start interrupted between opening and writing compass.scope leaves it
+    // zero-length. Reading that as a scope makes every later `ix view` tell the
+    // user to tear down an instance that is already scoped correctly.
+    writeFileSync(pidFile(), "4242");
+    writeFileSync(scopeFile(), "");
+    writeFileSync(portFile(), "19123");
+    vi.spyOn(process, "kill").mockReturnValue(true);
+
+    const output = await runView(["start", "--no-open", "--all"]);
+
+    expect(output).not.toContain("It is scoped to");
+  });
+
   it("removes persisted state when the visualizer stops", async () => {
     seedRunningState(19123);
     const kill = vi.spyOn(process, "kill").mockReturnValue(true);
