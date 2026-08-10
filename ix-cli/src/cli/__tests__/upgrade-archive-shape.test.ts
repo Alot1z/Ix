@@ -253,6 +253,41 @@ describe("sweepUpgradeOrphans", () => {
     expect(readFileSync(join(installDir, "cli", "dist", "cli", "main.js"), "utf-8")).toBe("// live\n");
   });
 
+  // install.ps1 downloads to `.cli-staging-<pid>.zip` and tees the compose pull
+  // output to `.cli-staging-pull-<pid>.log`, both inside IX_HOME, because
+  // Windows hands it a TEMP path in 8.3 short form whenever the profile
+  // contains a space and PowerShell's provider cannot resolve one. Moving them
+  // out of TEMP also moved them out from under the OS's own cleanup, so the
+  // installer now leans on this sweep to be the thing that reclaims them after
+  // a run that was killed before its own delete. They are files rather than
+  // directories, which the prefix match above had never been given.
+  it("reclaims the installer's leftover scratch files, not just directories", () => {
+    const installDir = join(root, "cli");
+    mkdirSync(join(installDir, "cli", "dist", "cli"), { recursive: true });
+    writeFileSync(join(installDir, "cli", "dist", "cli", "main.js"), "// live\n");
+    writeFileSync(join(root, ".cli-staging-333.zip"), "PK");
+    writeFileSync(join(root, ".cli-staging-pull-333.log"), "pulling...\n");
+
+    sweepUpgradeOrphans(root, installDir);
+
+    expect(existsSync(join(root, ".cli-staging-333.zip"))).toBe(false);
+    expect(existsSync(join(root, ".cli-staging-pull-333.log"))).toBe(false);
+    expect(readFileSync(join(installDir, "cli", "dist", "cli", "main.js"), "utf-8")).toBe("// live\n");
+  });
+
+  // The zip must not be named `.cli-backup-*`: that prefix is a recovery
+  // candidate, so a leftover would be renamed *over* ~/.ix/cli on the next
+  // upgrade and replace the install with a zip file. This pins the reason for
+  // the name install.ps1 actually uses.
+  it("does not treat a stray file as an install worth recovering", () => {
+    const installDir = join(root, "cli");
+    writeFileSync(join(root, ".cli-staging-444.zip"), "PK");
+
+    sweepUpgradeOrphans(root, installDir);
+
+    expect(existsSync(installDir)).toBe(false);
+  });
+
   it("is a no-op when IX_HOME does not exist yet", () => {
     expect(() => sweepUpgradeOrphans(join(root, "nope"), join(root, "nope", "cli"))).not.toThrow();
   });

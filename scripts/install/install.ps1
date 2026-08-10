@@ -22,6 +22,49 @@ $HealthUrl = "http://localhost:8090/v1/health"
 $ArangoUrl = "http://localhost:8529/_api/version"
 $NodeMinMajor = 22
 
+# Installer scratch files live under $IxHome, never under $env:TEMP.
+#
+# #349: on a profile at `C:\Users\Win 10`, Windows hands the installer a TEMP
+# path in 8.3 short form and the run dies after extraction. The reporter
+# confirmed that pointing TEMP and TMP at a path without a space lets the same
+# install finish, so the short TEMP path is what breaks it.
+#
+# The issue quotes the error verbatim as
+#   An object at the specified path C:\Users\WIN10\~1 does not exist.
+# -- note the backslash before `~1`. Probably a copy artifact, since
+# `C:\Users\WIN10~1` is the 8.3 alias of `C:\Users\Win 10` and a literal `~1`
+# directory makes no sense, but it has not been confirmed with the reporter and
+# the 8.3 reading depends on that one character. Quoted as written rather than
+# normalised, because the whole point of the block below is which parts of this
+# are established.
+#
+# $IxHome comes from USERPROFILE, which is the long form. $Staging was already
+# there, so moving these two takes the script off TEMP completely.
+#
+# What is NOT established is which call fails, or why -- treat the mechanism as
+# open until a fresh transcript says otherwise:
+#   - The provider cmdlets this script runs on the zip (`Test-Path
+#     -LiteralPath`, `Get-Item -LiteralPath`) resolve 8.3 segments fine on both
+#     Windows PowerShell 5.1 and 7, and the reporter's transcript shows them
+#     succeeding -- extraction completes before the error appears.
+#   - `Expand-Archive` resolves through the provider too (Resolve-Path in
+#     Microsoft.PowerShell.Archive), so this is not a Win32-vs-provider split.
+#   - That error string could not be reproduced from any cmdlet this script
+#     calls; the ones that fail on a missing path say "Cannot find path".
+# The likeliest remaining explanation is that 8.3 alias *creation* is disabled
+# on that volume while TEMP still carries a stale short path, so nothing
+# resolves it. Moving off TEMP fixes that reading too, which is why this is
+# worth shipping ahead of the diagnosis.
+#
+# Note `ix upgrade` still stages through os.tmpdir() (upgrade.ts), which on
+# Windows is TEMP verbatim. If this class is real, it is unfixed there.
+#
+# The `.cli-staging-` prefix on both scratch names is deliberate:
+# sweepUpgradeOrphans in upgrade.ts reclaims `.cli-staging-*` out of IX_HOME.
+# It must not be `.cli-backup-`: that prefix is a *recovery* candidate there,
+# and a leftover zip would be renamed over the install directory on the next
+# upgrade.
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 function Pause-On-Failure {
@@ -33,8 +76,60 @@ function Pause-On-Failure {
 
 function Write-Ok($msg) { Write-Host "  [ok] $msg" -ForegroundColor Green }
 function Write-Warn($msg) { Write-Host "  [!!] $msg" -ForegroundColor Yellow }
+# Leaving TEMP also left the OS's own cleanup, so every exit has to clear its
+# own scratch. sweepUpgradeOrphans covers a process killed outright, but it runs
+# only from `ix upgrade` and only when an update is actually available -- and a
+# first install that dies at the download leaves no `ix` on the machine to ever
+# run it, so a partial multi-MB zip would sit in ~/.ix forever. Write-Err is the
+# single exit for every failure below, which makes it the one place this has to
+# be right.
+#
+# Rebuilds the two names from $IxHome and $PID rather than reading $tmp and
+# $pullLog. README ships this as `irm ... | iex`, so the script body runs in the
+# *caller's* scope -- the same hazard the $Matches note below already calls out.
+# Every Write-Err above the assignments (and all of them, on the re-run path,
+# where $pullLog is never assigned because the backend is already healthy) would
+# otherwise read whatever the user's own session had in those names and delete
+# it. $IxHome is assigned unconditionally at the top, long before any Write-Err
+# is reachable, so it is always ours.
+#
+# -PathType Leaf so a *directory* sitting on either name is skipped rather than
+# removed. (Not $Staging -- that is `.cli-staging-<pid>` with no suffix and
+# cannot collide with the `.zip`/`.log` names built here.) Two measured cases:
+# a stale directory squatting the exact name, where `Remove-Item -Force` on one
+# with children throws, since there is no host UI for the prompt and
+# -ErrorAction SilentlyContinue does not catch it; and a junction at that name,
+# where the guard keeps the installer from deleting a reparse point it did not
+# create, and turns 5.1's NullReferenceException into a clean skip. Neither
+# host recurses into a junction's target without -Recurse, so that is not the
+# risk being avoided.
+#
+# The whole body is wrapped because this runs *from the error path*: anything
+# escaping lands in the trap and prints a second, meaningless error over the
+# actionable one. Under `$ErrorActionPreference = "Stop"` the two statements
+# fail on different inputs, which is why guarding one of them is not enough --
+# with IX_HOME on a detached drive it is `Join-Path` that throws
+# DriveNotFoundException, on both 5.1 and 7, before Test-Path is ever reached;
+# with illegal characters in the path `Join-Path` returns and `Test-Path`
+# throws ArgumentException, on 5.1 only. Best-effort cleanup must never be the
+# loudest thing in the output.
+function Remove-InstallerScratch {
+    if (-not $IxHome) { return }
+    try {
+        foreach ($name in @(".cli-staging-$PID.zip", ".cli-staging-pull-$PID.log")) {
+            $p = Join-Path $IxHome $name
+            if (Test-Path -LiteralPath $p -PathType Leaf) {
+                Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } catch {
+        # Deliberately silent: see above.
+    }
+}
+
 function Write-Err($msg) {
     Write-Host "  [error] $msg" -ForegroundColor Red
+    Remove-InstallerScratch
     Pause-On-Failure
     exit 1
 }
@@ -182,7 +277,7 @@ if (Test-Healthy) {
 
     # Capture the compose output so a failed pull can be diagnosed instead of
     # reported as a bare "Docker compose failed". Tee keeps it on screen too.
-    $pullLog = Join-Path $env:TEMP "ix-pull-$PID.log"
+    $pullLog = Join-Path $IxHome ".cli-staging-pull-$PID.log"
     $prevEap = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
@@ -260,7 +355,7 @@ Write-Host "`n-- CLI --"
 
 $Tarball = "ix-$Version-windows-amd64.zip"
 $Url = "https://github.com/$GithubOrg/$GithubRepo/releases/download/v$Version/$Tarball"
-$tmp = "$env:TEMP\$Tarball"
+$tmp = "$IxHome\.cli-staging-$PID.zip"
 $InstallDir = "$IxHome\cli"
 
 New-Item -ItemType Directory -Force -Path $IxBin | Out-Null
