@@ -76,6 +76,38 @@ function readRunningPort(): number | null {
   }
 }
 
+/**
+ * What to print under "already running", given where it is actually serving.
+ *
+ * #358 made this branch report the running port instead of echoing back the one
+ * just requested, which fixed the unreachable URL. It stayed silent about the
+ * request itself though, so `ix view -p 19124` against a server on 19123 prints
+ * a correct URL for a port you did not ask for and never says the flag was
+ * ignored — you find out by noticing the number changed.
+ *
+ * Pure, because the decision is all this is, and inline in a command action it
+ * could only be exercised by launching a detached server.
+ */
+export function runningInstanceLines(
+  runningPort: number | null,
+  requestedPort: number,
+  portWasRequested: boolean,
+): string[] {
+  if (runningPort === null) {
+    return [
+      "[!] The running visualizer's port is unknown.",
+      "    Run 'ix view stop' then 'ix view' to restart it.",
+    ];
+  }
+
+  const lines = [`  http://localhost:${runningPort}`];
+  if (portWasRequested && runningPort !== requestedPort) {
+    lines.push(`[!] You asked for port ${requestedPort}, but it is serving on ${runningPort}.`);
+    lines.push(`    Run 'ix view stop' then 'ix view -p ${requestedPort}' to move it.`);
+  }
+  return lines;
+}
+
 /** Read PID from file and check if the process is alive. */
 function readAlivePid(): number | null {
   if (!existsSync(PID_FILE)) {
@@ -241,6 +273,11 @@ export function registerViewCommand(program: Command): void {
         console.error("[error] Invalid port number.");
         process.exit(1);
       }
+      // Whether -p was typed, not whether it differs from 8080. Comparing against
+      // the default instead would stay silent for someone who explicitly passed
+      // `-p 8080` to a server running elsewhere — the exact case they typed the
+      // flag to find out about — and would nag anyone who typed nothing.
+      const portWasRequested = view.getOptionValueSource("port") === "cli";
 
       // Resolve the workspace this visualizer is scoped to. The proxy stamps it as
       // X-Ix-Workspace on every /v1 call so Compass isolates by workspace without any
@@ -286,12 +323,8 @@ export function registerViewCommand(program: Command): void {
       const existing = readAlivePid();
       if (existing) {
         console.log(`[ok] Visualizer is already running (PID ${existing})`);
-        const runningPort = readRunningPort();
-        if (runningPort !== null) {
-          console.log(`  http://localhost:${runningPort}`);
-        } else {
-          console.log("[!] The running visualizer's port is unknown.");
-          console.log("    Run 'ix view stop' then 'ix view' to restart it.");
+        for (const line of runningInstanceLines(readRunningPort(), port, portWasRequested)) {
+          console.log(line);
         }
         // The running instance has a fixed scope (baked at launch). If this directory
         // maps to a different workspace, say so rather than silently showing the old one.
@@ -396,6 +429,16 @@ export function registerViewCommand(program: Command): void {
       const pid = readAlivePid();
       if (pid) {
         console.log(`[ok] Visualizer is running (PID ${pid})`);
+        // Now that the port is recorded, status can answer the question people
+        // actually run it to answer. Shares runningInstanceLines with the
+        // already-running branch above so the two cannot drift: an instance
+        // started before the port file existed still has no port to report, and
+        // saying so beats printing nothing to someone who ran status *for* the
+        // URL. Never guessed either way — a confidently wrong URL is #358.
+        // `status` takes no -p, so the mismatch branch cannot fire here.
+        for (const line of runningInstanceLines(readRunningPort(), 0, false)) {
+          console.log(line);
+        }
       } else {
         console.log("[--] Visualizer is not running.");
         console.log("  Run 'ix view' to start it.");
