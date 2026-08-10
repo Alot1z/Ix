@@ -19,7 +19,7 @@ export function registerStatusCommand(program: Command): void {
         // Detect stale files
         let staleInfo;
         try {
-          staleInfo = await detectStaleFiles(client, root);
+          staleInfo = detectStaleFiles(root);
         } catch {
           staleInfo = null;
         }

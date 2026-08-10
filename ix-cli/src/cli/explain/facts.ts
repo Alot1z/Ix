@@ -179,7 +179,7 @@ export async function collectFacts(
   let stale = false;
   if (path) {
     try {
-      stale = await isFileStale(client, path);
+      stale = isFileStale(path);
     } catch {
       /* ignore */
     }

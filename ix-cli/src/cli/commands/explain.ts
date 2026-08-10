@@ -114,7 +114,7 @@ async function rawExplain(
   let stale = false;
   const sourceUri = node.provenance?.source_uri ?? node.provenance?.sourceUri;
   if (sourceUri) {
-    try { stale = await isFileStale(client, sourceUri); } catch {}
+    try { stale = isFileStale(sourceUri); } catch {}
   }
 
   // Extract snippet fields from attrs
