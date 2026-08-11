@@ -641,6 +641,21 @@ command and returns its `--format llm` records (see `docs/llm-format.md`).
 The tools are read-only queries; the MCP client holds the same power as the
 user at the terminal.
 
+Hardening contract:
+
+- **Sequential processing** — one tool call in flight at a time; a slow map
+  can never pile up unbounded child processes. A `ping` sent mid-call is
+  answered after the call completes.
+- **Message size cap** — a single line over 1 MiB is rejected with a
+  JSON-RPC parse error (`-32700`); the reader resyncs at the next newline
+  and the session stays usable.
+- **Batches rejected** — JSON-RPC batches get a single `-32600`; the server
+  does not process partial batches.
+- **Orphan reaping** — tool children are spawned detached (own process group
+  on POSIX; `taskkill /T` on Windows) and the whole tree is killed on
+  cancel, timeout, output overflow, EOF, or SIGINT/SIGTERM, so a tool that
+  spawned the indexing backend cannot leak it.
+
 Register in a client's `.mcp.json`:
 
 ```json
