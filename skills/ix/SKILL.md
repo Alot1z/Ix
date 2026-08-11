@@ -37,6 +37,11 @@ powershell -ExecutionPolicy Bypass -File scripts/bootstrap.ps1 [repo-root] [-NoM
 
 The bootstrap checks Node >= 22, git, Docker, and ripgrep; installs the `ix` CLI if missing; starts the local Docker backend; and maps the repo by default. Re-run `scripts/bootstrap.sh` on each new repo to register and map it.
 
+In MCP-capable clients, prefer `ix mcp --stdio`: it exposes the commands below
+(`ix_map`, `ix_status`, `ix_explain`, `ix_trace`, `ix_impact`, `ix_search`,
+`ix_rank`) as tools that return the same `--format llm` records, instead of
+shelling out. `ix mcp --list-tools` prints the registry.
+
 Refresh the graph after code changes:
 
 ```bash

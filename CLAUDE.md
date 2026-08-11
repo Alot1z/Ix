@@ -120,6 +120,14 @@ Pro-gated.
 
 Use bounded, composable CLI commands — never broad queries.
 
+### MCP Tool Surface
+
+In MCP-capable clients, `ix mcp --stdio` exposes the routing commands below
+as tools (`ix_map`, `ix_status`, `ix_explain`, `ix_trace`, `ix_impact`,
+`ix_search`, `ix_rank`). Prefer the tools over shelling out when the client
+supports them — they return the same `--format llm` records as the commands.
+List the registry with `ix mcp --list-tools`.
+
 ### High-Level Workflow Commands (Preferred)
 
 Start here. These aggregate multiple graph operations into single bounded responses.

@@ -29,6 +29,7 @@ primary clients. This reference is generated from the client source
 8. [Error Reference](#error-reference)
 9. [Timeouts & Deadlines](#timeouts--deadlines)
 10. [Versioning](#versioning)
+11. [MCP Server (`ix mcp`)](#mcp-server-ix-mcp)
 
 ## Overview
 
@@ -617,3 +618,41 @@ non-`ok` response, so CLI errors carry both the HTTP status and the raw body.
   recommended way to feature-detect rather than hard-code against versions.
 - Older backends may 404 new endpoints (`/v1/stitch/system/*`, async reset) —
   clients implement fallbacks, and so should any new client code.
+
+## MCP Server (`ix mcp`)
+
+Beyond the HTTP API, the CLI exposes the same code-graph surface as a local
+MCP (Model Context Protocol) server over stdio:
+
+```bash
+ix mcp --stdio
+```
+
+MCP-aware clients (Claude Code, Cursor, OpenCode, MCP Inspector) launch the
+server as a subprocess and call the code-graph commands as tools. No network
+port is opened — the server reads newline-delimited JSON-RPC on stdin and
+writes responses to stdout. It speaks MCP 2026-07-28 (stateless, per-request
+`_meta`) and the legacy 2025-06-18 initialize handshake, so both modern and
+classic clients connect.
+
+Exposed tools: `ix_map`, `ix_status`, `ix_explain`, `ix_trace`, `ix_impact`,
+`ix_search`, `ix_rank`. Each maps to the corresponding `ix` command and
+returns its `--format llm` records (see `docs/llm-format.md`). The tools are
+read-only queries; the MCP client holds the same power as the user at the
+terminal.
+
+Register in a client's `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "ix": { "command": "ix", "args": ["mcp", "--stdio"] }
+  }
+}
+```
+
+List the tool registry without starting a session:
+
+```bash
+ix mcp --list-tools
+```
