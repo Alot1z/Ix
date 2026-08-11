@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 
 import {
   installStagedTree,
+  prepareDownloadDir,
   soleChildDir,
   swapInStagedTree,
   sweepUpgradeOrphans,
@@ -290,5 +291,175 @@ describe("sweepUpgradeOrphans", () => {
 
   it("is a no-op when IX_HOME does not exist yet", () => {
     expect(() => sweepUpgradeOrphans(join(root, "nope"), join(root, "nope", "cli"))).not.toThrow();
+  });
+
+  // `ix upgrade` downloads into `.cli-download-*` / `.compass-download-*` under
+  // IX_HOME rather than os.tmpdir(), which on Windows is TEMP verbatim and is
+  // the path #349 died on. Leaving TEMP also left the OS's own cleanup, so a
+  // run killed mid-download would park a multi-MB archive in ~/.ix forever
+  // unless this sweep reclaims it.
+  it("reclaims an interrupted download's scratch directory", () => {
+    const installDir = join(root, "cli");
+    mkdirSync(join(installDir, "cli", "dist", "cli"), { recursive: true });
+    writeFileSync(join(installDir, "cli", "dist", "cli", "main.js"), "// live\n");
+    mkdirSync(join(root, ".cli-download-abc123"), { recursive: true });
+    writeFileSync(join(root, ".cli-download-abc123", "ix-0.9.2-linux-amd64.tar.gz"), "gz");
+    mkdirSync(join(root, ".compass-download-def456"), { recursive: true });
+
+    sweepUpgradeOrphans(root, installDir);
+
+    expect(existsSync(join(root, ".cli-download-abc123"))).toBe(false);
+    expect(existsSync(join(root, ".compass-download-def456"))).toBe(false);
+    expect(readFileSync(join(installDir, "cli", "dist", "cli", "main.js"), "utf-8")).toBe("// live\n");
+  });
+
+  // The counterpart to the `.cli-backup-` note above, and the reason the sweep
+  // call had to move above the download rather than staying between the
+  // download and the extract: a download directory must never be a recovery
+  // candidate, or an interrupted upgrade would rename an archive over ~/.ix/cli.
+  it("does not treat a download directory as an install worth recovering", () => {
+    const installDir = join(root, "cli");
+    mkdirSync(join(root, ".cli-download-abc123"), { recursive: true });
+    writeFileSync(join(root, ".cli-download-abc123", "ix-0.9.2-linux-amd64.tar.gz"), "gz");
+
+    sweepUpgradeOrphans(root, installDir);
+
+    expect(existsSync(installDir)).toBe(false);
+  });
+
+  /**
+   * cleanupCompassSwap tests `index.html` rather than a bare existsSync, and
+   * says why: a `compass/` holding only a `.version` is a real state, and a
+   * bare existsSync "would call that 'back in place' and drop a backup the
+   * caller had just told the user to go and rescue".
+   *
+   * recover() used the bare test, so the two disagreed on exactly that state —
+   * it declined to restore, and the loop below then deleted the only working
+   * bundle. Preserved by the swap's cleanup, destroyed by the sweep. Hoisting
+   * the sweep above the download made it fire on runs that install nothing, so
+   * an offline `ix upgrade` was enough to lose the compass permanently.
+   */
+  it("restores the compass over a husk instead of deleting the backup", () => {
+    const installDir = join(root, "cli");
+    // A torn swap: compass/ exists but holds only .version — index.html never
+    // arrived — while the backup holds the real bundle.
+    mkdirSync(join(installDir, "compass"), { recursive: true });
+    writeFileSync(join(installDir, "compass", ".version"), "0.3.0\n");
+    mkdirSync(join(root, ".compass-backup-1234"), { recursive: true });
+    writeFileSync(join(root, ".compass-backup-1234", "index.html"), "<!-- real -->");
+
+    sweepUpgradeOrphans(root, installDir);
+
+    expect(existsSync(join(installDir, "compass", "index.html"))).toBe(true);
+    expect(readFileSync(join(installDir, "compass", "index.html"), "utf-8")).toBe("<!-- real -->");
+    expect(existsSync(join(root, ".compass-backup-1234"))).toBe(false);
+  });
+
+  it("leaves a genuinely intact compass alone", () => {
+    // The other side of the same test: a real bundle is never replaced by a
+    // backup, and the backup is still reclaimed.
+    const installDir = join(root, "cli");
+    mkdirSync(join(installDir, "compass"), { recursive: true });
+    writeFileSync(join(installDir, "compass", "index.html"), "<!-- live -->");
+    mkdirSync(join(root, ".compass-backup-1234"), { recursive: true });
+    writeFileSync(join(root, ".compass-backup-1234", "index.html"), "<!-- stale -->");
+
+    sweepUpgradeOrphans(root, installDir);
+
+    expect(readFileSync(join(installDir, "compass", "index.html"), "utf-8")).toBe("<!-- live -->");
+    expect(existsSync(join(root, ".compass-backup-1234"))).toBe(false);
+  });
+
+  it("restores the CLI over a tree with no entry point", () => {
+    // Same rule for the install: a cli/ that cannot start is not worth keeping
+    // a backup from.
+    const installDir = join(root, "cli");
+    mkdirSync(join(installDir, "cli", "dist"), { recursive: true });
+    mkdirSync(join(root, ".cli-backup-1234", "cli", "dist", "cli"), { recursive: true });
+    writeFileSync(join(root, ".cli-backup-1234", "cli", "dist", "cli", "main.js"), "// real\n");
+
+    sweepUpgradeOrphans(root, installDir);
+
+    expect(readFileSync(join(installDir, "cli", "dist", "cli", "main.js"), "utf-8")).toBe("// real\n");
+  });
+
+  /**
+   * Moving the scratch under IX_HOME put it inside the sweep's reach for the
+   * whole 300s curl timeout. A second `ix upgrade` — a second terminal, or
+   * bootstrap.sh re-running it when compass is missing — would delete the first
+   * run's archive mid-download; on POSIX the unlink is silent and curl still
+   * exits 0, so the victim fails at the extract on a download it completed.
+   */
+  it("does not reclaim a download directory owned by a live process", () => {
+    const installDir = join(root, "cli");
+    // process.pid is by definition live — this stands in for the other run.
+    const live = join(root, `.cli-download-${process.pid}-aaaaaa`);
+    mkdirSync(live, { recursive: true });
+    writeFileSync(join(live, "ix-0.9.2-linux-amd64.tar.gz"), "in flight");
+
+    sweepUpgradeOrphans(root, installDir);
+
+    expect(existsSync(join(live, "ix-0.9.2-linux-amd64.tar.gz"))).toBe(true);
+  });
+
+  it("still reclaims a download directory whose process is gone", () => {
+    const installDir = join(root, "cli");
+    // PID 2^22 is above every platform's pid_max, so it cannot be running.
+    const dead = join(root, ".cli-download-4194304-bbbbbb");
+    mkdirSync(dead, { recursive: true });
+    writeFileSync(join(dead, "ix-0.9.2-linux-amd64.tar.gz"), "abandoned");
+    // And the pre-pid naming, which must stay collectable.
+    mkdirSync(join(root, ".compass-download-cccccc"), { recursive: true });
+
+    sweepUpgradeOrphans(root, installDir);
+
+    expect(existsSync(dead)).toBe(false);
+    expect(existsSync(join(root, ".compass-download-cccccc"))).toBe(false);
+  });
+});
+
+/**
+ * The ordering that #349's fix turns on, and the one thing about it no test
+ * reached while it was written inline in the command action: the sweep must run
+ * BEFORE the download scratch is created. Once the sweep reclaims
+ * `.cli-download-*`, running it afterwards deletes the archive the extract is
+ * about to read — breaking every upgrade on every platform, not just the
+ * Windows one. Both call sites go through this function so the order cannot
+ * drift back apart.
+ */
+describe("prepareDownloadDir", () => {
+  it("reclaims an earlier run's scratch but keeps the one it just made", () => {
+    const installDir = join(root, "cli");
+    mkdirSync(join(root, ".cli-download-stale1"), { recursive: true });
+    writeFileSync(join(root, ".cli-download-stale1", "ix-0.9.1-linux-amd64.tar.gz"), "old");
+
+    const dir = prepareDownloadDir(root, installDir, ".cli-download-");
+
+    expect(existsSync(join(root, ".cli-download-stale1"))).toBe(false);
+    // Swept after the mkdtemp instead of before, this directory is gone too and
+    // the download that follows writes an archive nothing will extract.
+    expect(existsSync(dir)).toBe(true);
+
+    writeFileSync(join(dir, "ix-0.9.2-linux-amd64.tar.gz"), "gz");
+    expect(existsSync(join(dir, "ix-0.9.2-linux-amd64.tar.gz"))).toBe(true);
+  });
+
+  it("puts an interrupted install back before downloading anything", () => {
+    // The other half of sweeping first: the recovery happens even if the
+    // download then fails, which the old position could not do.
+    const installDir = join(root, "cli");
+    mkdirSync(join(root, ".cli-backup-999", "cli", "dist", "cli"), { recursive: true });
+    writeFileSync(join(root, ".cli-backup-999", "cli", "dist", "cli", "main.js"), "// prev\n");
+
+    const dir = prepareDownloadDir(root, installDir, ".cli-download-");
+
+    expect(readFileSync(join(installDir, "cli", "dist", "cli", "main.js"), "utf-8")).toBe("// prev\n");
+    expect(existsSync(dir)).toBe(true);
+  });
+
+  it("creates IX_HOME when a manual install never did", () => {
+    const ixHome = join(root, "fresh");
+    const dir = prepareDownloadDir(ixHome, join(ixHome, "cli"), ".compass-download-");
+    expect(existsSync(dir)).toBe(true);
   });
 });
