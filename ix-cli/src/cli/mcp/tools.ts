@@ -202,6 +202,34 @@ export const TOOLS: ToolDefinition[] = [
       },
     },
   },
+  {
+    name: "ix_read",
+    description:
+      "Read actual source code from the code graph: a file range (path:start-end), a symbol's definition, or a resolved target. Returns file metadata plus the raw source lines. Use when you need the code itself, not just structure.",
+    command: "read",
+    positional: { property: "target", required: true, flag: "target" },
+    flags: [
+      { property: "kind", flag: "--kind", kind: "string" },
+      { property: "path", flag: "--path", kind: "string" },
+      { property: "pick", flag: "--pick", kind: "number" },
+      { property: "root", flag: "--root", kind: "string" },
+    ],
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        target: {
+          type: "string",
+          description: "Target to read: a path with an optional line range (src/auth.py:10-50) or a symbol name.",
+        },
+        kind: { type: "string", description: "Filter symbol by kind." },
+        path: { type: "string", description: "Prefer symbols from files matching this path substring." },
+        pick: { type: "number", description: "Pick Nth candidate from ambiguous results (1-based)." },
+        root: { type: "string", description: "Workspace root directory." },
+      },
+      required: ["target"],
+    },
+  },
 ];
 
 const toolByName = new Map(TOOLS.map((tool) => [tool.name, tool]));

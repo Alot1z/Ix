@@ -51,6 +51,9 @@ export class McpServer {
   /** Serializes message handling so tool calls never overlap. */
   private queue: Promise<void> = Promise.resolve();
 
+  /** Set once stdin closes; responses after this are dropped (client gone). */
+  private closed = false;
+
   constructor(options: McpServerOptions) {
     this.tools = options.tools ?? [];
     this.executor = options.executor;
@@ -70,11 +73,15 @@ export class McpServer {
         this.dispatchLine(line);
       });
       rl.on("close", () => {
-        this.enqueue(async () => {
-          // Flush pending writes before resolving.
-          await this.flushOutput();
-          resolve();
-        });
+        // Client disconnected (EOF): cancel in-flight tool calls and shut down
+        // promptly instead of waiting for a slow map to drain. Same discipline
+        // as the view server's remap handler, which kills the child when the
+        // client goes away. Responses after this point are dropped — the pipe
+        // is gone, and writing would raise EPIPE.
+        this.closed = true;
+        for (const controller of this.pending.values()) controller.abort();
+        this.pending.clear();
+        void this.flushOutput().then(() => resolve());
       });
       rl.on("error", (err) => {
         reject(err);
@@ -160,7 +167,7 @@ export class McpServer {
           protocolVersion: MCP_LEGACY_VERSION,
           capabilities: { tools: { listChanged: false } },
           serverInfo: this.serverInfo,
-          instructions: "Ix exposes its code-graph commands (map, status, explain, trace, impact, search, rank) as tools.",
+          instructions: "Ix exposes its code-graph commands (map, status, explain, trace, impact, search, rank, read) as tools.",
         });
         return;
       }
@@ -298,6 +305,7 @@ export class McpServer {
   }
 
   private writeMessage(message: unknown): void {
+    if (this.closed) return; // client disconnected — the pipe is gone
     // Responses carry the server identity for modern clients
     // (io.modelcontextprotocol/serverInfo in _meta). Legacy clients ignore it.
     let payload = message;

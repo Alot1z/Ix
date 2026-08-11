@@ -636,10 +636,10 @@ writes responses to stdout. It speaks MCP 2026-07-28 (stateless, per-request
 classic clients connect.
 
 Exposed tools: `ix_map`, `ix_status`, `ix_explain`, `ix_trace`, `ix_impact`,
-`ix_search`, `ix_rank`. Each maps to the corresponding `ix` command and
-returns its `--format llm` records (see `docs/llm-format.md`). The tools are
-read-only queries; the MCP client holds the same power as the user at the
-terminal.
+`ix_search`, `ix_rank`, `ix_read`. Each maps to the corresponding `ix`
+command and returns its `--format llm` records (see `docs/llm-format.md`).
+The tools are read-only queries; the MCP client holds the same power as the
+user at the terminal.
 
 Register in a client's `.mcp.json`:
 

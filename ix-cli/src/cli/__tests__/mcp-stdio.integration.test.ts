@@ -78,7 +78,7 @@ it("serves a full dual-era stdio session against the real entry", { timeout: 120
     child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list" }) + "\n");
     await waitUntil(() => lines.length >= 3);
     const list = JSON.parse(lines[2]);
-    expect(list.result.tools).toHaveLength(7);
+    expect(list.result.tools).toHaveLength(8);
 
     // 4. tools/call through the fixture executor (real child process).
     child.stdin.write(JSON.stringify({

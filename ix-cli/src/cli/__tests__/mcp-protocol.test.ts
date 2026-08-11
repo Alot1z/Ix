@@ -40,7 +40,7 @@ describe("mcp protocol helpers", () => {
 });
 
 describe("tool registry", () => {
-  it("exposes exactly the seven read tools in deterministic order", () => {
+  it("exposes exactly the eight read tools in deterministic order", () => {
     expect(TOOLS.map((t) => t.name)).toEqual([
       "ix_map",
       "ix_status",
@@ -49,6 +49,7 @@ describe("tool registry", () => {
       "ix_impact",
       "ix_search",
       "ix_rank",
+      "ix_read",
     ]);
   });
 

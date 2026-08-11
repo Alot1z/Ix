@@ -46,7 +46,7 @@ describe("ix mcp registration (F-009 guard)", () => {
 });
 
 describe("ix mcp --list-tools", () => {
-  it("prints the tool registry as JSON with the seven tools", async () => {
+  it("prints the tool registry as JSON with the eight tools", async () => {
     const output = await runMcp(["--list-tools"]);
     const parsed = JSON.parse(output);
     expect(parsed.map((t: { name: string }) => t.name)).toEqual([
@@ -57,6 +57,7 @@ describe("ix mcp --list-tools", () => {
       "ix_impact",
       "ix_search",
       "ix_rank",
+      "ix_read",
     ]);
     for (const tool of parsed) {
       expect(tool.description.length).toBeGreaterThan(10);

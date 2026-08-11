@@ -39,8 +39,8 @@ The bootstrap checks Node >= 22, git, Docker, and ripgrep; installs the `ix` CLI
 
 In MCP-capable clients, prefer `ix mcp --stdio`: it exposes the commands below
 (`ix_map`, `ix_status`, `ix_explain`, `ix_trace`, `ix_impact`, `ix_search`,
-`ix_rank`) as tools that return the same `--format llm` records, instead of
-shelling out. `ix mcp --list-tools` prints the registry.
+`ix_rank`, `ix_read`) as tools that return the same `--format llm` records,
+instead of shelling out. `ix mcp --list-tools` prints the registry.
 
 Refresh the graph after code changes:
 

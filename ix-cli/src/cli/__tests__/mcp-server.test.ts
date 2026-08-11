@@ -148,7 +148,7 @@ describe("mcp server — tools", () => {
     }));
     expect(res.result.resultType).toBe("complete");
     expect(res.result.tools.map((t: { name: string }) => t.name)).toEqual([
-      "ix_map", "ix_status", "ix_explain", "ix_trace", "ix_impact", "ix_search", "ix_rank",
+      "ix_map", "ix_status", "ix_explain", "ix_trace", "ix_impact", "ix_search", "ix_rank", "ix_read",
     ]);
     const first = res.result.tools[0];
     expect(first.inputSchema.additionalProperties).toBe(false);
@@ -288,5 +288,23 @@ describe("mcp server — protocol errors and lifecycle", () => {
     const n = session.responses.length;
     await session.close();
     expect(session.responses.length).toBe(n);
+  });
+
+  it("aborts an in-flight call and resolves promptly when stdin closes (EOF)", async () => {
+    const executor = new StubExecutor();
+    executor.waitForAbort = true;
+    const session = makeSession(executor);
+    session.input.write(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 20,
+      method: "tools/call",
+      params: { name: "ix_map", arguments: {} },
+    }) + "\n");
+    await delay(30); // let the call start
+    const started = Date.now();
+    await session.close(); // EOF while the call is in flight
+    expect(Date.now() - started).toBeLessThan(2000); // resolves promptly
+    // No response is written after the client is gone.
+    expect(session.responses.length).toBe(0);
   });
 });
