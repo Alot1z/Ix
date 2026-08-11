@@ -192,8 +192,142 @@ export function isNewer(latest: string, current: string): boolean {
  * always runs.
  */
 function getInstalledCompassVersion(): string {
-  if (!existsSync(join(COMPASS_DIR, "index.html"))) return "0.0.0";
-  return getTrackedVersion(COMPASS_VERSION_FILE);
+  return installedCompass().version;
+}
+
+/**
+ * The installed bundle's stamp, plus whether there is a bundle at all.
+ *
+ * `present` is carried separately rather than being encoded as version "0.0.0".
+ * Overloading the version number conflates two states that need opposite
+ * answers: a *missing* bundle must be repaired from dist, while a *present*
+ * release bundle whose stamp is unreadable must not be — 0.0.0 is also what
+ * `parseCompassStamp` returns for a stamp truncated by a full disk or a kill
+ * during the non-atomic write, and repairing that downgrades a working bundle.
+ *
+ * Returns the whole stamp rather than just the number because the source marker
+ * is half the answer, and reading the file once keeps the two from disagreeing.
+ */
+function installedCompass(): CompassStamp & { present: boolean } {
+  const present = existsSync(join(COMPASS_DIR, "index.html"));
+  if (!present) return { source: "dist", version: "0.0.0", present };
+  return { ...readCompassStamp(), present };
+}
+
+/**
+ * What `compass/.version` says about the bundle beside it.
+ *
+ * The stamp is written by two different producers in two different version
+ * series, and until now it recorded no way to tell them apart (#376):
+ *
+ * - the **release** workflow stamps the bundle it ships with the **Ix** version
+ *   (`0.9.2`), because the bundle is built from system-compass `main` at release
+ *   time and has no dist release number of its own;
+ * - **install.sh** and the compass-upgrade path below stamp the
+ *   **ix-compass-dist** release they downloaded (`0.3.0`).
+ *
+ * `isNewer(distLatest, stamp)` is only meaningful for the second. Against the
+ * first it compares two unrelated series and is correct purely by accident of
+ * Ix's numbers currently being the larger ones: the first ix-compass-dist tag
+ * above the running Ix version makes `isNewer` true and replaces a *newer*
+ * bundled compass with an older dist build. That is the same class of failure
+ * as #365/#366, reached from the other end.
+ *
+ * So the stamp declares its own provenance, and the comparison only runs where
+ * it means something. The provenance rides in **semver build metadata**, on one
+ * line, because this file has readers we cannot upgrade:
+ *
+ *     0.9.3+release.7f98724     a bundle built from system-compass main
+ *     0.3.0                     an ix-compass-dist download
+ *
+ * That shape is load-bearing. Every already-shipped CLI reads this file with
+ * `getTrackedVersion` — `readFileSync(...).trim()`, the *whole file* — and hands
+ * the result straight to `splitVersion`. A multi-line `key=value` stamp makes
+ * that return the entire blob, whose major parses as `Number("source=release…")`
+ * = NaN → 0; the old CLI then sees a 1.x release as `[0,0,0]` and downloads
+ * ix-compass-dist over the newer bundle it just installed — reintroducing #376
+ * through the format change itself, on exactly the upgrade that ships the fix.
+ * `splitVersion` already drops everything after `+` ("Build metadata (`+sha`)
+ * never participates in precedence"), so an old CLI reads `0.9.3+release.7f98724`
+ * as `0.9.3` and behaves precisely as it does today.
+ *
+ * A bare version number is both the legacy stamp (everything up to v0.9.2) and
+ * the dist form going forward, read as dist-series either way — which is what
+ * install.sh wrote, is the majority of installs in the wild, and leaves those
+ * exactly as correct as they are today. Release-bundled legacy stamps stay
+ * accidentally-correct until compass-dist passes the Ix version, and no worse
+ * than before; new releases carry the marker and are immune.
+ */
+export type CompassStamp = { source: "release" | "dist"; version: string };
+
+export function parseCompassStamp(raw: string): CompassStamp {
+  // First line only. Nothing writes a second one, but a stray trailing line
+  // must not turn the version into an unparseable blob — that is the failure
+  // this format exists to avoid, and it should not survive in our own reader.
+  const text = (raw.split(/\r?\n/)[0] ?? "").trim();
+  if (!text) return { source: "dist", version: "0.0.0" };
+
+  const plus = text.indexOf("+");
+  if (plus < 0) return { source: "dist", version: text };
+
+  const version = text.slice(0, plus).trim();
+  // No version means the stamp tells us nothing, marker or not — don't let a
+  // bare `+release` assert provenance it has no version to attach to.
+  if (!version) return { source: "dist", version: "0.0.0" };
+
+  const build = text.slice(plus + 1).trim();
+  // `release` or `release.<sha>`. Matched on the first dot-separated identifier
+  // so the commit stays free to change shape.
+  const source = build.split(".")[0] === "release" ? "release" : "dist";
+  return { source, version };
+}
+
+function readCompassStamp(): CompassStamp {
+  try {
+    if (!existsSync(COMPASS_VERSION_FILE)) return { source: "dist", version: "0.0.0" };
+    return parseCompassStamp(readFileSync(COMPASS_VERSION_FILE, "utf-8"));
+  } catch {
+    return { source: "dist", version: "0.0.0" };
+  }
+}
+
+/**
+ * Should `ix upgrade` offer to replace the installed compass with the latest
+ * ix-compass-dist release?
+ *
+ * Only when the two numbers are in the same series. A release-bundled compass
+ * is never replaced: it was built from system-compass `main` when the CLI was
+ * cut, so it is at least as new as any dist release published before it, and a
+ * dist release published *after* it arrives with the next Ix release, which
+ * bundles `main` again. The dist download stays the **repair** path for a
+ * missing or gutted bundle, and `present` — `index.html` on disk — is what
+ * decides that, deliberately ahead of the source check so a gutted *release*
+ * bundle is still repaired.
+ *
+ * `present` rather than version "0.0.0": that number is also what
+ * `parseCompassStamp` yields for a stamp truncated by a full disk or a kill
+ * during the non-atomic write, and a present, perfectly serviceable release
+ * bundle must not be "repaired" with an older dist build on the strength of a
+ * damaged stamp. An unreadable stamp beside a real bundle falls through to the
+ * dist comparison, which is what every shipped CLI already does with it.
+ *
+ * Takes the stamp as an argument rather than reading it: this decision is the
+ * whole point of #376, and with the file read inlined the only thing a test
+ * could reach was parseCompassStamp — so deleting the source check left every
+ * test passing while the inversion came straight back.
+ */
+export function shouldOfferCompassUpgradeFor(
+  compassLatest: string | undefined,
+  installed: CompassStamp & { present: boolean },
+): boolean {
+  if (!compassLatest) return false;
+  if (!installed.present) return true; // missing or gutted — repair.
+  if (installed.source === "release") return false;
+  return isNewer(compassLatest, installed.version);
+}
+
+function shouldOfferCompassUpgrade(compassLatest: string | undefined): boolean {
+  return shouldOfferCompassUpgradeFor(compassLatest, installedCompass());
 }
 
 function getTrackedVersion(versionFile: string): string {
@@ -797,9 +931,7 @@ export async function checkForUpdate(): Promise<void> {
 
   if (cache && Date.now() - cache.checkedAt < 3600_000) {
     const hasCliUpdate = isNewer(cache.latest, current);
-    const compassCurrent = getInstalledCompassVersion();
-    const hasCompassUpdate =
-      cache.compassLatest && isNewer(cache.compassLatest, compassCurrent);
+    const hasCompassUpdate = shouldOfferCompassUpgrade(cache.compassLatest);
     const backendCurrent = getTrackedVersion(BACKEND_VERSION_FILE);
     const hasBackendUpdate =
       cache.backendLatest && isNewer(cache.backendLatest, backendCurrent);
@@ -817,9 +949,7 @@ export async function checkForUpdate(): Promise<void> {
     if (!latest) return;
     writeCache(latest, compassLatest ?? undefined, backendLatest ?? undefined);
     const hasCliUpdate = isNewer(latest, current);
-    const compassCurrent = getInstalledCompassVersion();
-    const hasCompassUpdate =
-      compassLatest && isNewer(compassLatest, compassCurrent);
+    const hasCompassUpdate = shouldOfferCompassUpgrade(compassLatest ?? undefined);
     const backendCurrent = getTrackedVersion(BACKEND_VERSION_FILE);
     const hasBackendUpdate =
       backendLatest && isNewer(backendLatest, backendCurrent);
@@ -1156,7 +1286,7 @@ export function registerUpgradeCommand(program: Command): void {
 
       // ── Compass upgrade ──────────────────────────────────────────────
       const compassCurrent = getInstalledCompassVersion();
-      if (compassLatest && isNewer(compassLatest, compassCurrent)) {
+      if (shouldOfferCompassUpgrade(compassLatest ?? undefined)) {
         console.log(
           `Compass update available: ${compassCurrent === "0.0.0" ? "none" : compassCurrent} → ${chalk.green(compassLatest)}`
         );
@@ -1197,7 +1327,12 @@ export function registerUpgradeCommand(program: Command): void {
             // did not get stamped, which is not an extract problem and should
             // not be reported as one.
             stage = "stamp";
-            writeFileSync(COMPASS_VERSION_FILE, compassLatest);
+            // A bare dist release number. Dist needs no marker: bare *is* the
+            // dist form, it is what every shipped CLI already expects to find
+            // here, and this number really is in the ix-compass-dist series —
+            // which is the series the next run will compare it against
+            // (parseCompassStamp, #376).
+            writeFileSync(COMPASS_VERSION_FILE, `${compassLatest}\n`);
             console.log(`[ok] Compass upgraded to ${compassLatest}`);
           } catch (err) {
             console.error(`[!!] Compass ${stage} failed: ${describeExecFailure(err)}`);
@@ -1220,6 +1355,12 @@ export function registerUpgradeCommand(program: Command): void {
           cleanupCompassSwap(COMPASS_DIR, compassStaging, compassBackup);
           rmSync(compassTmp, { recursive: true, force: true });
         }
+      } else if (compassLatest && readCompassStamp().source === "release") {
+        // Not "already latest" — it is a different series. Say what it is, so
+        // nobody reads a bundled 0.9.2 as a compass version and files #376 again.
+        console.log(
+          `[ok] Compass is the build bundled with Ix ${compassCurrent} (ix-compass-dist ${compassLatest} not applied)`
+        );
       } else if (compassLatest) {
         console.log(`[ok] Compass already on the latest version (${compassCurrent})`);
       } else {
