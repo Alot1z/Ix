@@ -11,10 +11,26 @@ import { TOOLS } from "./tools.js";
 
 /** Serve MCP over process stdio until stdin closes. */
 export async function runStdioMcpServer(): Promise<void> {
+  const executor = new CliToolExecutor();
   const server = new McpServer({
     tools: TOOLS,
-    executor: new CliToolExecutor(),
+    executor,
     io: { input: process.stdin, output: process.stdout },
   });
-  await server.start();
+
+  // Reap tool child trees when the process is asked to stop (SIGINT/SIGTERM).
+  // Without this, a backend spawned by a tool call could outlive the server
+  // if the client kills it outright instead of closing stdin.
+  const shutdown = (): void => {
+    executor.disposeAll();
+    process.exit(0);
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+
+  try {
+    await server.start();
+  } finally {
+    executor.disposeAll();
+  }
 }

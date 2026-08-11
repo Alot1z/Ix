@@ -18,8 +18,7 @@
  * protocol session with PassThrough streams and a stub executor.
  */
 
-import { createInterface } from "node:readline";
-import { ErrorCode, hasId, isJsonRpcMessage, MCP_LEGACY_VERSION, MCP_PROTOCOL_VERSION, MCP_SUPPORTED_VERSIONS, META_PROTOCOL_VERSION, META_SERVER_INFO, metaProtocolVersion, parseLine, serializeMessage } from "./protocol.js";
+import { ErrorCode, hasId, isJsonRpcMessage, JSONRPC_VERSION, MCP_LEGACY_VERSION, MCP_PROTOCOL_VERSION, MCP_SUPPORTED_VERSIONS, META_PROTOCOL_VERSION, META_SERVER_INFO, metaProtocolVersion, parseLine, serializeMessage } from "./protocol.js";
 import { findTool, validateArgs, toolTimeoutMs } from "./tools.js";
 import type { McpIo, ToolDefinition, ToolExecutor, ToolRunResult } from "./types.js";
 import type { JsonRpcId } from "./protocol.js";
@@ -30,6 +29,83 @@ export interface McpServerOptions {
   io?: McpIo;
   /** Advertised server identity; defaults to ix + the CLI package version. */
   serverInfo?: { name: string; version: string };
+  /**
+   * Byte cap on one stdio message line. A line above this is rejected with a
+   * ParseError and the reader resyncs at the next newline — a pathological
+   * client can never make the server buffer more than this per message.
+   */
+  maxLineBytes?: number;
+}
+
+/** Default cap on one stdio message line (newline-delimited framing). */
+const DEFAULT_MAX_LINE_BYTES = 1 * 1024 * 1024; // 1 MiB
+
+/**
+ * Byte-bounded streaming line splitter for the stdio transport.
+ *
+ * Unlike readline, which buffers a whole line before emitting it, this reader
+ * tracks the byte length of the in-flight line and never accumulates more than
+ * `maxBytes` for a single line. If a line grows past the cap it is reported
+ * via `onOversize` and its tail is then discarded: the reader resyncs at the
+ * next newline, so the session stays usable. This closes the memory- and
+ * CPU-exhaustion vector of a client sending unbounded lines.
+ */
+class LineReader {
+  private pending = "";
+  private pendingBytes = 0;
+  /** True while the tail of an oversized line is being discarded. */
+  private discarding = false;
+
+  constructor(
+    private readonly maxBytes: number,
+    private readonly onLine: (line: string) => void,
+    private readonly onOversize: (bytes: number) => void,
+  ) {}
+
+  push(chunk: string | Buffer): void {
+    const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    let start = 0;
+    for (let i = 0; i < text.length; i++) {
+      if (text.charCodeAt(i) !== 10) continue; // \n
+      const segment = text.slice(start, i);
+      start = i + 1;
+      if (this.discarding) {
+        // End of the oversized line: drop the tail, resume normal parsing.
+        this.discarding = false;
+        this.pending = "";
+        this.pendingBytes = 0;
+        continue;
+      }
+      const line = this.pending + segment;
+      const bytes = this.pendingBytes + Buffer.byteLength(segment, "utf8");
+      this.pending = "";
+      this.pendingBytes = 0;
+      if (bytes > this.maxBytes) {
+        this.onOversize(bytes);
+        continue;
+      }
+      this.onLine(stripLineBreak(line));
+    }
+    if (start < text.length) {
+      const rest = text.slice(start);
+      if (this.discarding) return; // still inside the oversized line
+      this.pendingBytes += Buffer.byteLength(rest, "utf8");
+      if (this.pendingBytes > this.maxBytes) {
+        const exceeded = this.pendingBytes;
+        this.discarding = true;
+        this.pending = "";
+        this.pendingBytes = 0;
+        this.onOversize(exceeded);
+      } else {
+        this.pending += rest;
+      }
+    }
+  }
+}
+
+/** Strip a trailing CR from CRLF line endings (framing tolerates CRLF). */
+function stripLineBreak(line: string): string {
+  return line.endsWith("\r") ? line.slice(0, -1) : line;
 }
 
 const DEFAULT_SERVER_INFO = { name: "ix", version: "0.9.2" };
@@ -44,6 +120,7 @@ export class McpServer {
   private readonly executor: ToolExecutor;
   private readonly io: McpIo;
   private readonly serverInfo: { name: string; version: string };
+  private readonly maxLineBytes: number;
 
   /** Request id → AbortController for in-flight tool calls (cancellation). */
   private readonly pending = new Map<JsonRpcId, AbortController>();
@@ -59,6 +136,7 @@ export class McpServer {
     this.executor = options.executor;
     this.serverInfo = options.serverInfo ?? DEFAULT_SERVER_INFO;
     this.io = options.io ?? { input: process.stdin, output: process.stdout };
+    this.maxLineBytes = options.maxLineBytes ?? DEFAULT_MAX_LINE_BYTES;
   }
 
   /**
@@ -67,12 +145,23 @@ export class McpServer {
    */
   start(): Promise<void> {
     return new Promise((resolve, reject) => {
-      const rl = createInterface({ input: this.io.input as NodeJS.ReadableStream, crlfDelay: Infinity, terminal: false });
-
-      rl.on("line", (line) => {
-        this.dispatchLine(line);
-      });
-      rl.on("close", () => {
+      const input = this.io.input as NodeJS.ReadableStream;
+      const reader = new LineReader(
+        this.maxLineBytes,
+        (line) => this.dispatchLine(line),
+        (bytes) => {
+          // Oversized message: reply with a ParseError and resync at the next
+          // newline. Memory stays bounded because the reader never buffers
+          // more than maxLineBytes for a single line.
+          this.writeMessage({
+            jsonrpc: "2.0",
+            id: null,
+            error: { code: ErrorCode.ParseError, message: `Message too large (${bytes} bytes; limit ${this.maxLineBytes})` },
+          });
+        },
+      );
+      input.on("data", (chunk: Buffer) => reader.push(chunk));
+      input.on("end", () => {
         // Client disconnected (EOF): cancel in-flight tool calls and shut down
         // promptly instead of waiting for a slow map to drain. Same discipline
         // as the view server's remap handler, which kills the child when the
@@ -83,10 +172,7 @@ export class McpServer {
         this.pending.clear();
         void this.flushOutput().then(() => resolve());
       });
-      rl.on("error", (err) => {
-        reject(err);
-      });
-      this.io.input.on?.("error", reject);
+      input.on("error", reject);
     });
   }
 
@@ -113,6 +199,16 @@ export class McpServer {
       return;
     }
     if (message === undefined) return; // blank line
+    if (Array.isArray(message)) {
+      // JSON-RPC batches are rejected wholesale: the spec permits a single
+      // Invalid Request response for a batch the server does not support.
+      this.writeMessage({
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: ErrorCode.InvalidRequest, message: "Batch requests are not supported" },
+      });
+      return;
+    }
 
     const isNotification = isJsonRpcMessage(message) && !hasId(message);
     if (isNotification) {
@@ -143,6 +239,18 @@ export class McpServer {
     // fallback id and is only reachable on the early-return paths below.
     const id: JsonRpcId = message.id !== undefined ? message.id : null;
     const isNotification = !hasId(message);
+
+    // JSON-RPC 2.0 compliance: wrong version or a non-scalar id makes the
+    // whole request object invalid (respond with a null id rather than echo
+    // an id that is not a valid JSON-RPC id).
+    if (message.jsonrpc !== JSONRPC_VERSION) {
+      this.respondError(id, ErrorCode.InvalidRequest, `Invalid Request: jsonrpc must be ${JSONRPC_VERSION}`);
+      return;
+    }
+    if (message.id !== undefined && typeof message.id !== "string" && typeof message.id !== "number" && message.id !== null) {
+      this.respondError(null, ErrorCode.InvalidRequest, "Invalid Request: id must be a string, number, or null");
+      return;
+    }
 
     // Modern protocol version gate: a request carrying per-request metadata
     // declares its revision in _meta. Unknown revisions are rejected with the
