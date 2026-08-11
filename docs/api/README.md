@@ -476,10 +476,18 @@ backend:
 1. **`/v1/*` proxy** — every backend request is proxied to `localhost:8090`
    with `x-ix-workspace` and `x-ix-system` headers baked in at launch, so the
    browser app never knows about workspaces. `--all` opts out of scoping.
-2. **SPA fallback** — any other path serves `index.html`. There is no
-   `/__ix/remap` endpoint: a `POST` to it falls through to this handler and
-   returns the SPA HTML with a `200`, so a caller cannot tell it did nothing.
-   Re-map from the CLI with `ix map .` instead.
+2. **`POST /__ix/remap`** — rebuild the code map for the workspace the
+   visualizer was launched from (its cwd) by running `ix map .` with a
+   30-minute timeout. Responds `{ "ok": true }` on success, or a `500` with
+   `{ "ok": false, "error": ... }` when the map command fails. **Loopback
+   only:** the server binds `127.0.0.1`, and the handler rejects requests
+   whose `Host` is not loopback or whose browser `Origin` is not loopback
+   (`403 { "ok": false, "error": "forbidden: loopback only" }`), blocking
+   CSRF and DNS-rebinding — the endpoint shells out with the user's
+   privileges. Requests with no `Origin` (e.g. `curl`) are allowed when the
+   `Host` is loopback.
+3. **SPA fallback** — any other path serves `index.html`. A `GET` to
+   `/__ix/remap` (or any other unknown path) falls through to this handler.
 
 ## Data Models
 

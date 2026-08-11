@@ -39,8 +39,10 @@ info() { printf '\033[1;36m[ix-skill]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[ix-skill]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[ix-skill]\033[0m %s\n' "$*" >&2; exit 1; }
 
-# Detect Windows (Git Bash / MSYS2 / Cygwin).
-is_windows() { [ -n "${MSYSTEM:-}" ] || [ -n "${WSL_DISTRO_NAME:-}" ] || case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) return 0 ;; *) return 1 ;; esac; }
+# Detect Windows (Git Bash / MSYS2 / Cygwin). WSL is Linux: it reports
+# uname = Linux and must take the curl|sh path, not the PowerShell installer,
+# so it is deliberately not treated as Windows here.
+is_windows() { case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) return 0 ;; *) return 1 ;; esac; }
 
 version_ge() { # version_ge <got> <want>
   # `sort -C` succeeds when its input is already in order, so feeding it
@@ -55,10 +57,9 @@ command_exists() { command -v "$1" >/dev/null 2>&1; }
 info "Ix skill bootstrap — repo: $REPO"
 
 # --- Prerequisites -----------------------------------------------------------
-node_ok=0
 if command_exists node; then
   node_ver="$(node --version | tr -d 'v')"
-  if version_ge "$node_ver" "22"; then node_ok=1; else warn "Node $node_ver detected; Ix requires Node >= 22."; fi
+  if ! version_ge "$node_ver" "22"; then warn "Node $node_ver detected; Ix requires Node >= 22."; fi
 else
   warn "Node.js not found; Ix requires Node >= 22 (https://nodejs.org)."
 fi
