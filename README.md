@@ -52,6 +52,48 @@ The graph lives on your machine, and it persists — so context survives between
 sessions, and your assistant can navigate a real map of your system instead of
 re-deriving it from whatever fits in a prompt.
 
+### Use Ix from any MCP client
+
+The CLI includes a canonical stdio MCP server with the same graph tools used by
+the editor integrations:
+
+```bash
+ix mcp
+```
+
+To register it with every AI client on the machine at once:
+
+```bash
+ix mcp install            # detect clients and register `ix mcp` with each
+ix mcp install --dry-run  # show what would change, write nothing
+ix mcp doctor             # check each client's registration
+```
+
+`install` knows Claude Code, Codex, Cursor, VS Code, Gemini CLI, OpenClaw and
+opencode. It writes through each client's own MCP command where one exists
+(`claude mcp add`, `codex mcp add`, `gemini mcp add`, `openclaw mcp set`,
+`code --add-mcp`), so the client owns its config format; only Cursor and
+opencode are edited directly, and both are merged in place with a `.bak` kept
+alongside.
+
+**It never overwrites.** If the name `ix-memory` already belongs to a different
+server — an earlier Ix plugin, say — that client is reported and left exactly as
+it was. Pass `--force` to replace it, or `--host <id>` to limit the run.
+
+To register a single client by hand instead, point it at `ix` with the argument
+`mcp`. For Codex:
+
+```bash
+codex mcp add ix-memory -- ix mcp
+```
+
+The client launches the server in the active workspace, so every Ix tool uses
+that repository's graph and configuration.
+
+Tool calls run inside the server process. Set `IX_MCP_SUBPROCESS=1` to run each
+one as a separate `ix` child process instead — slower by roughly the CLI's
+startup time per call, but fully isolated.
+
 ## Sign up for Kartr
 
 We built Kartr on top of this technology.
