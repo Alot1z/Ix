@@ -1,11 +1,11 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { Command } from "commander";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { acquireMapLock } from "../single-flight.js";
+import { acquireMapLock, lockPathForTest } from "../single-flight.js";
 import { createInProcessRunner, resolveDefaultRunner, runCurrentIx } from "../../mcp/runner.js";
 
 const resetReadScope = vi.hoisted(() => vi.fn());
@@ -76,12 +76,29 @@ function createTestProgram(): Command {
   // process exit to release.
   program
     .command("map")
-    .action(() => {
-      const lock = acquireMapLock(process.env.IX_TEST_WORKSPACE ?? "workspace", "ix map test");
-      console.log(lock ? "mapped" : "coalesced");
+    .option("--hold <ms>", "keep working after taking the lock", "0")
+    .option("--hang", "take the lock and never finish")
+    .action(async (opts: { hold: string; hang?: boolean }) => {
+      const workspace = process.env.IX_TEST_WORKSPACE ?? "workspace";
+      const lock = acquireMapLock(workspace, "ix map test");
+      if (!lock) {
+        console.log("coalesced");
+        return;
+      }
+      if (opts.hang) await new Promise(() => {});
+      await new Promise((resolve) => setTimeout(resolve, Number(opts.hold)));
+      // Whether the lock this command took is still its own by the time it
+      // finishes — anything releasing it mid-run reopens the window.
+      console.log(existsSync(lockPathForTest(workspace)) ? "mapped" : "lock-taken-mid-run");
     });
 
   program.command("ingest").action(() => console.log("ingested"));
+
+  // Never settles: a hung backend call, or a rejection that used to end the
+  // process and is now only logged by the server's error handlers.
+  program.command("hang").action(async () => {
+    await new Promise(() => {});
+  });
 
   return program;
 }
@@ -90,11 +107,51 @@ function testRunner() {
   return createInProcessRunner({ version: "test-version", createProgram: createTestProgram });
 }
 
+/**
+ * Run a body against a throwaway lock directory.
+ *
+ * Any test whose commands reach `acquireMapLock` needs this: without it the
+ * lock lands in the developer's real `~/.ix/locks` and can block their own
+ * `ix map` for twenty minutes.
+ */
+async function withLockDir(body: () => Promise<void>): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), "ix-mcp-lock-"));
+  const previous = { lockDir: process.env.IX_LOCK_DIR, workspace: process.env.IX_TEST_WORKSPACE };
+  process.env.IX_LOCK_DIR = dir;
+  process.env.IX_TEST_WORKSPACE = join(dir, "workspace");
+  try {
+    await body();
+  } finally {
+    if (previous.lockDir === undefined) delete process.env.IX_LOCK_DIR;
+    else process.env.IX_LOCK_DIR = previous.lockDir;
+    if (previous.workspace === undefined) delete process.env.IX_TEST_WORKSPACE;
+    else process.env.IX_TEST_WORKSPACE = previous.workspace;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 const originalSubprocessFlag = process.env.IX_MCP_SUBPROCESS;
 
-afterEach(() => {
+/**
+ * Longer than the slowest command any test here abandons and then waits for.
+ *
+ * Every test pays it, so it is kept close to what the slowest one needs rather
+ * than padded: at 500 it added ~11s to this file alone. The two commands that
+ * never settle are unaffected either way — their grace is what bounds them.
+ */
+const DRAIN_MS = 250;
+
+afterEach(async () => {
   if (originalSubprocessFlag === undefined) delete process.env.IX_MCP_SUBPROCESS;
   else process.env.IX_MCP_SUBPROCESS = originalSubprocessFlag;
+
+  // Several tests deliberately abandon a command at its timeout, and an
+  // abandoned command outlives the test that started it. The runner's state is
+  // module-level, so while one is in flight every later test sees exit codes
+  // distrusted and a lock held — which is correct behaviour, and silently
+  // changes what an unrelated assertion observes. Draining here rather than at
+  // the end of each body means a failing assertion cannot skip it.
+  await new Promise((resolve) => setTimeout(resolve, DRAIN_MS));
 });
 
 describe("in-process ix runner", () => {
@@ -219,13 +276,7 @@ describe("in-process ix runner", () => {
   });
 
   it("releases the map single-flight lock when the command ends, not the process", async () => {
-    const lockDir = mkdtempSync(join(tmpdir(), "ix-mcp-lock-"));
-    const previousLockDir = process.env.IX_LOCK_DIR;
-    const previousWorkspace = process.env.IX_TEST_WORKSPACE;
-    process.env.IX_LOCK_DIR = lockDir;
-    process.env.IX_TEST_WORKSPACE = join(lockDir, "workspace");
-
-    try {
+    await withLockDir(async () => {
       const run = testRunner();
 
       const first = await run(["map"]);
@@ -236,27 +287,120 @@ describe("in-process ix runner", () => {
       // stale. Held across calls, every later ix_map coalesced into an empty
       // success while the graph was never refreshed.
       expect(second.stdout).toBe("mapped\n");
-    } finally {
-      if (previousLockDir === undefined) delete process.env.IX_LOCK_DIR;
-      else process.env.IX_LOCK_DIR = previousLockDir;
-      if (previousWorkspace === undefined) delete process.env.IX_TEST_WORKSPACE;
-      else process.env.IX_TEST_WORKSPACE = previousWorkspace;
-      rmSync(lockDir, { recursive: true, force: true });
-    }
+    });
+  });
+
+  it("does not release a running command's lock when an orphan settles", async () => {
+    await withLockDir(async () => {
+      const run = testRunner();
+
+      // Abandoned at 40ms, settles at ~150ms — part-way through the map below.
+      const orphan = run(["slow", "--delay", "150", "--tag", "orphan"], 40);
+      const mapped = run(["map", "--hold", "400"]);
+
+      expect((await orphan).ok).toBe(false);
+      // Releasing every lock the process holds drops more than the
+      // finishing command's, so an orphan settling mid-map deleted the lock of
+      // the map that was still running — reopening the exact window
+      // single-flight exists to close.
+      expect((await mapped).stdout).toBe("mapped\n");
+    });
+  });
+
+  it("does not release a still-running command's lock when its own grace fires", async () => {
+    await withLockDir(async () => {
+      const run = createInProcessRunner({
+        version: "test-version",
+        createProgram: createTestProgram,
+        orphanGraceMs: 60,
+      });
+
+      // Abandoned at 40ms, grace fires at ~100ms, still working until ~400ms.
+      // The grace drops the exit-code distrust; the lock is a separate lifetime
+      // and stays with the command that is still using it.
+      expect((await run(["map", "--hold", "400"], 40)).ok).toBe(false);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      // An unrelated command completing must not take the running map's lock
+      // with it — releasing everything held is what did, one call later than
+      // the grace itself.
+      expect((await run(["say", "unrelated"], 5_000)).stdout).toBe("out:unrelated\n");
+      expect((await run(["map"], 5_000)).stdout).toBe("coalesced\n");
+    });
+  });
+
+  it("releases the lock of a command that overran its grace once it finishes", async () => {
+    await withLockDir(async () => {
+      const run = createInProcessRunner({
+        version: "test-version",
+        createProgram: createTestProgram,
+        orphanGraceMs: 40,
+      });
+
+      // The other direction: holding every lock back to protect a running
+      // command stranded the ones whose command had genuinely finished, and the
+      // next ix_map coalesced forever. Ownership is what lets both hold.
+      await run(["map", "--hold", "250"], 30);
+      await new Promise((resolve) => setTimeout(resolve, 400));
+
+      expect((await run(["map"], 5_000)).stdout).toBe("mapped\n");
+    });
+  });
+
+  it("invalidates the read scope for a command that never settles at all", async () => {
+    await withLockDir(async () => {
+      const run = createInProcessRunner({
+        version: "test-version",
+        createProgram: createTestProgram,
+        orphanGraceMs: 40,
+      });
+      resetReadScope.mockClear();
+
+      // A hung `ix map` has no settle to hang the invalidation off, so the
+      // grace has to carry it — otherwise the pre-map scope stays pinned for
+      // the life of the server with nothing left to clear it.
+      await run(["map", "--hang"], 30);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+
+      expect(resetReadScope).toHaveBeenCalled();
+    });
+  });
+
+  it("stops distrusting the exit code once an abandoned command overruns its grace", async () => {
+    await withLockDir(async () => {
+      const run = createInProcessRunner({
+        version: "test-version",
+        createProgram: createTestProgram,
+        orphanGraceMs: 60,
+      });
+      process.exitCode = undefined;
+
+      // Never settles, so nothing will ever remove it from the orphan set.
+      // Left unbounded, every later failure reports ok and no lock is ever
+      // released again — both for the life of the server.
+      await run(["hang"], 30);
+      await new Promise((resolve) => setTimeout(resolve, 120));
+
+      expect(await run(["soft-fail"], 30)).toMatchObject({ ok: false });
+      expect((await run(["map"], 30)).stdout).toBe("mapped\n");
+      expect((await run(["map"], 30)).stdout).toBe("mapped\n");
+    });
   });
 
   it("invalidates the read-scope cache after a command that can change it", async () => {
-    const run = testRunner();
-    resetReadScope.mockClear();
+    await withLockDir(async () => {
+      const run = testRunner();
+      resetReadScope.mockClear();
 
-    await run(["say", "read"]);
-    expect(resetReadScope).not.toHaveBeenCalled();
+      await run(["say", "read"]);
+      expect(resetReadScope).not.toHaveBeenCalled();
 
-    // `ix map` can stitch the repo into a System server-side; every later read
-    // in the session would otherwise still scope to the pre-map workspace.
-    await run(["map"]);
-    await run(["ingest"]);
-    expect(resetReadScope).toHaveBeenCalledTimes(2);
+      // `ix map` can stitch the repo into a System server-side; every later read
+      // in the session would otherwise still scope to the pre-map workspace.
+      await run(["map"]);
+      await run(["ingest"]);
+      expect(resetReadScope).toHaveBeenCalledTimes(2);
+    });
   });
 
   it("truncates output instead of growing the server heap without bound", async () => {

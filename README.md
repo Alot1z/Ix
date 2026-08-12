@@ -71,18 +71,24 @@ ix mcp doctor             # check each client's registration
 
 `install` knows Claude Code, Codex, Cursor, VS Code, Gemini CLI, OpenClaw and
 opencode. It writes through each client's own MCP command where one exists
-(`claude mcp add`, `codex mcp add`, `gemini mcp add`, `openclaw mcp set`), so
-the client owns its config format; Cursor, VS Code and opencode are edited
-directly, and each is merged in place with a `.bak` kept alongside. Those three
-are also detected by their config directory rather than by a shell command,
-since `cursor` and `code` are opt-in shims a GUI install may not have.
+(`claude mcp add`, `codex mcp add`, `gemini mcp add`, and `openclaw mcp set`
+everywhere but Windows), so the client owns its config format. Cursor, VS Code
+and opencode are edited directly instead, as is OpenClaw on Windows — its
+registration is passed as a JSON argument, which cmd cannot carry intact. Every
+direct write is merged in place with a `.bak` kept alongside. Cursor, VS Code
+and opencode are also detected by their config directory rather than by a shell
+command, since `cursor` and `code` are opt-in shims a GUI install may not have.
 
 **It never overwrites.** If the name `ix-memory` already belongs to a different
 server — an earlier Ix plugin, say — that client is reported and left exactly as
 it was. Pass `--force` to replace it, or `--host <id>` to limit the run; an
-unrecognised id is an error rather than a silent no-op. `doctor` additionally
-reports a registration of ours whose recorded launcher path has since
-disappeared, which `install` then repairs without `--force`.
+unrecognised id is an error rather than a silent no-op. Where a client's own
+config can be read back — Cursor, VS Code, opencode, and OpenClaw off Windows —
+`doctor` also reports a registration of ours whose recorded launcher path has
+since disappeared, and `install` repairs it. The clients that answer with a
+rendered table instead expose no stored command, so a launcher that has moved
+there is not detected: clear the name with that client's own command
+(`claude mcp remove ix-memory`) and re-run `ix mcp install`.
 
 To register a single client by hand instead, point it at `ix` with the argument
 `mcp`. For Codex:

@@ -11,7 +11,7 @@ import { Command, CommanderError } from "commander";
 import { registerOssCommands, registerProStubs } from "../cli/register/oss.js";
 import { tryLoadProCommands } from "../cli/register/pro-loader.js";
 import { resetReadScope } from "../cli/resolve.js";
-import { releaseHeldLocks } from "../cli/single-flight.js";
+import { releaseLocksOwnedBy, setLockOwnerResolver } from "../cli/single-flight.js";
 
 const execFileAsync = promisify(execFile);
 const CLI_ENTRYPOINT = fileURLToPath(new URL("../cli/main.js", import.meta.url));
@@ -99,6 +99,11 @@ const runContext = new AsyncLocalStorage<ActiveRun>();
  * *successful* tool call as failed, with its real answer buried inside an
  * `error` string. A run started while this set is non-empty therefore ignores
  * `process.exitCode` and judges only by what the command threw.
+ *
+ * Membership is bounded by a grace timer as well as by the command settling,
+ * because distrust is not free: while it holds, a genuinely failing command
+ * reports success. An entry that could never be removed would make that
+ * permanent.
  */
 const liveOrphans = new Set<Promise<void>>();
 
@@ -220,6 +225,15 @@ function installCapture(options: { redirectIdleStdout?: boolean } = {}): void {
     if (!resolveRun()) return pristineExit(code);
     throw new ProcessExitSignal(code ?? 0);
   }) as typeof process.exit;
+
+  // Single-flight locks are taken deep inside a command, so the command has to
+  // be identifiable from there. Deliberately the async context alone, without
+  // resolveRun's fallback to activeRun: for output that fallback only ever
+  // narrows the damage, but an owner guessed wrong here means a *different*
+  // command's settle deletes a lock that is still in use. Unattributed is the
+  // safe direction — the lock outlives its command and ages out — so a lock
+  // taken outside any run context simply gets no owner.
+  setLockOwnerResolver(() => runContext.getStore() ?? null);
 }
 
 /**
@@ -289,6 +303,12 @@ export interface InProcessRunnerOptions {
   createProgram?: (version: string) => Command | Promise<Command>;
   /** Output cap for a single run. Defaults to {@link MAX_OUTPUT_BYTES}. */
   maxOutputBytes?: number;
+  /**
+   * How long an abandoned command keeps {@link liveOrphans} membership before
+   * it is dropped regardless. Defaults to as long again as the command was
+   * given. Tests shorten it; nothing else should need to.
+   */
+  orphanGraceMs?: number;
 }
 
 /**
@@ -298,16 +318,27 @@ export interface InProcessRunnerOptions {
  * process. In a server that never exits they are leaks, and each of them makes
  * the next tool call answer from something stale rather than fail loudly.
  */
-function afterCommand(args: string[]): void {
+function invalidateAfter(args: string[]): void {
   if (SCOPE_CHANGING_COMMANDS.has(args[0] ?? "")) resetReadScope();
+}
 
-  // `ix map` takes a single-flight lock it never releases itself, relying on
-  // process exit. Held by a long-lived server, the lock file names the server's
-  // own live PID — so it never reads as stale — and every later ix_map coalesces
-  // and returns an empty success while the graph goes unrefreshed. It also
-  // blocks the user's own editor-hook `ix map` for the same 20 minutes. Skipped
-  // while an orphan is in flight: a map still running is entitled to its lock.
-  if (liveOrphans.size === 0) releaseHeldLocks();
+/**
+ * Give up the single-flight locks this command took.
+ *
+ * `ix map` takes its lock and never releases it, relying on process exit. Held
+ * by a long-lived server the lock names the server's own live PID, so it never
+ * reads as stale: every later ix_map coalesces into an empty success while the
+ * graph goes unrefreshed, and the user's own editor-hook `ix map` is blocked
+ * for the same 20 minutes.
+ *
+ * Scoped to this run, which is the whole point. Releasing everything held was
+ * wrong in both directions — it took the lock of a map still running, and
+ * holding it back to avoid that then stranded the lock of a map that had
+ * finished. Ownership makes the question local: this command is over, so its
+ * own locks go, and nobody else's are touched.
+ */
+function releaseLocksOf(run: ActiveRun): void {
+  releaseLocksOwnedBy(run);
 }
 
 /**
@@ -339,6 +370,7 @@ async function executeInProcess(
   version: string,
   createProgram: (version: string) => Command | Promise<Command>,
   maxBytes: number,
+  orphanGraceMs?: number,
 ): Promise<IxRunResult> {
   const program = throwOnUsageError(await createProgram(version));
   const run: ActiveRun = {
@@ -394,12 +426,44 @@ async function executeInProcess(
     activeRun = null;
 
     if (commandSettled) {
-      afterCommand(args);
+      invalidateAfter(args);
+      releaseLocksOf(run);
     } else {
       liveOrphans.add(finished);
+
+      // A command that never settles at all — a hung fetch, or a rejection that
+      // used to end the process and is now only logged — would otherwise hold
+      // this entry forever, and exit codes would stay distrusted, so *every*
+      // later failure would report ok. The wait is bounded to as long again as
+      // the command was allowed to run. Locks are not keyed off this set at all
+      // any more, so the bound says nothing about them: a command that never
+      // settles keeps the lock it is still using until it ages out.
+      //
+      // The cost of that bound is real and lands on someone else: past the
+      // grace this command's late `process.exitCode` is charged to whichever
+      // call is running by then, which is #400's original symptom in delayed
+      // form. Bounded-open beats permanently-open, so the trade stands — but it
+      // is a trade, not a free win.
+      //
+      // The grace drops the distrust and invalidates, and nothing else. It must
+      // not release the lock: the command is by definition *still running*
+      // there, and its lock is still doing its job. Scope invalidation is
+      // idempotent, so running it here as well as on settle costs nothing and
+      // covers the command that never settles at all — which would otherwise
+      // leave the pre-map scope pinned with nothing left to invalidate it.
+      const grace = setTimeout(() => {
+        liveOrphans.delete(finished);
+        invalidateAfter(args);
+      }, orphanGraceMs ?? Math.max(timeoutMs, DEFAULT_TIMEOUT_MS));
+      grace.unref?.();
+
       void finished.then(() => {
         liveOrphans.delete(finished);
-        afterCommand(args);
+        clearTimeout(grace);
+        // On settle the command really is over, however long it overran, so its
+        // locks go now.
+        invalidateAfter(args);
+        releaseLocksOf(run);
       });
     }
   }
@@ -419,7 +483,7 @@ async function executeInProcess(
  * agent pays on every hop of a `locate → callers → read` chain. Running the
  * same command tree here removes that entirely and lets `cli/resolve.ts`'s
  * per-cwd scope cache survive between calls — but only between *reads*: see
- * {@link afterCommand} for the state whose sole invalidation used to be the
+ * {@link invalidateAfter} for the state whose sole invalidation used to be the
  * process ending, and which is therefore reset per command here.
  *
  * Runs are serialized. Commands report failure through `process.exitCode` and
@@ -434,12 +498,13 @@ export function createInProcessRunner(options: InProcessRunnerOptions = {}): IxR
   const version = options.version ?? "0.0.0";
   const createProgram = options.createProgram ?? buildProgram;
   const maxBytes = options.maxOutputBytes ?? MAX_OUTPUT_BYTES;
+  const orphanGraceMs = options.orphanGraceMs;
 
   let queue: Promise<unknown> = Promise.resolve();
 
   return (args, timeoutMs = DEFAULT_TIMEOUT_MS) => {
     const result = queue.then(() =>
-      executeInProcess(args, timeoutMs, version, createProgram, maxBytes),
+      executeInProcess(args, timeoutMs, version, createProgram, maxBytes, orphanGraceMs),
     );
     // The chain must survive a rejection, or one failed run would strand every
     // later call behind it. executeInProcess resolves rather than throws for

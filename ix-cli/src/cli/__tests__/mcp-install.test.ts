@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -339,26 +339,69 @@ describe("registration classification", () => {
     expect(classifyListing("some-other-server: npx thing").registration).toBe("none");
   });
 
-  it("reports an absolute launcher path that no longer resolves as stale", () => {
-    // What a Windows registration looks like after an nvm switch or a reinstall
-    // to a different prefix. Judged from the command string alone this reads as
-    // healthy, so install skipped it and doctor called it registered while every
-    // client failed to start a single Ix tool.
-    const entry = JSON.stringify({ command: "C:\\Users\\gone\\AppData\\Roaming\\npm\\ix.cmd", args: ["mcp"] });
-
-    expect(classifyListing(`ix-memory ${entry}`)).toMatchObject({
+  it.each([
+    String.raw`C:\Users\gone\AppData\Roaming\npm\ix.cmd`,
+    // A Windows username with a space is the common case, not the edge one; a
+    // first attempt that recovered the path by regex stopped at the space and
+    // read this as healthy — for most of the users the check was written for.
+    String.raw`C:\Users\Jane Doe\AppData\Roaming\npm\ix.cmd`,
+    String.raw`C:\Program Files\nodejs\ix.cmd`,
+    "/opt/my tools/bin/ix",
+  ])("reports %s as stale once it no longer resolves", (command) => {
+    // What a registration looks like after an nvm switch or a reinstall to a
+    // different prefix. Read as healthy, install skipped the one host it should
+    // have repaired while doctor agreed it was fine.
+    expect(classifyListing(`ix-memory ${JSON.stringify({ command, args: ["mcp"] })}`, command)).toMatchObject({
       registration: "stale",
       detail: expect.stringContaining("no longer exists"),
     });
   });
 
   it("keeps an absolute launcher that does resolve as ours", () => {
-    const launcher = join(tempDir(), "ix.cmd");
+    // Written under a directory with a space in it, so this cannot pass merely
+    // by failing to recognise the path as a path.
+    const dir = join(tempDir(), "my tools");
+    mkdirSync(dir, { recursive: true });
+    const launcher = join(dir, "ix.cmd");
     writeFileSync(launcher, "@echo off");
 
-    expect(classifyListing(`ix-memory ${JSON.stringify({ command: launcher, args: ["mcp"] })}`).registration).toBe(
+    expect(
+      classifyListing(`ix-memory ${JSON.stringify({ command: launcher, args: ["mcp"] })}`, launcher).registration,
+    ).toBe("ours");
+  });
+
+  // Windows-only by nature: a UNC path is a network location there, and stat
+  // fails on it with something other than ENOENT. Everywhere else those
+  // backslashes are ordinary filename characters, so the path really is absent
+  // and `stale` is the right answer.
+  it.skipIf(process.platform !== "win32")("leaves a launcher it cannot conclusively stat alone", () => {
+    // A file server being offline is not evidence the launcher is gone, and
+    // `stale` triggers a rewrite with no --force, so only ENOENT counts.
+    const unc = String.raw`\\server-that-does-not-exist\share\npm\ix.cmd`;
+
+    expect(classifyListing(`ix-memory ${JSON.stringify({ command: unc, args: ["mcp"] })}`, unc).registration).toBe(
       "ours",
     );
+  });
+
+  it("does not invent a stale launcher out of a suffix of a live path", () => {
+    // A launcher that genuinely exists, sitting under a `.../npm/ix.cmd` tail.
+    // A regex allowed to start at an interior `/` matched only that tail,
+    // stat'd `/npm/ix.cmd` from the filesystem root, found nothing, and called
+    // a working registration stale — so `install` rewrote it with no --force
+    // and `doctor` exited 1 on a healthy machine. The fixture has to use a path
+    // that exists, or it cannot tell the two behaviours apart.
+    const dir = join(tempDir(), "Program Files", "npm");
+    mkdirSync(dir, { recursive: true });
+    const launcher = join(dir, "ix.cmd");
+    writeFileSync(launcher, "@echo off");
+    // Both properties are needed to reproduce it: the space stops an
+    // unanchored match from spanning the path from its start, and the forward
+    // slashes then give it an interior `/npm/ix.cmd` to latch onto instead.
+    // A temp path without either cannot tell the two behaviours apart.
+    const rendered = launcher.replaceAll("\\", "/");
+
+    expect(classifyListing(`ix-memory  ${rendered}  mcp  -  enabled`).registration).toBe("ours");
   });
 
   it("recognises a pretty-printed definition split across lines", () => {
@@ -399,6 +442,21 @@ describe("quoteForCmd", () => {
     );
   });
 
+  it.each([
+    String.raw`C:\Users\R&D\npm\ix.cmd`,
+    String.raw`C:\a^b\ix.cmd`,
+    String.raw`C:\a|b\ix.cmd`,
+  ])("quotes %s, which carries a metacharacter but no space", (path) => {
+    // The case the test above cannot reach, because its fixture has a space and
+    // so takes the quoting branch either way. A "does this need quoting?" check
+    // that asks only about whitespace lets these through bare: verified by
+    // round-trip that `C:\Users\R&D\npm\ix.cmd` then arrives as `C:\Users\R`
+    // with cmd running `D\npm\ix.cmd` as a second command, and that
+    // `C:\a^b\ix.cmd` arrives silently as `C:\ab\ix.cmd` — a wrong launcher
+    // path written into every host config and reported as a success.
+    expect(quoteForCmd(path)).toBe(`"${path}"`);
+  });
+
   it("leaves an ordinary argument alone", () => {
     expect(quoteForCmd("--scope")).toBe("--scope");
   });
@@ -416,6 +474,13 @@ describe("classifyShown", () => {
 
   it("still reads an explicit 'no such server' as free", () => {
     expect(classifyShown("No MCP server named ix-memory\n", false).registration).toBe("none");
+  });
+
+  it("does not read an unrelated 'not found' as free", () => {
+    // A missing plugin, or the host's own loader failing. Neither says anything
+    // about our name, and reading one as an empty slot writes over whatever the
+    // user had — the very thing this function exists to prevent.
+    expect(classifyShown("Error: plugin 'foo' not found\n", false).registration).toBe("unknown");
   });
 
   it("reads a definition body as ours", () => {
