@@ -1,11 +1,11 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, writeFileSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:net";
 import * as http from "node:http";
-import { serverScript } from "../src/cli/commands/view.js";
+import { serverScript } from "../commands/view.js";
 
 /** Pick a free TCP port by binding port 0 and releasing it. */
 function getFreePort(): Promise<number> {
@@ -36,61 +36,105 @@ async function waitForPort(port: number, timeoutMs = 8000): Promise<void> {
 
 describe("view server (/__ix/remap)", () => {
   let distDir: string;
+  let mapRoot: string;
   let stubMain: string;
+  let marker: string;
   let child: ChildProcess | null = null;
   let port = 0;
-  const marker = join(process.cwd(), "stub-ran.txt");
 
   beforeAll(async () => {
     // A fake Compass dist: index.html is the SPA entry the fallback serves.
     distDir = mkdtempSync(join(tmpdir(), "ix-view-dist-"));
     writeFileSync(join(distDir, "index.html"), "<h1>fake compass</h1>");
 
-    // A stub `ix` CLI main: the server runs `node <MAP_MAIN> map .`. Exit code
-    // comes from STUB_EXIT (default 0), so both the success and failure paths
-    // are testable without a real installation.
+    // The workspace the server is scoped to. The endpoint maps this, not its
+    // own cwd, so the test has to supply one.
+    mapRoot = mkdtempSync(join(tmpdir(), "ix-view-root-"));
+
+    // The marker records every stub invocation. It lives in the temp tree and
+    // is passed by env rather than written to process.cwd(): the stub's cwd is
+    // MAP_ROOT now, and writing into the package root left an untracked file
+    // behind whenever a run was interrupted before cleanup.
+    marker = join(distDir, "stub-ran.txt");
+
+    // A stub `ix` CLI main: the server runs `node <MAP_MAIN> map <root> --silent`.
+    // STUB_MS holds it open so overlapping requests are observable; STUB_EXIT
+    // drives the failure path.
     stubMain = join(distDir, "stub-main.js");
     writeFileSync(
       stubMain,
       [
         'const fs = require("fs");',
-        'fs.writeFileSync(require("path").join(process.cwd(), "stub-ran.txt"), "ok");',
-        "process.exit(Number(process.env.STUB_EXIT || 0));",
+        "fs.appendFileSync(process.env.STUB_MARKER, process.argv.slice(2).join(\" \") + \"\\n\");",
+        "const ms = Number(process.env.STUB_MS || 0);",
+        "const done = () => process.exit(Number(process.env.STUB_EXIT || 0));",
+        "if (ms > 0) setTimeout(done, ms); else done();",
       ].join("\n"),
     );
 
     port = await getFreePort();
-    const script = serverScript(distDir, port, "test-workspace", null);
+    const script = serverScript(distDir, port, "test-workspace", null, mapRoot);
     // The generated script must survive template-literal emission intact.
     expect(script).toContain('"/__ix/remap"');
     expect(script).toContain("IX_VIEW_MAP_MAIN");
     expect(script).toContain('server.listen(PORT, "127.0.0.1"');
 
-    const scriptPath = join(distDir, "compass-server.js");
-    writeFileSync(scriptPath, script);
     await startServer({ STUB_EXIT: "0" });
-    await waitForPort(port);
   });
 
-  afterAll(() => {
-    child?.kill();
-    rmSync(marker, { force: true });
+  afterAll(async () => {
+    await stopServer();
+    rmSync(distDir, { recursive: true, force: true });
+    rmSync(mapRoot, { recursive: true, force: true });
   });
 
-  async function startServer(extraEnv: Record<string, string>) {
-    child?.kill();
-    const script = serverScript(distDir, port, "test-workspace", null);
+  /** Kill the running server and wait for the socket to be released. */
+  async function stopServer(): Promise<void> {
+    if (!child) return;
+    const dying = child;
+    child = null;
+    if (dying.exitCode !== null || dying.signalCode !== null) return;
+    await new Promise<void>((resolve) => {
+      dying.once("exit", () => resolve());
+      dying.kill();
+    });
+  }
+
+  /**
+   * Replace the running server.
+   *
+   * Awaiting the old child's exit matters: kill() returns when SIGTERM is sent,
+   * not when it lands, so spawning the replacement on the same port immediately
+   * could lose the bind to EADDRINUSE — invisibly, because stdio is ignored —
+   * while waitForPort was satisfied by the still-dying old server.
+   */
+  async function startServer(extraEnv: Record<string, string>, root: string | null = mapRoot) {
+    await stopServer();
     const scriptPath = join(distDir, "compass-server.js");
-    writeFileSync(scriptPath, script);
-    child = spawn(process.execPath, [scriptPath], {
-      env: { ...process.env, IX_VIEW_MAP_MAIN: stubMain, ...extraEnv },
+    writeFileSync(scriptPath, serverScript(distDir, port, "test-workspace", null, root));
+    const spawned = spawn(process.execPath, [scriptPath], {
+      env: {
+        ...process.env,
+        NODE_ENV: "test", // the IX_VIEW_MAP_MAIN seam is honoured only under this
+        IX_VIEW_MAP_MAIN: stubMain,
+        STUB_MARKER: marker,
+        STUB_MS: "0",
+        ...extraEnv,
+      },
       stdio: "ignore",
     });
+    // A server that dies on startup would otherwise surface as a timeout in
+    // waitForPort with no indication of why.
+    spawned.once("error", () => { /* surfaced by waitForPort */ });
+    child = spawned;
     await waitForPort(port);
   }
 
-  const post = (path: string, headers: Record<string, string>) =>
+  const post = (path: string, headers: Record<string, string> = {}) =>
     fetch(`http://127.0.0.1:${port}${path}`, { method: "POST", headers });
+
+  const runs = () => (existsSync(marker) ? readFileSync(marker, "utf8").trim().split("\n").filter(Boolean) : []);
+  const resetRuns = () => writeFileSync(marker, "");
 
   it("rejects a cross-site Origin (CSRF) with 403", async () => {
     const res = await post("/__ix/remap", { origin: "https://evil.example", host: `127.0.0.1:${port}` });
@@ -126,6 +170,16 @@ describe("view server (/__ix/remap)", () => {
     expect(res.status).toBe(403);
   });
 
+  it("rejects a loopback Origin on a different port", async () => {
+    // Loopback is not one origin. Any page served on another localhost port can
+    // send this exact POST with no preflight, so accepting the whole interface
+    // let a local dev server or docs site trigger a remap.
+    resetRuns();
+    const res = await post("/__ix/remap", { origin: `http://localhost:${port + 1}`, host: `127.0.0.1:${port}` });
+    expect(res.status).toBe(403);
+    expect(runs()).toHaveLength(0);
+  });
+
   it("accepts a bracketed IPv6 loopback Host ([::1]:port)", async () => {
     const status = await new Promise<number>((resolve, reject) => {
       const req = http.request(
@@ -141,18 +195,52 @@ describe("view server (/__ix/remap)", () => {
     expect(status).toBe(200);
   });
 
-  it("accepts a no-Origin (curl-style) POST and runs the map command", async () => {
-    rmSync(marker, { force: true });
+  it("accepts a no-Origin (curl-style) POST and maps the scoped workspace", async () => {
+    resetRuns();
     const res = await post("/__ix/remap", { host: `127.0.0.1:${port}` });
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true });
-    expect(existsSync(marker)).toBe(true);
+    // The recorded workspace root, never the server's own cwd, and --silent
+    // because nothing reads the output.
+    expect(runs()).toEqual([`map ${mapRoot} --silent`]);
   });
 
   it("accepts a same-origin loopback Origin", async () => {
     const res = await post("/__ix/remap", { origin: `http://localhost:${port}`, host: `127.0.0.1:${port}` });
     expect(res.status).toBe(200);
     expect((await res.json()).ok).toBe(true);
+  });
+
+  it("refuses a second remap while one is in flight", async () => {
+    await startServer({ STUB_MS: "1200" });
+    resetRuns();
+    const first = post("/__ix/remap", { host: `127.0.0.1:${port}` });
+    // Let the first request reach the spawn before the second arrives.
+    await new Promise((r) => setTimeout(r, 300));
+    const second = await post("/__ix/remap", { host: `127.0.0.1:${port}` });
+
+    expect(second.status).toBe(409);
+    expect((await second.json()).error).toMatch(/already running/);
+    expect((await first).status).toBe(200);
+    expect(runs()).toHaveLength(1);
+
+    // The slot is released, so the next one is accepted rather than wedged.
+    await startServer({ STUB_EXIT: "0" });
+    expect((await post("/__ix/remap", { host: `127.0.0.1:${port}` })).status).toBe(200);
+  });
+
+  it("refuses to remap when the view is unscoped (--all)", async () => {
+    await startServer({ STUB_EXIT: "0" }, null);
+    resetRuns();
+    const res = await post("/__ix/remap", { host: `127.0.0.1:${port}` });
+
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toMatch(/--all/);
+    // The point of the guard: nothing was mapped. Falling back to the server's
+    // cwd here is what could ingest a home directory.
+    expect(runs()).toHaveLength(0);
+
+    await startServer({ STUB_EXIT: "0" });
   });
 
   it("returns ok:false when the map command fails", async () => {

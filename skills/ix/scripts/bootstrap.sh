@@ -41,8 +41,12 @@ fail() { printf '\033[1;31m[ix-skill]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # Detect Windows (Git Bash / MSYS2 / Cygwin). WSL is Linux: it reports
 # uname = Linux and must take the curl|sh path, not the PowerShell installer,
-# so it is deliberately not treated as Windows here.
-is_windows() { case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) return 0 ;; *) return 1 ;; esac; }
+# so WSL_DISTRO_NAME is deliberately not treated as Windows here.
+#
+# MSYSTEM stays. Dropping it along with the WSL check was collateral — uname
+# does report MINGW*/MSYS* under Git Bash, so it looked redundant, but it is
+# the belt to that braces and its removal was never the fix.
+is_windows() { [ -n "${MSYSTEM:-}" ] || case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) return 0 ;; *) return 1 ;; esac; }
 
 version_ge() { # version_ge <got> <want>
   # `sort -C` succeeds when its input is already in order, so feeding it
@@ -139,7 +143,11 @@ fi
 # --- Backend ------------------------------------------------------------------
 if [ "$DO_BACKEND" = "1" ]; then
   info "Starting the Ix backend (ArangoDB + memory layer)…"
-  ix docker start || warn "`ix docker start` reported a problem — run `ix doctor` and `ix status` for details."
+  # Single quotes: inside double quotes these backticks were command
+  # substitutions, so the failure path re-ran 'ix docker start' and then ran
+  # 'ix doctor' and 'ix status', splicing their output into the message and
+  # leaving the user with the command names stripped out of the advice.
+  ix docker start || warn 'ix docker start reported a problem — run: ix doctor, then ix status'
   for _ in $(seq 1 15); do
     if ix status >/dev/null 2>&1; then break; fi
     sleep 2

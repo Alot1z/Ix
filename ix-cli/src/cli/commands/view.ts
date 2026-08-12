@@ -12,7 +12,7 @@ import { homedir, platform } from "os";
 import { fileURLToPath } from "url";
 import { createConnection } from "net";
 import { resolveWorkspaceId } from "../bootstrap.js";
-import { findWorkspaceForCwd, loadWorkspaces, getEndpoint } from "../config.js";
+import { findWorkspaceForCwd, getDefaultWorkspace, loadWorkspaces, getEndpoint } from "../config.js";
 import { detectSystem } from "../system.js";
 import { IxClient } from "../../client/api.js";
 
@@ -177,8 +177,25 @@ function isPortInUse(port: number): Promise<boolean> {
   });
 }
 
+/**
+ * Path to the CLI entry point of the install generating this script.
+ *
+ * Taken from this module's own location rather than derived from the compass
+ * dist directory, so it holds for a repo checkout as well as an install.
+ */
+function cliMainForScript(): string {
+  return join(dirname(fileURLToPath(import.meta.url)), "..", "main.js");
+}
+
 /** Generate the inline server script that serves static files + proxies /v1. */
-export function serverScript(distDir: string, port: number, workspaceId: string | null, systemId: string | null): string {
+export function serverScript(
+  distDir: string,
+  port: number,
+  workspaceId: string | null,
+  systemId: string | null,
+  mapRoot: string | null = null,
+): string {
+  const cliMainPath = cliMainForScript();
   return `
 const http = require("http");
 const fs = require("fs");
@@ -191,6 +208,25 @@ const PORT = ${port};
 const BACKEND = ${JSON.stringify(BACKEND_URL)};
 const WORKSPACE_ID = ${JSON.stringify(workspaceId)};
 const SYSTEM_ID = ${JSON.stringify(systemId)};
+
+// The workspace root /__ix/remap maps, resolved by ix view start and baked in
+// rather than re-derived here — null when --all left the view unscoped.
+const MAP_ROOT = ${JSON.stringify(mapRoot)};
+
+// The CLI that generated this script, resolved from its own location at
+// generation time. Deriving it here from DIST only worked for the installed
+// layout; findCompassDist's dev branch returns a repo path, from which the
+// same arithmetic lands on a file that never exists.
+//
+// The env override is a test seam and is honoured only under NODE_ENV=test, so
+// a shipped install cannot be pointed at an arbitrary script through the
+// environment.
+const MAP_MAIN = (process.env.NODE_ENV === "test" && process.env.IX_VIEW_MAP_MAIN)
+  ? process.env.IX_VIEW_MAP_MAIN
+  : ${JSON.stringify(cliMainPath)};
+
+// One map at a time. execFile is asynchronous, so nothing else serialises them.
+let mapInFlight = null;
 
 const MIME = {
   ".html": "text/html",
@@ -265,7 +301,12 @@ const server = http.createServer((req, res) => {
         const u = new URL(origin);
         loopbackOrigin =
           (u.protocol === "http:" || u.protocol === "https:") &&
-          (u.hostname === "localhost" || u.hostname === "127.0.0.1" || u.hostname === "[::1]");
+          (u.hostname === "localhost" || u.hostname === "127.0.0.1" || u.hostname === "[::1]") &&
+          // Our own port, not merely some loopback one. Any page served on any
+          // other localhost port — a dev server, a local docs site — can send a
+          // simple POST with no preflight, and accepting the whole loopback
+          // interface as one origin let it trigger a remap.
+          u.port === String(PORT);
       } catch {
         loopbackOrigin = false;
       }
@@ -275,23 +316,50 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ ok: false, error: "forbidden: loopback only" }));
       return;
     }
-    const IX_HOME = path.resolve(DIST, "..", "..");
-    // Overridable for tests; production resolves the CLI that shipped with Ix.
-    const MAP_MAIN = process.env.IX_VIEW_MAP_MAIN || path.join(IX_HOME, "cli", "cli", "dist", "cli", "main.js");
+    // Nothing reads the request body, but leaving it unconsumed holds the
+    // stream open for the whole map.
+    req.resume();
+    // MAP_ROOT is the workspace this visualizer is showing, resolved once by
+    // ix view start and baked in. Mapping process.cwd() instead would follow
+    // whatever directory the detached server was launched from: --all does not
+    // require that to be a workspace at all, so "ix view start --all" run from
+    // a home directory turned one click into an ingest of the whole of it.
+    if (!MAP_ROOT) {
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: "remap needs a single workspace; this view was started with --all" }));
+      return;
+    }
+    if (mapInFlight) {
+      // execFile is async, so without this every POST starts another full
+      // ingest and Louvain pass over the same workspace.
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: "a remap is already running" }));
+      return;
+    }
     if (!fs.existsSync(MAP_MAIN)) {
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: false, error: "ix CLI not found at " + MAP_MAIN }));
       return;
     }
-    const child = execFile(process.execPath, [MAP_MAIN, "map", "."], { cwd: process.cwd(), timeout: 1800000 }, (err, stdout, stderr) => {
+    // --silent because nothing here reads stdout, and the default text render
+    // is work done only to be thrown away. maxBuffer is raised anyway: the
+    // default 1 MiB makes Node SIGTERM the child mid-map, which surfaces as a
+    // 500 rather than as the truncation it is.
+    const child = execFile(process.execPath, [MAP_MAIN, "map", MAP_ROOT, "--silent"], { cwd: MAP_ROOT, timeout: 1800000, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
+      mapInFlight = null;
       if (res.destroyed) return; // client disconnected while mapping
       res.writeHead(err ? 500 : 200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: !err, error: err ? String(stderr || err.message).slice(0, 400) : undefined }));
     });
+    mapInFlight = child;
     // Stop the map if the client goes away before we respond. res "close" fires
     // on abnormal teardown too; writableEnded tells normal completion apart
     // from a disconnect (IncomingMessage "close" can fire on request completion
     // in some Node versions, which would kill the map mid-flight).
+    //
+    // Killing mid-map is safe: the ingest baseline is only persisted after a
+    // clean run, so an interrupted map re-ingests next time rather than
+    // recording files as done that never landed.
     res.on("close", () => { if (!res.writableEnded) { try { child.kill(); } catch {} } });
     return;
   }
@@ -373,6 +441,12 @@ export function registerViewCommand(program: Command): void {
       // X-Ix-Workspace on every /v1 call so Compass isolates by workspace without any
       // workspace awareness of its own. --all opts out (show the whole backend).
       const workspaceId = opts.all ? null : (resolveWorkspaceId() ?? null);
+      // Resolved the same way workspaceId is, so /__ix/remap re-maps exactly
+      // what the visualizer is showing. Null under --all, which deliberately
+      // scopes to nothing — there is no single workspace to rebuild.
+      const mapRoot = opts.all
+        ? null
+        : ((findWorkspaceForCwd(process.cwd()) ?? getDefaultWorkspace())?.root_path ?? null);
 
       // If the launch directory is a multi-repo system, scope by system_id instead of
       // workspace_id: co-ingested member repos live under their own workspace_ids, so a
@@ -460,7 +534,7 @@ export function registerViewCommand(program: Command): void {
       // Write server script to temp location
       const scriptDir = dirname(SERVER_SCRIPT_FILE);
       mkdirSync(scriptDir, { recursive: true });
-      writeFileSync(SERVER_SCRIPT_FILE, serverScript(distDir, port, workspaceId, systemId));
+      writeFileSync(SERVER_SCRIPT_FILE, serverScript(distDir, port, workspaceId, systemId, mapRoot));
 
       // Spawn detached process
       const child = spawn("node", [SERVER_SCRIPT_FILE], {
