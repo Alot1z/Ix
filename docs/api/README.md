@@ -476,10 +476,43 @@ backend:
 1. **`/v1/*` proxy** — every backend request is proxied to `localhost:8090`
    with `x-ix-workspace` and `x-ix-system` headers baked in at launch, so the
    browser app never knows about workspaces. `--all` opts out of scoping.
-2. **SPA fallback** — any other path serves `index.html`. There is no
-   `/__ix/remap` endpoint: a `POST` to it falls through to this handler and
-   returns the SPA HTML with a `200`, so a caller cannot tell it did nothing.
-   Re-map from the CLI with `ix map .` instead.
+2. **`POST /__ix/remap`** — rebuild the code map for the workspace this
+   visualizer is scoped to, by running `ix map <workspace-root> --silent` with
+   a 30-minute timeout. Responds `{ "ok": true }` on success, or a `500` with
+   `{ "ok": false, "error": ... }` when the map command fails.
+
+   The workspace root is resolved once, by `ix view start`, and baked into the
+   generated server — the same resolution that produces the `x-ix-workspace`
+   header, so a remap rebuilds exactly what the view is showing. It is *not*
+   the server's working directory: under `--all` that need not be a workspace
+   at all, so a view started from a home directory would have mapped the whole
+   of it. Two `409`s follow from that:
+
+   - `--all` leaves the view unscoped and there is no single workspace to
+     rebuild: `{ "ok": false, "error": "remap needs a single workspace; …" }`
+   - a remap is already running: `{ "ok": false, "error": "a remap is already
+     running" }`. `execFile` is asynchronous, so without this every request
+     would start another full ingest over the same workspace.
+
+   It does **not** run `ix reset` — `ix map` reconciles deletions itself, and
+   `ix reset` takes no workspace id, so it would wipe every workspace in the
+   backend rather than rebuilding this one.
+
+   **Loopback only:** the server binds `127.0.0.1`, and the handler rejects
+   requests whose `Host` is not loopback, or whose browser `Origin` is not
+   this exact origin — loopback hostname *and* this server's port
+   (`403 { "ok": false, "error": "forbidden: loopback only" }`). Matching the
+   port matters: any page served on another localhost port can send this POST
+   with no preflight, so treating the whole loopback interface as one origin
+   would let a local dev server trigger a remap. Requests with no `Origin`
+   (e.g. `curl`) are allowed when the `Host` is loopback. The endpoint shells
+   out with the user's privileges, which is what all of this is guarding.
+
+   Interrupting a remap is safe: the client going away kills the child, and the
+   ingest baseline is only persisted after a clean run, so an interrupted map
+   re-ingests next time rather than recording files as done that never landed.
+3. **SPA fallback** — any other path serves `index.html`. A `GET` to
+   `/__ix/remap` (or any other unknown path) falls through to this handler.
 
 ## Data Models
 
