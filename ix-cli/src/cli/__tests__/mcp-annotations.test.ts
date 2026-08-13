@@ -72,4 +72,16 @@ describe("ix mcp tool annotations", () => {
     expect(byName.get("ix_map")?.annotations?.openWorldHint).toBe(false);
     expect(byName.get("ix_text")?.annotations?.openWorldHint).toBe(false);
   });
+
+  it("advertises a truthful non-empty title for every tool", async () => {
+    const client = await connect(async () => ({ ok: true, stdout: "ok", stderr: "" }), true);
+    const tools = await client.listTools();
+    const byName = new Map(tools.tools.map((entry) => [entry.name, entry]));
+
+    for (const name of IX_MCP_TOOL_NAMES) {
+      const title = byName.get(name)?.annotations?.title;
+      expect(typeof title, `tool ${name} has no title annotation`).toBe("string");
+      expect((title ?? "").length, `tool ${name} title is empty`).toBeGreaterThan(0);
+    }
+  });
 });
