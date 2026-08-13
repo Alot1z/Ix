@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 import {
@@ -60,6 +60,67 @@ export const IX_MCP_PRO_TOOL_NAMES = ["ix_briefing", "ix_decisions", "ix_decide"
 
 /** Every tool this server can serve, across both tiers. */
 export const IX_MCP_TOOL_NAMES = [...IX_MCP_OSS_TOOL_NAMES, ...IX_MCP_PRO_TOOL_NAMES] as const;
+
+/**
+ * Semantic annotations for the tool catalog.
+ *
+ * These are advisory hints for MCP clients: they describe each tool's intent so
+ * a client can present and route it sensibly. They are NOT security controls —
+ * the hardening that actually matters (argv construction, timeouts, output
+ * bounds, process cleanup) lives in the runner and is unchanged. The table is
+ * keyed by {@link IX_MCP_TOOL_NAMES}, so the typechecker rejects any tool
+ * added to the catalog without a truthful classification.
+ */
+const READ_ONLY: ToolAnnotations = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+};
+
+/** Mutates backend state, so it is neither read-only nor idempotent. */
+const WRITE: ToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: false,
+};
+
+/** Mutates backend state and reaches outside the host (GitHub): open-world. */
+const WRITE_OPEN_WORLD: ToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: true,
+};
+
+const TOOL_ANNOTATIONS: Record<(typeof IX_MCP_TOOL_NAMES)[number], ToolAnnotations> = {
+  ix_health: READ_ONLY,
+  ix_locate: READ_ONLY,
+  ix_text: READ_ONLY,
+  ix_impact: READ_ONLY,
+  ix_map: WRITE,
+  ix_overview: READ_ONLY,
+  ix_read: READ_ONLY,
+  ix_diff: READ_ONLY,
+  ix_callers: READ_ONLY,
+  ix_callees: READ_ONLY,
+  ix_imported_by: READ_ONLY,
+  ix_imports: READ_ONLY,
+  ix_depends: READ_ONLY,
+  ix_trace: READ_ONLY,
+  ix_explain: READ_ONLY,
+  ix_rank: READ_ONLY,
+  ix_inventory: READ_ONLY,
+  ix_smells: READ_ONLY,
+  ix_stats: READ_ONLY,
+  ix_subsystems: READ_ONLY,
+  ix_history: READ_ONLY,
+  ix_ingest: WRITE_OPEN_WORLD,
+  ix_briefing: READ_ONLY,
+  ix_decisions: READ_ONLY,
+  ix_decide: WRITE,
+};
 
 interface CreateServerOptions {
   version?: string;
@@ -371,8 +432,10 @@ function registerTool(
   inputSchema: z.ZodRawShape,
   handler: (input: ToolInput) => Promise<CallToolResult>,
 ): void {
-  server.registerTool(name, { description, inputSchema }, async (input) =>
-    handler(input as ToolInput),
+  server.registerTool(
+    name,
+    { description, inputSchema, annotations: TOOL_ANNOTATIONS[name as keyof typeof TOOL_ANNOTATIONS] },
+    async (input) => handler(input as ToolInput),
   );
 }
 
