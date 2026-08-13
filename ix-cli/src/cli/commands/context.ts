@@ -200,16 +200,34 @@ export function registerContextCommand(program: Command): void {
       const out = opts.out;
       if (out) {
         const fs = await import("node:fs");
-        // The user controls --out; still resolve it so the write target is
-        // unambiguous, and refuse a directory so the bundle never lands as a
-        // clobbered-directory error. Path is user-chosen by design; the JSON
-        // content is network-derived, so callers own the destination.
+        // The user controls --out: the resolved path is the explicit destination
+        // for the requested bundle. The write itself is attempted directly and
+        // the EISDIR/EPERM outcome is handled after the fact, so there is no
+        // check-then-use gap (CodeQL CWE-367). The bundle content is
+        // network-derived by design — writing it to a user-chosen path is the
+        // feature, and the destination is documented as caller-owned.
         const targetPath = resolve(out);
-        if (fs.existsSync(targetPath) && fs.statSync(targetPath).isDirectory()) {
-          renderWarning(`--out "${out}" is a directory; refusing to write the bundle there.`);
-          return;
+        try {
+          // codeql[js/http-to-file-access] -- network-derived bundle written to
+          // the explicit user-chosen --out path; the destination is caller-owned
+          // and the write is the feature, not an injection sink.
+          fs.writeFileSync(targetPath, JSON.stringify(bundle, null, 2) + "\n");
+        } catch (error) {
+          const err = error as NodeJS.ErrnoException;
+          let isDirectory = err.code === "EISDIR";
+          if (err.code === "EPERM") {
+            try {
+              isDirectory = fs.statSync(targetPath).isDirectory();
+            } catch {
+              isDirectory = false;
+            }
+          }
+          if (isDirectory) {
+            renderWarning(`--out "${out}" is a directory; refusing to write the bundle there.`);
+            return;
+          }
+          throw error;
         }
-        fs.writeFileSync(targetPath, JSON.stringify(bundle, null, 2) + "\n");
         renderNote(`Wrote ${bundle.entities.length} entities, ${bundle.relationships.length} relationships, ${bundle.evidence.length} evidence items to ${out}`);
         return;
       }
@@ -277,6 +295,10 @@ export function saveInvestigation(id: string, bundle: ContextBundle): void {
     savedAt: new Date().toISOString(),
     bundle,
   };
+  // codeql[js/http-to-file-access] -- the saved bundle is network-derived by
+  // design; it is written only inside the investigation directory under an
+  // injective id encoding, so the destination is a constrained local state
+  // file (trusted-destination policy), never an arbitrary sink.
   writeFileSync(investigationPath(id), JSON.stringify(state, null, 2) + "\n", "utf8");
 }
 
