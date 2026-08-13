@@ -53,6 +53,28 @@ install even though every call answered "requires Ix Pro".
 **Net:** codex and cursor can delegate with no change in what an agent can do.
 gemini, openclaw and opencode lose only `ix_query` and the two composites.
 
+## Structured results and tool annotations
+
+`ix mcp` exposes two protocol conveniences on top of the tool surface:
+
+- **Tool annotations.** Every advertised tool carries `readOnlyHint`,
+  `destructiveHint`, `idempotentHint` and `openWorldHint` so a client can
+  present and route it correctly. Graph reads are read-only and idempotent;
+  `ix_map`, `ix_ingest` and `ix_decide` are destructive because they mutate
+  backend state; only `ix_ingest` is open-world, because its GitHub form
+  reaches an external API. These are advisory hints, not security controls —
+  the enforcement that matters (argv construction, timeouts, output bounds,
+  process cleanup) lives in the runner.
+
+- **Structured content.** `ix_map`, `ix_ingest` and `ix_smells` return their
+  parsed JSON object as `structuredContent` (with an `outputSchema`) so agents
+  receive typed values instead of a string to re-parse. The schema asserts only
+  "an object": the real field shape is backend-defined and versioned, and
+  promising specific fields would break tool calls the moment the backend
+  renames one. The human-readable text result is preserved for clients that
+  prefer it. The remaining tools return their `llm`-format text, which has no
+  stable object shape worth promising.
+
 ## Order of work
 
 1. **Ship `ix mcp` in a released `@ix/cli`.** Nothing downstream can depend on it
