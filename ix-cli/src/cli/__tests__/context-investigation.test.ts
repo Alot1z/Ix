@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -12,7 +12,13 @@ import type {
   ScoredClaim,
 } from "../../client/types.js";
 import type { EntityFacts } from "../explain/facts.js";
-import { buildBundle, diffInvestigations, loadInvestigation, saveInvestigation } from "../commands/context.js";
+import {
+  buildBundle,
+  diffInvestigations,
+  loadInvestigation,
+  mergeDiffOptions,
+  saveInvestigation,
+} from "../commands/context.js";
 
 let home: string;
 
@@ -188,5 +194,37 @@ describe("ix context investigation state", () => {
     const diff = diffInvestigations(stored, fresh);
     expect(diff.freshness.previous.classification).toBe("current");
     expect(diff.freshness.current.classification).toBe("stale");
+  });
+
+  it("preserves saved revision and depth for --diff unless explicitly overridden", () => {
+    const bundle = bundleWith([makeClaim("renders to DOM", 0.9)]);
+    bundle.metadata.asOfRev = 7;
+    bundle.metadata.depth = "2";
+    saveInvestigation("widget-check", bundle);
+    const stored = loadInvestigation("widget-check")!;
+
+    expect(mergeDiffOptions(stored, {})).toEqual({ asOfRev: "7", depth: "2" });
+    expect(mergeDiffOptions(stored, { asOfRev: "3" })).toEqual({ asOfRev: "3", depth: "2" });
+    expect(mergeDiffOptions(stored, { depth: "4" })).toEqual({ asOfRev: "7", depth: "4" });
+    expect(mergeDiffOptions(stored, { asOfRev: "3", depth: "4" })).toEqual({ asOfRev: "3", depth: "4" });
+  });
+
+  it("never collides or escapes for hostile investigation ids", () => {
+    const a = bundleWith([makeClaim("renders to DOM", 0.9)]);
+    const b = bundleWith([makeClaim("mounts to DOM", 0.9)]);
+    saveInvestigation("a/b", a);
+    saveInvestigation("a?b", b);
+    saveInvestigation("../../escape", a);
+
+    expect(loadInvestigation("a/b")?.bundle.evidence).toEqual(a.evidence);
+    expect(loadInvestigation("a?b")?.bundle.evidence).toEqual(b.evidence);
+    expect(loadInvestigation("../../escape")?.bundle.target.name).toBe("Widget");
+
+    // Every hostile id lands as one single-segment file inside the IX_HOME
+    // investigations directory; nothing is written outside it.
+    const jsonFiles = readdirSync(home).filter((f) => f.endsWith(".json"));
+    expect(jsonFiles).toHaveLength(3);
+    for (const f of jsonFiles) expect(f).not.toContain("/");
+    expect(existsSync(join(home, "..", "escape.json"))).toBe(false);
   });
 });

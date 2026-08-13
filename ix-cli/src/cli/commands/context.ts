@@ -1,7 +1,7 @@
 import type { Command } from "commander";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import { IxClient } from "../../client/api.js";
 import type {
@@ -110,8 +110,10 @@ interface ContextBundle {
  */
 export function registerContextCommand(program: Command): void {
   program
-    .command("context <target>")
-    .description("Build a bounded, deterministic context bundle for a symbol, file, or entity")
+    .command("context [target]")
+    .description(
+      "Build a bounded, deterministic context bundle for a symbol, file, or entity (or resume/diff a saved investigation without a target)",
+    )
     .option("--kind <kind>", "Filter target entity by kind")
     .option("--path <path>", "Prefer symbols from files matching this path substring")
     .option("--pick <n>", "Pick Nth candidate from ambiguous results (1-based)")
@@ -138,7 +140,11 @@ export function registerContextCommand(program: Command): void {
       if (opts.diff) {
         const saved = loadInvestigation(opts.diff);
         if (!saved) return;
-        const fresh = await buildFreshBundle(target ?? saved.bundle.target.name, opts, saved.bundle.budgets);
+        const fresh = await buildFreshBundle(
+          target ?? saved.bundle.target.name,
+          { ...opts, ...mergeDiffOptions(saved, opts) },
+          saved.bundle.budgets,
+        );
         if (!fresh) return;
         renderInvestigationDiff(saved, fresh, opts.format);
         return;
@@ -151,6 +157,7 @@ export function registerContextCommand(program: Command): void {
       const client = new IxClient(getEndpoint());
 
       const resolved = await resolveFileOrEntity(client, target, {
+        kind: opts.kind,
         path: opts.path,
         pick: opts.pick ? parseInt(opts.pick, 10) : undefined,
       });
@@ -193,7 +200,16 @@ export function registerContextCommand(program: Command): void {
       const out = opts.out;
       if (out) {
         const fs = await import("node:fs");
-        fs.writeFileSync(out, JSON.stringify(bundle, null, 2) + "\n");
+        // The user controls --out; still resolve it so the write target is
+        // unambiguous, and refuse a directory so the bundle never lands as a
+        // clobbered-directory error. Path is user-chosen by design; the JSON
+        // content is network-derived, so callers own the destination.
+        const targetPath = resolve(out);
+        if (fs.existsSync(targetPath) && fs.statSync(targetPath).isDirectory()) {
+          renderWarning(`--out "${out}" is a directory; refusing to write the bundle there.`);
+          return;
+        }
+        fs.writeFileSync(targetPath, JSON.stringify(bundle, null, 2) + "\n");
         renderNote(`Wrote ${bundle.entities.length} entities, ${bundle.relationships.length} relationships, ${bundle.evidence.length} evidence items to ${out}`);
         return;
       }
@@ -234,8 +250,22 @@ function investigationPath(id: string): string {
   return join(investigationDir(), `${sanitizeId(id)}.json`);
 }
 
-function sanitizeId(id: string): string {
-  return id.replace(/[^A-Za-z0-9._-]/g, "-");
+/**
+ * Encode an investigation id into a filesystem-safe file name, injectively.
+ *
+ * `[A-Za-z0-9._-]` passes through unchanged; every other UTF-16 code unit —
+ * including the escape marker `~` itself — is hex-encoded as `~HH`. Two
+ * different logical ids can therefore never map to the same file, and a raw
+ * `~` in user input cannot be confused with an encoding: `a/b`, `a?b`, and
+ * `a~2Fb` all land in distinct, single-segment files under the investigation
+ * directory instead of silently colliding or escaping it.
+ */
+export function sanitizeId(id: string): string {
+  let out = "";
+  for (const ch of id) {
+    out += /[A-Za-z0-9._-]/.test(ch) ? ch : `~${ch.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`;
+  }
+  return out || "unnamed";
 }
 
 export function saveInvestigation(id: string, bundle: ContextBundle): void {
@@ -255,6 +285,23 @@ interface SavedInvestigation {
   id: string;
   savedAt: string;
   bundle: ContextBundle;
+}
+
+/**
+ * Carry the saved investigation's revision and depth into a fresh `--diff`
+ * build unless the caller explicitly overrides them, so a plain
+ * `ix context --diff <id>` compares like-for-like instead of silently
+ * re-basing the saved state onto current HEAD.
+ */
+export function mergeDiffOptions(
+  saved: SavedInvestigation,
+  opts: { asOfRev?: string; depth?: string },
+): { asOfRev?: string; depth?: string } {
+  const savedRev = saved.bundle.metadata.asOfRev;
+  return {
+    asOfRev: opts.asOfRev ?? (savedRev === undefined ? undefined : String(savedRev)),
+    depth: opts.depth ?? saved.bundle.metadata.depth,
+  };
 }
 
 export function loadInvestigation(id: string): SavedInvestigation | undefined {
@@ -428,15 +475,22 @@ export function buildBundle(input: BuildInput): ContextBundle {
     },
     entities: [],
     relationships: [],
-    claims: context.claims.map((scored) => ({
-      id: scored.claim.id,
-      entityId: scored.claim.entityId,
-      statement: scored.claim.statement,
-      status: scored.claim.status,
-    })),
-    decisions: context.decisions,
-    conflicts: context.conflicts,
-    intents: context.intents,
+    claims: [...context.claims]
+      .sort(
+        (a, b) =>
+          cmp(a.claim.entityId, b.claim.entityId) ||
+          cmp(a.claim.statement, b.claim.statement) ||
+          cmp(a.claim.id, b.claim.id),
+      )
+      .map((scored) => ({
+        id: scored.claim.id,
+        entityId: scored.claim.entityId,
+        statement: scored.claim.statement,
+        status: scored.claim.status,
+      })),
+    decisions: [...context.decisions].sort((a, b) => cmp(a.title, b.title) || a.rev - b.rev || cmp(a.rationale, b.rationale)),
+    conflicts: [...context.conflicts].sort((a, b) => cmp(a.claimA, b.claimA) || cmp(a.claimB, b.claimB) || cmp(a.id, b.id)),
+    intents: [...context.intents].sort((a, b) => cmp(a.statement, b.statement) || cmp(a.id, b.id)),
     provenance: {
       sourceUri: asString(prov.sourceUri) ?? facts.path,
       sourceHash: asString(prov.sourceHash),
@@ -475,17 +529,21 @@ export function buildBundle(input: BuildInput): ContextBundle {
 
   // Evidence is ordered by relevance, so keep the highest-priority prefix and
   // drop the tail when either the count or the character budget is exceeded.
+  // maxChars bounds the serialized JSON size of the evidence list exactly as it
+  // is emitted in the bundle (each item's JSON.stringify length, in the item's
+  // deterministic key order), so the budget matches the actual representation
+  // rather than an estimate from metadata lengths.
+  const sizedEvidence = evidence.map((item) => ({ item, size: JSON.stringify(item).length }));
   let chars = 0;
   let kept = 0;
-  for (const item of evidence) {
-    const size = item.title.length + item.reason.length + 64;
-    if (kept >= budgets.maxEvidence || chars + size > budgets.maxChars) break;
-    chars += size;
+  for (const entry of sizedEvidence) {
+    if (kept >= budgets.maxEvidence || chars + entry.size > budgets.maxChars) break;
+    chars += entry.size;
     kept += 1;
   }
   bundle.evidence = evidence.slice(0, kept);
   bundle.truncation.evidenceTruncated = evidence.length - kept;
-  const fullChars = evidence.reduce((sum, item) => sum + item.title.length + item.reason.length, 0);
+  const fullChars = sizedEvidence.reduce((sum, entry) => sum + entry.size, 0);
   bundle.truncation.charactersTruncated = Math.max(0, fullChars - chars);
 
   return bundle;

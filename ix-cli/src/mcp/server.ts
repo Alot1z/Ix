@@ -72,6 +72,38 @@ interface CreateServerOptions {
 type ToolInput = Record<string, unknown>;
 
 /**
+ * Stable MCP output schema for `ix_context`. Mirrors the top-level shape of
+ * the versioned `ix-context-bundle/1` bundle so agents get a structured
+ * contract; nested report objects (claims/decisions/conflicts/intents) keep
+ * their own internal shapes and are typed loosely here, with the bundle's
+ * versioned `schema` field as the source of truth.
+ */
+const contextBundleSchema = z.object({
+  schema: z.string(),
+  generatedAt: z.string(),
+  target: z.object({
+    id: z.string(),
+    name: z.string(),
+    kind: z.string(),
+    resolutionMode: z.string(),
+  }),
+  entities: z.array(
+    z.object({ id: z.string(), name: z.string(), kind: z.string(), path: z.string().optional(), stale: z.boolean() }),
+  ),
+  relationships: z.array(z.object({ src: z.string(), dst: z.string(), predicate: z.string() })),
+  claims: z.array(z.record(z.string(), z.unknown())),
+  decisions: z.array(z.record(z.string(), z.unknown())),
+  conflicts: z.array(z.record(z.string(), z.unknown())),
+  intents: z.array(z.record(z.string(), z.unknown())),
+  provenance: z.record(z.string(), z.unknown()),
+  freshness: z.object({ stale: z.boolean(), classification: z.string() }),
+  evidence: z.array(z.record(z.string(), z.unknown())),
+  budgets: z.record(z.string(), z.number()),
+  truncation: z.record(z.string(), z.number()),
+  metadata: z.record(z.string(), z.unknown()),
+});
+
+/**
  * One Ix invocation, with its options kept apart from its positional values.
  *
  * The split is what lets every positional go behind a `--` separator. Appending
@@ -296,6 +328,13 @@ export function createIxMcpServer(options: CreateServerOptions = {}): McpServer 
       max_entities: z.number().int().min(1).max(500).optional(),
       max_relationships: z.number().int().min(1).max(1000).optional(),
       max_evidence: z.number().int().min(1).max(200).optional(),
+      max_chars: z
+        .number()
+        .int()
+        .min(1000)
+        .max(1_000_000)
+        .optional()
+        .describe("exact serialized-character budget for the evidence list"),
     },
     async (input) => {
       const options: string[] = [];
@@ -304,8 +343,10 @@ export function createIxMcpServer(options: CreateServerOptions = {}): McpServer 
       if (typeof input.max_relationships === "number")
         options.push(`--max-relationships=${numberArg(input, "max_relationships")}`);
       if (typeof input.max_evidence === "number") options.push(`--max-evidence=${numberArg(input, "max_evidence")}`);
-      return runJson(runIx, "ix_context", ix("context", [stringArg(input, "target")], options));
+      if (typeof input.max_chars === "number") options.push(`--max-chars=${numberArg(input, "max_chars")}`);
+      return runJsonStructured(runIx, "ix_context", ix("context", [stringArg(input, "target")], options));
     },
+    contextBundleSchema,
   );
   registerTool(
     server,
@@ -392,9 +433,12 @@ function registerTool(
   description: string,
   inputSchema: z.ZodRawShape,
   handler: (input: ToolInput) => Promise<CallToolResult>,
+  outputSchema?: z.ZodType,
 ): void {
-  server.registerTool(name, { description, inputSchema }, async (input) =>
-    handler(input as ToolInput),
+  server.registerTool(
+    name,
+    { description, inputSchema, ...(outputSchema ? { outputSchema } : {}) },
+    async (input) => handler(input as ToolInput),
   );
 }
 
@@ -426,6 +470,39 @@ async function runJson(
   timeoutMs = DEFAULT_TIMEOUT_MS,
 ): Promise<CallToolResult> {
   return runCommand(runIx, tool, toArgv(argv, "json"), timeoutMs);
+}
+
+/**
+ * Run a command in JSON format and surface the parsed result as MCP
+ * `structuredContent` alongside the text payload. The context bundle carries
+ * its own versioned schema (`ix-context-bundle/1`), so the structured copy is
+ * stable across releases; when the output does not parse into a usable object
+ * we omit structured content and keep the text result authoritative rather
+ * than throwing.
+ */
+async function runJsonStructured(
+  runIx: IxRunner,
+  tool: string,
+  argv: IxArgv,
+): Promise<CallToolResult> {
+  const result = await runIx(toArgv(argv, "json"), DEFAULT_TIMEOUT_MS);
+  if (!result.ok) {
+    const detail = result.stderr.trim() || result.stdout.trim() || `${argv.command} failed without output`;
+    return textResult(JSON.stringify({ error: detail, tool }), true);
+  }
+  const text = result.stdout.trim() || "{}";
+  const parsed = parseJsonOutput(text);
+  // The CLI contract for `--format=json` is a parseable bundle; when stdout is
+  // not a usable object the tool genuinely failed, and returning an MCP error
+  // is more truthful than inventing a bundle (the output schema requires
+  // schema-valid structured content on every result).
+  if (!isRecord(parsed) || Object.keys(parsed).length === 0) {
+    return textResult(text || JSON.stringify({ error: `${argv.command} produced no parseable JSON`, tool }), true);
+  }
+  return {
+    content: [{ type: "text", text }],
+    structuredContent: parsed,
+  };
 }
 
 async function runCommand(

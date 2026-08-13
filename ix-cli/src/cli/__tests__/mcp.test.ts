@@ -96,6 +96,54 @@ describe("ix mcp", () => {
     ]);
   });
 
+  it("forwards ix_context max_chars to the CLI contract", async () => {
+    const calls: string[][] = [];
+    const client = await connect(async (args) => {
+      calls.push(args);
+      return { ok: true, stdout: "{}", stderr: "" };
+    });
+
+    await client.callTool({ name: "ix_context", arguments: { target: "Widget", max_evidence: 3, max_chars: 5000 } });
+
+    expect(calls).toEqual([["context", "--max-evidence=3", "--max-chars=5000", "--format=json", "--", "Widget"]]);
+  });
+
+  it("returns ix_context structuredContent with the parsed bundle", async () => {
+    const bundle = {
+      schema: "ix-context-bundle/1",
+      generatedAt: "2026-01-01T00:00:00Z",
+      target: { id: "e1", name: "Widget", kind: "class", resolutionMode: "exact" },
+      entities: [{ id: "e1", name: "Widget", kind: "class", stale: false }],
+      relationships: [],
+      claims: [],
+      decisions: [],
+      conflicts: [],
+      intents: [],
+      provenance: {},
+      freshness: { stale: false, classification: "current" },
+      evidence: [],
+      budgets: { maxEntities: 50, maxRelationships: 100, maxEvidence: 25, maxChars: 12000 },
+      truncation: { entitiesTruncated: 0, relationshipsTruncated: 0, evidenceTruncated: 0, charactersTruncated: 0 },
+      metadata: { rankingRule: "deterministic-tier" },
+    };
+    const client = await connect(async () => ({ ok: true, stdout: JSON.stringify(bundle), stderr: "" }));
+
+    const result = await client.callTool({ name: "ix_context", arguments: { target: "Widget" } });
+
+    expect(result.structuredContent).toEqual(bundle);
+    expect(result.content).toEqual([{ type: "text", text: JSON.stringify(bundle) }]);
+  });
+
+  it("marks an unparseable bundle output as an MCP error", async () => {
+    const client = await connect(async () => ({ ok: true, stdout: "not json at all", stderr: "" }));
+
+    const result = await client.callTool({ name: "ix_context", arguments: { target: "Widget" } });
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toBeUndefined();
+    expect(result.content).toEqual([{ type: "text", text: "not json at all" }]);
+  });
+
   it("omits unset context budgets rather than sending empty flags", async () => {
     const calls: string[][] = [];
     const client = await connect(async (args) => {

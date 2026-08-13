@@ -9,7 +9,7 @@ import type {
   ScoredClaim,
 } from "../../client/types.js";
 import type { EntityFacts } from "../explain/facts.js";
-import { buildBundle } from "../commands/context.js";
+import { buildBundle, sanitizeId } from "../commands/context.js";
 
 function makeFacts(overrides: Partial<EntityFacts> = {}): EntityFacts {
   return {
@@ -144,5 +144,72 @@ describe("ix context bundle", () => {
 
     const current = buildBundle({ ...input(), facts: makeFacts({ stale: false }) });
     expect(current.freshness).toEqual({ stale: false, classification: "current" });
+  });
+
+  it("orders claims, decisions, conflicts, and intents deterministically", () => {
+    const decisions: DecisionReport[] = [
+      { title: "zeta", rationale: "late", entityId: "entity-1", rev: 1 },
+      { title: "alpha", rationale: "second", entityId: "entity-1", rev: 1 },
+      { title: "alpha", rationale: "first", entityId: "entity-1", rev: 2 },
+    ];
+    const conflicts: ConflictReport[] = [
+      { id: "c-1", claimA: "zeta claim", claimB: "delta claim", reason: "r", recommendation: "rec" },
+      { id: "c-2", claimA: "alpha claim", claimB: "beta claim", reason: "r", recommendation: "rec" },
+    ];
+    const intents: IntentReport[] = [
+      { id: "i-2", statement: "zeta intent", status: "active", confidence: 0.5 },
+      { id: "i-1", statement: "alpha intent", status: "active", confidence: 0.5 },
+    ];
+    const claims = [makeClaim("zeta statement", 0.5), makeClaim("alpha one", 0.9), makeClaim("alpha two", 0.7)];
+    const shuffled = {
+      claims: [...claims].reverse(),
+      conflicts: [...conflicts].reverse(),
+      decisions: [...decisions].reverse(),
+      intents: [...intents].reverse(),
+    };
+
+    const first = buildBundle({ ...input(), context: makeContext(shuffled) });
+    const second = buildBundle({ ...input(), context: makeContext({ ...shuffled }) });
+
+    expect(first.claims.map((c) => c.statement)).toEqual(["alpha one", "alpha two", "zeta statement"]);
+    expect(first.decisions.map((d) => d.title)).toEqual(["alpha", "alpha", "zeta"]);
+    expect(first.conflicts.map((c) => c.claimA)).toEqual(["alpha claim", "zeta claim"]);
+    expect(first.intents.map((i) => i.statement)).toEqual(["alpha intent", "zeta intent"]);
+    // Same data in any input order produces the same bundle sections.
+    expect(second.claims).toEqual(first.claims);
+    expect(second.decisions).toEqual(first.decisions);
+    expect(second.conflicts).toEqual(first.conflicts);
+    expect(second.intents).toEqual(first.intents);
+  });
+
+  it("bounds evidence by the exact serialized representation, not an estimate", () => {
+    const claims = Array.from({ length: 60 }, (_, i) => makeClaim(`statement number ${i} with some padding text`, 0.5));
+    const budgets = { maxEntities: 50, maxRelationships: 100, maxEvidence: 25, maxChars: 500 };
+
+    const bundle = buildBundle({ ...input(), context: makeContext({ claims }), budgets });
+
+    // maxChars bounds the sum of the serialized JSON sizes of the kept items.
+    const keptSerialized = bundle.evidence.reduce((sum, item) => sum + JSON.stringify(item).length, 0);
+    expect(keptSerialized).toBeLessThanOrEqual(500);
+    expect(bundle.evidence.length).toBeLessThan(25); // the char budget bit before the count budget
+    expect(bundle.truncation.evidenceTruncated).toBeGreaterThan(0);
+    expect(bundle.truncation.charactersTruncated).toBeGreaterThan(0);
+    // Identical inputs produce an identical budgeted list.
+    expect(bundle.evidence).toEqual(
+      buildBundle({ ...input(), context: makeContext({ claims }), budgets }).evidence,
+    );
+  });
+
+  it("encodes investigation ids injectively so distinct ids never collide", () => {
+    expect(sanitizeId("widget-check")).toBe("widget-check");
+    expect(sanitizeId("a/b")).not.toBe(sanitizeId("a?b"));
+    expect(sanitizeId("a/b")).not.toBe(sanitizeId("a:b"));
+    expect(sanitizeId("a?b")).not.toBe(sanitizeId("a~2Fb"));
+    expect(sanitizeId("~")).toBe("~7E");
+    expect(sanitizeId("../../etc/passwd")).not.toContain("/");
+    expect(sanitizeId("C:\\Windows")).not.toContain("\\");
+    expect(sanitizeId("")).toBe("unnamed");
+    const names = ["a/b", "a?b", "a:b", "a~2Fb", "C:\\Windows", "../..", "~"].map(sanitizeId);
+    expect(new Set(names).size).toBe(names.length);
   });
 });
