@@ -30,6 +30,7 @@ interface ContextOptions {
   maxRelationships?: string;
   maxEvidence?: string;
   maxChars?: string;
+  out?: string;
   format: string;
 }
 
@@ -115,6 +116,7 @@ export function registerContextCommand(program: Command): void {
     .option("--max-evidence <n>", "Maximum evidence items in the bundle", "25")
     .option("--max-chars <n>", "Maximum characters of evidence output", "12000")
     .option("--format <fmt>", "Output format (text|json|llm)", "text")
+    .option("--out <path>", "Write the JSON bundle to this file instead of stdout")
     .addHelpText(
       "after",
       "\nExamples:\n  ix context IngestionService\n  ix context src/main.ts --format json\n  ix context Widget --max-entities 20 --max-evidence 10",
@@ -154,6 +156,16 @@ export function registerContextCommand(program: Command): void {
         budgets: { maxEntities, maxRelationships, maxEvidence, maxChars },
       });
 
+      if (opts.out && opts.format !== "json") {
+        renderWarning("--out writes JSON; ignoring --format and forcing json.");
+      }
+      const out = opts.out;
+      if (out) {
+        const fs = await import("node:fs");
+        fs.writeFileSync(out, JSON.stringify(bundle, null, 2) + "\n");
+        renderNote(`Wrote ${bundle.entities.length} entities, ${bundle.relationships.length} relationships, ${bundle.evidence.length} evidence items to ${out}`);
+        return;
+      }
       renderBundle(bundle, opts.format);
     });
 }

@@ -79,6 +79,35 @@ describe("ix mcp", () => {
     expect(result.content).toEqual([{ type: "text", text: "match name=Widget" }]);
   });
 
+  it("forwards ix_context target and bounded budgets as the CLI contract", async () => {
+    const calls: string[][] = [];
+    const client = await connect(async (args) => {
+      calls.push(args);
+      return { ok: true, stdout: JSON.stringify({ schema: "ix-context-bundle/1" }), stderr: "" };
+    });
+
+    await client.callTool({
+      name: "ix_context",
+      arguments: { target: "Widget", max_entities: 20, max_evidence: 5 },
+    });
+
+    expect(calls).toEqual([
+      ["context", "--max-entities=20", "--max-evidence=5", "--format=json", "--", "Widget"],
+    ]);
+  });
+
+  it("omits unset context budgets rather than sending empty flags", async () => {
+    const calls: string[][] = [];
+    const client = await connect(async (args) => {
+      calls.push(args);
+      return { ok: true, stdout: "{}", stderr: "" };
+    });
+
+    await client.callTool({ name: "ix_context", arguments: { target: "src/main.ts" } });
+
+    expect(calls).toEqual([["context", "--format=json", "--", "src/main.ts"]]);
+  });
+
   it("marks Ix command failures as MCP errors", async () => {
     const client = await connect(async () => ({
       ok: false,

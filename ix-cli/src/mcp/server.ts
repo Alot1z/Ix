@@ -45,6 +45,7 @@ export const IX_MCP_OSS_TOOL_NAMES = [
   "ix_stats",
   "ix_subsystems",
   "ix_history",
+  "ix_context",
   "ix_ingest",
 ] as const;
 
@@ -284,6 +285,27 @@ export function createIxMcpServer(options: CreateServerOptions = {}): McpServer 
     "Show provenance and patch history for a file or symbol",
     { target: z.string().min(1) },
     async (input) => runFormatted(runIx, "ix_history", ix("history", [stringArg(input, "target")])),
+  );
+  registerTool(
+    server,
+    "ix_context",
+    "Build a bounded, deterministic context bundle for a symbol, file, or entity",
+    {
+      target: z.string().min(1),
+      as_of_rev: z.number().int().nonnegative().optional().describe("graph revision for historical context"),
+      max_entities: z.number().int().min(1).max(500).optional(),
+      max_relationships: z.number().int().min(1).max(1000).optional(),
+      max_evidence: z.number().int().min(1).max(200).optional(),
+    },
+    async (input) => {
+      const options: string[] = [];
+      if (typeof input.as_of_rev === "number") options.push(`--as-of-rev=${numberArg(input, "as_of_rev")}`);
+      if (typeof input.max_entities === "number") options.push(`--max-entities=${numberArg(input, "max_entities")}`);
+      if (typeof input.max_relationships === "number")
+        options.push(`--max-relationships=${numberArg(input, "max_relationships")}`);
+      if (typeof input.max_evidence === "number") options.push(`--max-evidence=${numberArg(input, "max_evidence")}`);
+      return runJson(runIx, "ix_context", ix("context", [stringArg(input, "target")], options));
+    },
   );
   registerTool(
     server,
