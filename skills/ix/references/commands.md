@@ -12,6 +12,7 @@ These aggregate multiple graph operations into single bounded responses.
 | Blast radius / impact | `ix impact` | `ix impact UserService --format llm` |
 | Hotspot discovery | `ix rank` | `ix rank --by dependents --kind class --top 10 --format llm` |
 | One-shot summary | `ix overview` | `ix overview IngestionService --format llm` |
+| Deterministic context bundle | `ix context` | `ix context IngestionService --format llm` |
 | Scoped entity listing | `ix inventory` | `ix inventory --kind function --path auth.py --format llm` |
 
 ## Finding & Understanding Code
