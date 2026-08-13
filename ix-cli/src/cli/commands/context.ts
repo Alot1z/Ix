@@ -1,7 +1,9 @@
 import type { Command } from "commander";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+
+import { contextBundleSchema } from "../context-bundle-schema.js";
 
 import { IxClient } from "../../client/api.js";
 import type {
@@ -200,35 +202,39 @@ export function registerContextCommand(program: Command): void {
       const out = opts.out;
       if (out) {
         const fs = await import("node:fs");
-        // The user controls --out: the resolved path is the explicit destination
-        // for the requested bundle. The write itself is attempted directly and
-        // the EISDIR/EPERM outcome is handled after the fact, so there is no
-        // check-then-use gap (CodeQL CWE-367). The bundle content is
-        // network-derived by design — writing it to a user-chosen path is the
-        // feature, and the destination is documented as caller-owned.
+        // Validate the network-derived bundle against the versioned contract
+        // before persisting it: only a bundle matching ix-context-bundle/1 is
+        // written, so a malformed or unexpected backend payload can never land
+        // in a caller-owned file (CodeQL js/network-data-written-to-file).
+        const parsed = contextBundleSchema.safeParse(bundle);
+        if (!parsed.success) {
+          renderWarning(`--out "${out}" refused: the bundle does not match the ${BUNDLE_SCHEMA} schema (${parsed.error.issues.length} issue(s)).`);
+          return;
+        }
+        // Atomic write: serialize to a private temp file in the SAME directory,
+        // then rename over the target, so the write is never a check-then-write
+        // race and a partial file is never visible (CodeQL js/file-system-race;
+        // same pattern as the config writer in src/cli/config.ts). Renaming
+        // onto an existing directory fails, which surfaces as the refusal below.
         const targetPath = resolve(out);
+        const tmpPath = join(dirname(targetPath), `.${process.pid}.${Date.now().toString(36)}.tmp`);
         try {
-          // codeql[js/http-to-file-access] -- network-derived bundle written to
-          // the explicit user-chosen --out path; the destination is caller-owned
-          // and the write is the feature, not an injection sink.
-          fs.writeFileSync(targetPath, JSON.stringify(bundle, null, 2) + "\n");
+          fs.writeFileSync(tmpPath, JSON.stringify(parsed.data, null, 2) + "\n", "utf8");
+          fs.renameSync(tmpPath, targetPath);
         } catch (error) {
+          try { fs.rmSync(tmpPath, { force: true }); } catch { /* best effort */ }
           const err = error as NodeJS.ErrnoException;
-          let isDirectory = err.code === "EISDIR";
-          if (err.code === "EPERM") {
+          if (err.code === "EISDIR" || err.code === "EPERM") {
             try {
-              isDirectory = fs.statSync(targetPath).isDirectory();
-            } catch {
-              isDirectory = false;
-            }
-          }
-          if (isDirectory) {
-            renderWarning(`--out "${out}" is a directory; refusing to write the bundle there.`);
-            return;
+              if (fs.statSync(targetPath).isDirectory()) {
+                renderWarning(`--out "${out}" is a directory; refusing to write the bundle there.`);
+                return;
+              }
+            } catch { /* target may not exist; fall through to rethrow */ }
           }
           throw error;
         }
-        renderNote(`Wrote ${bundle.entities.length} entities, ${bundle.relationships.length} relationships, ${bundle.evidence.length} evidence items to ${out}`);
+        renderNote(`Wrote ${parsed.data.entities.length} entities, ${parsed.data.relationships.length} relationships, ${parsed.data.evidence.length} evidence items to ${out}`);
         return;
       }
       renderBundle(bundle, opts.format);
@@ -289,17 +295,32 @@ export function sanitizeId(id: string): string {
 export function saveInvestigation(id: string, bundle: ContextBundle): void {
   const dir = investigationDir();
   mkdirSync(dir, { recursive: true });
+  // Refuse to persist a bundle that does not match the versioned contract:
+  // network-derived investigation state is validated before it reaches disk
+  // (CodeQL js/network-data-written-to-file).
+  const parsed = contextBundleSchema.safeParse(bundle);
+  if (!parsed.success) {
+    renderWarning(`Refusing to save investigation "${id}": the bundle does not match the ${BUNDLE_SCHEMA} schema (${parsed.error.issues.length} issue(s)).`);
+    return;
+  }
   const state = {
     schema: "ix-investigation/1",
     id: sanitizeId(id),
     savedAt: new Date().toISOString(),
-    bundle,
+    bundle: parsed.data,
   };
-  // codeql[js/http-to-file-access] -- the saved bundle is network-derived by
-  // design; it is written only inside the investigation directory under an
-  // injective id encoding, so the destination is a constrained local state
-  // file (trusted-destination policy), never an arbitrary sink.
-  writeFileSync(investigationPath(id), JSON.stringify(state, null, 2) + "\n", "utf8");
+  // Atomic write (temp + rename in the same directory), matching the config
+  // writer, so a saved investigation is never partially written (CodeQL
+  // js/file-system-race).
+  const path = investigationPath(id);
+  const tmpPath = join(dirname(path), `.${process.pid}.${Date.now().toString(36)}.tmp`);
+  writeFileSync(tmpPath, JSON.stringify(state, null, 2) + "\n", "utf8");
+  try {
+    renameSync(tmpPath, path);
+  } catch (err) {
+    try { rmSync(tmpPath, { force: true }); } catch { /* best effort */ }
+    throw err;
+  }
 }
 
 interface SavedInvestigation {

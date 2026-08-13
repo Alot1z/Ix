@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { contextBundleSchema } from "../cli/context-bundle-schema.js";
 
 import {
   createProtocolStdout,
@@ -72,39 +73,12 @@ interface CreateServerOptions {
 type ToolInput = Record<string, unknown>;
 
 /**
- * Stable MCP output schema for `ix_context`. Mirrors the top-level shape of
- * the versioned `ix-context-bundle/1` bundle so agents get a structured
- * contract; nested report objects (claims/decisions/conflicts/intents) keep
- * their own internal shapes and are typed loosely here, with the bundle's
- * versioned `schema` field as the source of truth.
+ * `ix_context` output schema — shared contract from the CLI bundle module so
+ * the MCP surface and persisted investigation state validate the same shape.
  */
-const contextBundleSchema = z.object({
-  schema: z.string(),
-  generatedAt: z.string(),
-  target: z.object({
-    id: z.string(),
-    name: z.string(),
-    kind: z.string(),
-    resolutionMode: z.string(),
-  }),
-  entities: z.array(
-    z.object({ id: z.string(), name: z.string(), kind: z.string(), path: z.string().optional(), stale: z.boolean() }),
-  ),
-  relationships: z.array(z.object({ src: z.string(), dst: z.string(), predicate: z.string() })),
-  claims: z.array(z.record(z.string(), z.unknown())),
-  decisions: z.array(z.record(z.string(), z.unknown())),
-  conflicts: z.array(z.record(z.string(), z.unknown())),
-  intents: z.array(z.record(z.string(), z.unknown())),
-  provenance: z.record(z.string(), z.unknown()),
-  freshness: z.object({ stale: z.boolean(), classification: z.string() }),
-  evidence: z.array(z.record(z.string(), z.unknown())),
-  budgets: z.record(z.string(), z.number()),
-  truncation: z.record(z.string(), z.number()),
-  metadata: z.record(z.string(), z.unknown()),
-});
 
 /**
- * One Ix invocation, with its options kept apart from its positional values.
+ * One Ix invocationation, with its options kept apart from its positional values.
  *
  * The split is what lets every positional go behind a `--` separator. Appending
  * them as bare tokens let commander read any value beginning with `-` as a

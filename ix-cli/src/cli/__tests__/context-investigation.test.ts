@@ -132,6 +132,13 @@ describe("ix context investigation state", () => {
     expect(loadInvestigation("broken")).toBeUndefined();
   });
 
+  it("refuses to save a bundle that does not match the versioned contract", () => {
+    const malformed = { ...bundleWith([]), entities: "not-an-array" } as unknown as ReturnType<typeof buildBundle>;
+    saveInvestigation("bad-shape", malformed);
+    expect(loadInvestigation("bad-shape")).toBeUndefined();
+    expect(existsSync(join(home, ".ix", "investigations", "bad-shape.json"))).toBe(false);
+  });
+
   it("computes a deterministic delta between saved and fresh state", () => {
     const saved = bundleWith([makeClaim("renders to DOM", 0.9)]);
     saveInvestigation("widget-check", saved);
