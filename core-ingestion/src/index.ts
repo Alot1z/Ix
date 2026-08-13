@@ -172,6 +172,12 @@ export interface ParsedRelationship {
   // that happens to flatten to the same stem ("core"). Absent on non-import rels
   // and on dotted/symbol imports where dstName is already the full identifier.
   importRaw?: string;
+  /**
+   * JS/TS only: whether this identifier use is lexically bound to its matching
+   * import. False means a parameter or local declaration shadows that import.
+   * Undefined preserves compatibility with hand-built/older parse results.
+   */
+  importBinding?: boolean;
 }
 
 /**
@@ -522,6 +528,130 @@ function extractJsImportBindings(stmtNode: any, rawSpec: string): ImportBinding[
   return out;
 }
 
+const JS_TS_FUNCTION_NODES = new Set([
+  'function_declaration',
+  'generator_function_declaration',
+  'function_expression',
+  'generator_function',
+  'arrow_function',
+  'method_definition',
+]);
+
+function jsTsBindingPatternContains(node: any, name: string): boolean {
+  if (!node) return false;
+  if ((node.type === 'identifier' || node.type === 'shorthand_property_identifier_pattern') && node.text === name) {
+    return true;
+  }
+  if (node.type === 'required_parameter' || node.type === 'optional_parameter') {
+    return jsTsBindingPatternContains(node.childForFieldName?.('pattern'), name);
+  }
+  if (node.type === 'assignment_pattern') {
+    return jsTsBindingPatternContains(node.childForFieldName?.('left'), name);
+  }
+  if (node.type === 'object_assignment_pattern') {
+    return jsTsBindingPatternContains(node.childForFieldName?.('left'), name);
+  }
+  if (node.type === 'pair_pattern') {
+    return jsTsBindingPatternContains(node.childForFieldName?.('value'), name);
+  }
+  if (node.type === 'rest_pattern') {
+    return jsTsBindingPatternContains(node.childForFieldName?.('argument') ?? node.namedChild(0), name);
+  }
+  for (let i = 0; i < node.namedChildCount; i++) {
+    if (jsTsBindingPatternContains(node.namedChild(i), name)) return true;
+  }
+  return false;
+}
+
+function jsTsTypeParametersContain(node: any, name: string): boolean {
+  if (!node) return false;
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const parameter = node.namedChild(i);
+    if (parameter.type !== 'type_parameter') continue;
+    const nameNode = parameter.childForFieldName?.('name') ?? parameter.namedChild(0);
+    if (nameNode?.text === name) return true;
+  }
+  return false;
+}
+
+function jsTsDeclarationBinds(node: any, name: string, namespace: 'value' | 'type'): boolean {
+  if (!node) return false;
+  if (node.type === 'export_statement') {
+    for (let i = 0; i < node.namedChildCount; i++) {
+      if (jsTsDeclarationBinds(node.namedChild(i), name, namespace)) return true;
+    }
+    return false;
+  }
+  if (namespace === 'value' && (node.type === 'lexical_declaration' || node.type === 'variable_declaration')) {
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const declarator = node.namedChild(i);
+      if (declarator.type !== 'variable_declarator') continue;
+      if (jsTsBindingPatternContains(declarator.childForFieldName?.('name') ?? declarator.namedChild(0), name)) return true;
+    }
+    return false;
+  }
+  const bindsValue = node.type === 'function_declaration' || node.type === 'generator_function_declaration' ||
+    node.type === 'class_declaration' || node.type === 'enum_declaration';
+  const bindsType = node.type === 'class_declaration' || node.type === 'type_alias_declaration' ||
+    node.type === 'interface_declaration' || node.type === 'enum_declaration';
+  if ((namespace === 'value' && bindsValue) || (namespace === 'type' && bindsType)) {
+    return node.childForFieldName?.('name')?.text === name;
+  }
+  return false;
+}
+
+function jsTsScopeDirectlyBinds(scope: any, name: string, namespace: 'value' | 'type'): boolean {
+  for (let i = 0; i < scope.namedChildCount; i++) {
+    if (jsTsDeclarationBinds(scope.namedChild(i), name, namespace)) return true;
+  }
+  return false;
+}
+
+function jsTsFunctionHasVarBinding(node: any, name: string, isRoot = true): boolean {
+  if (!node) return false;
+  if (!isRoot && JS_TS_FUNCTION_NODES.has(node.type)) return false;
+  if (node.type === 'variable_declaration' && jsTsDeclarationBinds(node, name, 'value')) return true;
+  for (let i = 0; i < node.namedChildCount; i++) {
+    if (jsTsFunctionHasVarBinding(node.namedChild(i), name, false)) return true;
+  }
+  return false;
+}
+
+/** True when a declaration shadows an imported JS/TS name at this use. */
+function isJsTsImportShadowed(identifierNode: any, name: string, namespace: 'value' | 'type'): boolean {
+  let child = identifierNode;
+  let scope = identifierNode?.parent;
+  while (scope) {
+    if (scope.type === 'statement_block' || scope.type === 'program') {
+      if (jsTsScopeDirectlyBinds(scope, name, namespace)) return true;
+    }
+    if (namespace === 'value' && scope.type === 'catch_clause') {
+      if (jsTsBindingPatternContains(scope.childForFieldName?.('parameter'), name)) return true;
+    }
+    if (namespace === 'value' && (scope.type === 'for_statement' || scope.type === 'for_in_statement')) {
+      const initializer = scope.childForFieldName?.('initializer') ?? scope.childForFieldName?.('left');
+      if (jsTsDeclarationBinds(initializer, name, 'value')) return true;
+    }
+    if (JS_TS_FUNCTION_NODES.has(scope.type)) {
+      if (namespace === 'value') {
+        if (scope.childForFieldName?.('name')?.text === name) return true;
+        if (jsTsBindingPatternContains(scope.childForFieldName?.('parameters'), name)) return true;
+        const body = scope.childForFieldName?.('body');
+        if (body && jsTsFunctionHasVarBinding(body, name)) return true;
+      } else if (jsTsTypeParametersContain(scope.childForFieldName?.('type_parameters'), name)) {
+        return true;
+      }
+    }
+    if (scope.type === 'class_declaration' || scope.type === 'class') {
+      if (scope.childForFieldName?.('name')?.text === name) return true;
+      if (namespace === 'type' && jsTsTypeParametersContain(scope.childForFieldName?.('type_parameters'), name)) return true;
+    }
+    child = scope;
+    scope = child.parent;
+  }
+  return false;
+}
+
 /**
  * Walk a JS/TS tree for provider-side public export names that differ from the
  * local entity name: `export { impl as format }` (no source) → {impl, format};
@@ -542,11 +672,13 @@ function extractJsExportPublicNames(rootNode: any): ExportPublicName[] {
       }
       let clause: any = null;
       let decl: any = null;
+      let defaultIdentifier: any = null;
       for (let i = 0; i < node.namedChildCount; i++) {
         const c = node.namedChild(i);
         if (c.type === 'export_clause') clause = c;
         else if (c.type === 'function_declaration' || c.type === 'class_declaration'
           || c.type === 'lexical_declaration' || c.type === 'generator_function_declaration') decl = c;
+        else if (c.type === 'identifier') defaultIdentifier = c;
       }
       // Local re-export `export { a as b }` (NOT `... from './x'`): a is public as b.
       if (clause && !hasSource) {
@@ -564,9 +696,12 @@ function extractJsExportPublicNames(rootNode: any): ExportPublicName[] {
           }
         }
       }
-      // `export default function debug(){}` / `export default class X {}` → public "default".
-      if (isDefault && decl) {
-        const nameNode = (decl.childForFieldName && decl.childForFieldName('name')) || decl.namedChild(0);
+      // Named default declarations and `export default localName` advertise the
+      // local entity under the public name "default".
+      if (isDefault && (decl || defaultIdentifier)) {
+        const nameNode = decl
+          ? (decl.childForFieldName && decl.childForFieldName('name')) || decl.namedChild(0)
+          : defaultIdentifier;
         const nm = nameNode?.text;
         if (nm) {
           const k = `${nm}\x00default`;
@@ -1953,6 +2088,32 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
     // alias resolution. Additive: never alters emitted relationships.
     const isJsTs = language === SupportedLanguages.JavaScript || language === SupportedLanguages.TypeScript;
     const importBindings: ImportBinding[] = [];
+    const jsTsImportedLocalNames = new Set<string>();
+    const jsTsImportUseHasUnshadowed = new Map<string, boolean>();
+    if (isJsTs) {
+      for (const match of pass2Matches) {
+        const importSource = match.captures.find((c: any) => c.name === 'import.source');
+        const stmtNode = match.captures.find((c: any) => c.name === 'import')?.node;
+        if (!importSource || !stmtNode) continue;
+        const rawSpec = unwrapImportSpecifier(importSource.node.text);
+        for (const binding of extractJsImportBindings(stmtNode, rawSpec)) {
+          jsTsImportedLocalNames.add(binding.local);
+        }
+      }
+    }
+    const recordJsTsImportUse = (
+      predicate: string,
+      srcName: string,
+      dstName: string,
+      identifierNode: any,
+      localName: string,
+      namespace: 'value' | 'type' = 'value',
+    ): void => {
+      if (!isJsTs || !jsTsImportedLocalNames.has(localName)) return;
+      const key = `${predicate}\x00${srcName}\x00${dstName}`;
+      const unshadowed = !isJsTsImportShadowed(identifierNode, localName, namespace);
+      jsTsImportUseHasUnshadowed.set(key, (jsTsImportUseHasUnshadowed.get(key) ?? false) || unshadowed);
+    };
 
     // Detect the Go package name once (one package_clause per file). Used to
     // package-prefix Go entity qualifiedNames + bare-call dstNames so
@@ -2071,6 +2232,13 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
         c.name === 'heritage.extends' || c.name === 'heritage.trait'
       );
       if (heritageClass && heritageExtends) {
+        recordJsTsImportUse(
+          'EXTENDS',
+          heritageClass.node.text,
+          heritageExtends.node.text,
+          heritageExtends.node,
+          heritageExtends.node.text,
+        );
         relationships.push({
           srcName: heritageClass.node.text,
           dstName: heritageExtends.node.text,
@@ -2084,6 +2252,14 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
         c.name === 'heritage.implements'
       );
       if (heritageClass && heritageImpl) {
+        recordJsTsImportUse(
+          'EXTENDS',
+          heritageClass.node.text,
+          heritageImpl.node.text,
+          heritageImpl.node,
+          heritageImpl.node.text,
+          'type',
+        );
         relationships.push({
           srcName: heritageClass.node.text,
           dstName: heritageImpl.node.text,
@@ -2482,6 +2658,10 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
           return `${qualifier}.${callee}`;
         })();
 
+        if (!qualifierCapture && !namespaceCapture && effectiveCallee === callee) {
+          recordJsTsImportUse('CALLS', caller, effectiveCallee, callName.node, callee);
+        }
+
         if (!seen.has(effectiveCallee)) {
           seen.add(effectiveCallee);
           relationships.push({ srcName: caller, dstName: effectiveCallee, predicate: 'CALLS' });
@@ -2502,6 +2682,8 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
           ?? findEnclosing(classRanges, refLine, typeName)
           ?? fileName;
 
+        recordJsTsImportUse('REFERENCES', src, typeName, refType.node, typeName, 'type');
+
         if (!seenRefs.has(src)) seenRefs.set(src, new Set());
         const seen = seenRefs.get(src)!;
         if (!seen.has(typeName)) {
@@ -2509,6 +2691,25 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
           relationships.push({ srcName: src, dstName: typeName, predicate: 'REFERENCES' });
         }
         continue;
+      }
+    }
+
+    // A single relationship can represent multiple same-name uses in one scope.
+    // Mark it local-only only when every captured use is shadowed; if any use still
+    // sees the import, the cross-file edge remains meaningful.
+    for (const rel of relationships) {
+      const key = `${rel.predicate}\x00${rel.srcName}\x00${rel.dstName}`;
+      const hasUnshadowedUse = jsTsImportUseHasUnshadowed.get(key);
+      if (hasUnshadowedUse === false) {
+        rel.importBinding = false;
+      } else if (
+        hasUnshadowedUse === true &&
+        entities.some(entity => entity.kind !== 'file' && entity.kind !== 'module' && entity.name === rel.dstName)
+      ) {
+        // Usually an unshadowed import needs no annotation. Preserve an explicit
+        // true only when a same-file definition elsewhere would otherwise make
+        // the resolver apply its backward-compatible file-wide shadow fallback.
+        rel.importBinding = true;
       }
     }
 
@@ -2637,6 +2838,7 @@ function bestQKey(
 export interface GlobalResolutionIndex {
   fileHasSymbol:    Map<string, Set<string>>;
   fileQKeys:        Map<string, Map<string, string[]>>;
+  filePublicNames?: Map<string, Map<string, string>>;
   symbolToFiles:    Map<string, string[]>;
   stemToFiles:      Map<string, string[]>;
   dirToIndexFiles:  Map<string, string[]>;
@@ -2718,6 +2920,7 @@ export function buildGlobalResolutionIndex(
 
   // Entity maps (built from sources if provided, via fast regex scan)
   const fileQKeys = new Map<string, Map<string, string[]>>();
+  const filePublicNames = new Map<string, Map<string, string>>();
   const fileHasSymbol = new Map<string, Set<string>>();
   const symbolToFiles = new Map<string, string[]>();
 
@@ -2786,6 +2989,9 @@ export function buildGlobalResolutionIndex(
       if (qkMap.size > 0) {
         fileQKeys.set(fp, qkMap);
         fileHasSymbol.set(fp, new Set(qkMap.keys()));
+      }
+      if (parsed.exportPublicNames) {
+        filePublicNames.set(fp, new Map(parsed.exportPublicNames.map(name => [name.public, name.local])));
       }
     }
 
@@ -2865,6 +3071,7 @@ export function buildGlobalResolutionIndex(
   return {
     fileHasSymbol,
     fileQKeys,
+    filePublicNames,
     symbolToFiles,
     stemToFiles,
     dirToIndexFiles,
@@ -2969,14 +3176,18 @@ export function resolveEdges(
   // Renamed-import call resolution (Z): a call to a renamed local binding (`import
   // { format as fmt }; fmt()`) should resolve as the provider's public symbol
   // (`format`), so in-repo AND co-ingest resolution link it to the real definition.
-  // Map per file: local binding name -> imported public symbol, EXCLUDING default
-  // imports (imported == "default" is not a by-name symbol in the provider; those are
-  // handled in the cross-repo stitch path) and no-op named imports (local == imported).
+  // Map per file: local binding name -> imported public symbol, excluding default
+  // and no-op named imports from the by-name rewrite. Provider public-name
+  // resolution below handles those bindings against the imported file itself.
   const callBindings = new Map<string, Map<string, string>>();
+  const importBindingsByLocal = new Map<string, Map<string, ImportBinding>>();
   const relativeCallBindings = new Map<string, Set<string>>();
   for (const r of results) {
     if (!r.importBindings) continue;
     for (const b of r.importBindings) {
+      let imports = importBindingsByLocal.get(r.filePath);
+      if (!imports) { imports = new Map(); importBindingsByLocal.set(r.filePath, imports); }
+      if (!imports.has(b.local)) imports.set(b.local, b);
       if (
         b.pkg.startsWith('./') || b.pkg.startsWith('../') ||
         (r.language === SupportedLanguages.Python && b.pkg.startsWith('.'))
@@ -3109,6 +3320,17 @@ export function resolveEdges(
       qkMap.set(e.name, list);
     }
     fileQKeys.set(r.filePath, qkMap);  // overrides global entry if present
+  }
+
+  const filePublicNames = globalIndex
+    ? new Map<string, Map<string, string>>(globalIndex.filePublicNames ?? [])
+    : new Map<string, Map<string, string>>();
+  for (const r of results) {
+    if (r.exportPublicNames) {
+      filePublicNames.set(r.filePath, new Map(r.exportPublicNames.map(name => [name.public, name.local])));
+    } else {
+      filePublicNames.delete(r.filePath);
+    }
   }
 
   // fileHasSymbol: rebuilt from merged fileQKeys so per-batch overrides take effect.
@@ -3615,12 +3837,21 @@ export function resolveEdges(
     return qks.includes(`${qualifierPart}.${memberPart}`);
   }
 
+  function sameScopeDefines(result: FileParseResult, srcName: string, dstName: string): boolean {
+    const sourceEntities = result.entities.filter(e => e.name === srcName || qualifiedKey(e) === srcName);
+    if (sourceEntities.length === 0) return false;
+    return result.entities.some(definition =>
+      definition.name === dstName && sourceEntities.some(source =>
+        definition.lineStart >= source.lineStart && definition.lineEnd <= source.lineEnd,
+      ),
+    );
+  }
+
   const resolved: ResolvedEdge[] = [];
 
   for (const result of results) {
     const srcFilePath = result.filePath;
     const srcLanguage = result.language;
-    const srcSymbols = fileHasSymbol.get(srcFilePath)!;
     const pythonHasRelativeModuleImport = srcLanguage === SupportedLanguages.Python &&
       result.relationships.some(rel => rel.predicate === 'IMPORTS' && rel.importRaw?.startsWith('.'));
 
@@ -3734,6 +3965,51 @@ export function resolveEdges(
       // back to the source call by name). No-op unless this is a renamed-import call.
       const dstName = (rel.predicate === 'CALLS' ? callBindings.get(srcFilePath)?.get(rel.dstName) : undefined) ?? rel.dstName;
       const srcName = rel.srcName;
+      const binding = rel.importBinding === false
+        ? undefined
+        : importBindingsByLocal.get(srcFilePath)?.get(origDstName);
+
+      // Tier 1: same-file — already correct in buildPatch, skip here. Check the
+      // call-site name before any import binding rewrite so a local shadow wins.
+      // Without an import binding, preserve the existing file-wide preference.
+      const hasSameFileDefinition = fileHasSymbol.get(srcFilePath)?.has(origDstName) === true;
+      if (
+        hasSameFileDefinition &&
+        (!binding || (rel.importBinding !== true && sameScopeDefines(result, srcName, origDstName)))
+      ) continue;
+      if (rel.importBinding === false) continue;
+
+      if (rel.predicate === 'CALLS' || rel.predicate === 'EXTENDS' || rel.predicate === 'REFERENCES') {
+        if (binding) {
+          const providerFiles = [...new Set(resolveImportTargets(
+            srcFilePath,
+            srcLanguage,
+            binding.pkg,
+            binding.pkg,
+          ))];
+          const publicMatches: Array<{ fp: string; local: string }> = [];
+          for (const fp of providerFiles.length === 1 ? providerFiles : []) {
+            const local = filePublicNames.get(fp)?.get(binding.imported);
+            if (local && fileHasSymbol.get(fp)?.has(local)) publicMatches.push({ fp, local });
+          }
+          if (publicMatches.length === 1) {
+            const { fp, local } = publicMatches[0];
+            const dstQualifiedKey = bestQKey(fileQKeys, fp, local);
+            if (dstQualifiedKey !== null) {
+              resolved.push({
+                srcFilePath,
+                srcName,
+                dstFilePath: fp,
+                dstName: origDstName,
+                dstQualifiedKey,
+                predicate: rel.predicate,
+                confidence: 0.9,
+              });
+              continue;
+            }
+          }
+        }
+      }
 
       // Tier 1b: qualifier-assisted (confidence 0.9 / 0.7)
       // For dotted names like "NodeKind.Decision" (emitted by field_expression queries):
@@ -3802,9 +4078,6 @@ export function resolveEdges(
           continue; // qualified name exhausted — don't try bare-name tiers
         }
       }
-
-      // Tier 1: same-file — already correct in buildPatch, skip here
-      if (srcSymbols.has(dstName)) continue;
 
       // Tier 2: import-scoped (confidence 0.9)
       const importMatches: string[] = [];
