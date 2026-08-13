@@ -122,6 +122,32 @@ const TOOL_ANNOTATIONS: Record<(typeof IX_MCP_TOOL_NAMES)[number], ToolAnnotatio
   ix_decide: WRITE,
 };
 
+/**
+ * The output schema for tools that return a stable JSON object whose field
+ * shape is backend- and version-defined.
+ *
+ * `z.object({}).passthrough()` accepts any object without promising specific
+ * fields, so a backend addition or rename cannot turn a formatting surprise
+ * into a failed tool call. It is deliberately not `z.record(...)`: the MCP SDK
+ * only recognizes object schemas as output schemas, and a record schema is
+ * silently dropped from tools/list.
+ */
+const JSON_OBJECT_SCHEMA = z.object({}).passthrough();
+
+/**
+ * Tools whose `--format=json` output is a stable object, exposed as MCP
+ * structured content.
+ *
+ * The Pro tools are omitted because their command implementations live in the
+ * separate `@ix/pro` package, so their output shape cannot be verified from
+ * this repository.
+ */
+const TOOL_OUTPUT_SCHEMA: Partial<Record<(typeof IX_MCP_TOOL_NAMES)[number], z.ZodTypeAny>> = {
+  ix_map: JSON_OBJECT_SCHEMA,
+  ix_ingest: JSON_OBJECT_SCHEMA,
+  ix_smells: JSON_OBJECT_SCHEMA,
+};
+
 interface CreateServerOptions {
   version?: string;
   runIx?: IxRunner;
@@ -434,7 +460,12 @@ function registerTool(
 ): void {
   server.registerTool(
     name,
-    { description, inputSchema, annotations: TOOL_ANNOTATIONS[name as keyof typeof TOOL_ANNOTATIONS] },
+    {
+      description,
+      inputSchema,
+      annotations: TOOL_ANNOTATIONS[name as keyof typeof TOOL_ANNOTATIONS],
+      outputSchema: TOOL_OUTPUT_SCHEMA[name as keyof typeof TOOL_OUTPUT_SCHEMA],
+    },
     async (input) => handler(input as ToolInput),
   );
 }
@@ -466,7 +497,8 @@ async function runJson(
   argv: IxArgv,
   timeoutMs = DEFAULT_TIMEOUT_MS,
 ): Promise<CallToolResult> {
-  return runCommand(runIx, tool, toArgv(argv, "json"), timeoutMs);
+  const result = await runCommand(runIx, tool, toArgv(argv, "json"), timeoutMs);
+  return withStructuredContent(result);
 }
 
 async function runCommand(
@@ -487,6 +519,23 @@ async function runCommand(
   return textResult(result.stdout.trim() || "{}");
 }
 
+/**
+ * Expose the parsed JSON object as structuredContent so clients receive a typed
+ * value instead of a string to re-parse.
+ *
+ * Falls back to `{}` — never throws — when the output is not a JSON object; the
+ * human-readable text content is always preserved. The fallback keeps tools
+ * with an outputSchema valid even if a future backend returns an unexpected
+ * shape, rather than turning a formatting surprise into a failed tool call.
+ */
+function withStructuredContent(result: CallToolResult): CallToolResult {
+  if (result.isError) return result;
+  const first = result.content?.[0];
+  const text = first?.type === "text" ? first.text : "";
+  const parsed = parseJsonOutput(text);
+  return { ...result, structuredContent: isRecord(parsed) ? parsed : {} };
+}
+
 async function runSmells(runIx: IxRunner, input: ToolInput): Promise<CallToolResult> {
   const result = await runIx(toArgv(ix("smells"), "json"), DEFAULT_TIMEOUT_MS);
   if (!result.ok) {
@@ -496,7 +545,7 @@ async function runSmells(runIx: IxRunner, input: ToolInput): Promise<CallToolRes
 
   const parsed = parseJsonOutput(result.stdout);
   if (!isRecord(parsed) || !Array.isArray(parsed.candidates)) {
-    return textResult(result.stdout.trim() || "{}");
+    return withStructuredContent(textResult(result.stdout.trim() || "{}"));
   }
 
   const path = typeof input.path === "string" ? normalizePath(input.path) : null;
@@ -515,7 +564,11 @@ async function runSmells(runIx: IxRunner, input: ToolInput): Promise<CallToolRes
     })
     .slice(0, limit);
 
-  return textResult(JSON.stringify({ ...parsed, count: candidates.length, candidates }, null, 2));
+  const payload = { ...parsed, count: candidates.length, candidates };
+  return {
+    content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+    structuredContent: payload,
+  };
 }
 
 function textResult(text: string, isError = false): CallToolResult {
