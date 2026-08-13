@@ -1,4 +1,7 @@
 import type { Command } from "commander";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 import { IxClient } from "../../client/api.js";
 import type {
@@ -31,6 +34,9 @@ interface ContextOptions {
   maxEvidence?: string;
   maxChars?: string;
   out?: string;
+  save?: string;
+  resume?: string;
+  diff?: string;
   format: string;
 }
 
@@ -117,15 +123,34 @@ export function registerContextCommand(program: Command): void {
     .option("--max-chars <n>", "Maximum characters of evidence output", "12000")
     .option("--format <fmt>", "Output format (text|json|llm)", "text")
     .option("--out <path>", "Write the JSON bundle to this file instead of stdout")
+    .option("--save <id>", "Persist the bundle as a resumable investigation state")
+    .option("--resume <id>", "Render a saved investigation state without a backend")
+    .option("--diff <id>", "Diff a saved investigation against a fresh build of the same target")
     .addHelpText(
       "after",
-      "\nExamples:\n  ix context IngestionService\n  ix context src/main.ts --format json\n  ix context Widget --max-entities 20 --max-evidence 10",
+      "\nExamples:\n  ix context IngestionService\n  ix context src/main.ts --format json\n  ix context Widget --max-entities 20 --max-evidence 10\n  ix context Widget --save widget-investigation\n  ix context --resume widget-investigation\n  ix context --diff widget-investigation",
     )
-    .action(async (target: string, opts: ContextOptions) => {
+    .action(async (target: string | undefined, opts: ContextOptions) => {
+      if (opts.resume) {
+        renderSavedInvestigation(opts.resume, opts.format);
+        return;
+      }
+      if (opts.diff) {
+        const saved = loadInvestigation(opts.diff);
+        if (!saved) return;
+        const fresh = await buildFreshBundle(target ?? saved.bundle.target.name, opts, saved.bundle.budgets);
+        if (!fresh) return;
+        renderInvestigationDiff(saved, fresh, opts.format);
+        return;
+      }
+      if (!target) {
+        renderWarning("ix context requires a target unless --resume <id> or --diff <id> is given.");
+        return;
+      }
+
       const client = new IxClient(getEndpoint());
 
       const resolved = await resolveFileOrEntity(client, target, {
-        kind: opts.kind,
         path: opts.path,
         pick: opts.pick ? parseInt(opts.pick, 10) : undefined,
       });
@@ -156,6 +181,12 @@ export function registerContextCommand(program: Command): void {
         budgets: { maxEntities, maxRelationships, maxEvidence, maxChars },
       });
 
+      if (opts.save) {
+        saveInvestigation(opts.save, bundle);
+        renderNote(`Saved investigation "${opts.save}" (${bundle.entities.length} entities, ${bundle.relationships.length} relationships, ${bundle.evidence.length} evidence items). Resume with: ix context --resume ${opts.save}`);
+        return;
+      }
+
       if (opts.out && opts.format !== "json") {
         renderWarning("--out writes JSON; ignoring --format and forcing json.");
       }
@@ -168,6 +199,174 @@ export function registerContextCommand(program: Command): void {
       }
       renderBundle(bundle, opts.format);
     });
+
+async function buildFreshBundle(
+  target: string,
+  opts: { kind?: string; path?: string; pick?: string; depth?: string; asOfRev?: string },
+  budgets: { maxEntities: number; maxRelationships: number; maxEvidence: number; maxChars: number },
+): Promise<ContextBundle | undefined> {
+  const client = new IxClient(getEndpoint());
+  const resolved = await resolveFileOrEntity(client, target, {
+    kind: opts.kind,
+    path: opts.path,
+    pick: opts.pick ? parseInt(opts.pick, 10) : undefined,
+  });
+  if (!resolved) return undefined;
+
+  const asOfRev = opts.asOfRev ? parseInt(opts.asOfRev, 10) : undefined;
+  const [facts, context, provenance] = await Promise.all([
+    collectFacts(client, resolved.id, resolved.name, resolved.kind),
+    client.query(resolved.name, { asOfRev, depth: opts.depth }),
+    client.provenance(resolved.id),
+  ]);
+
+  return buildBundle({ resolved, facts, context, provenance, asOfRev, depth: opts.depth, budgets });
+}
+}
+
+
+/** Saved investigation state lives under ~/.ix/investigations. */
+function investigationDir(): string {
+  return process.env.IX_HOME || join(homedir(), ".ix", "investigations");
+}
+
+function investigationPath(id: string): string {
+  return join(investigationDir(), `${sanitizeId(id)}.json`);
+}
+
+function sanitizeId(id: string): string {
+  return id.replace(/[^A-Za-z0-9._-]/g, "-");
+}
+
+export function saveInvestigation(id: string, bundle: ContextBundle): void {
+  const dir = investigationDir();
+  mkdirSync(dir, { recursive: true });
+  const state = {
+    schema: "ix-investigation/1",
+    id: sanitizeId(id),
+    savedAt: new Date().toISOString(),
+    bundle,
+  };
+  writeFileSync(investigationPath(id), JSON.stringify(state, null, 2) + "\n", "utf8");
+}
+
+interface SavedInvestigation {
+  schema: string;
+  id: string;
+  savedAt: string;
+  bundle: ContextBundle;
+}
+
+export function loadInvestigation(id: string): SavedInvestigation | undefined {
+  const path = investigationPath(id);
+  if (!existsSync(path)) {
+    renderWarning(`No saved investigation "${id}" at ${path}`);
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as SavedInvestigation;
+    if (parsed.schema !== "ix-investigation/1" || !parsed.bundle) {
+      renderWarning(`Saved investigation "${id}" has an unknown schema; refusing to resume.`);
+      return undefined;
+    }
+    return parsed;
+  } catch {
+    renderWarning(`Saved investigation "${id}" is not valid JSON; refusing to resume.`);
+    return undefined;
+  }
+}
+
+function renderSavedInvestigation(id: string, format: string): void {
+  const saved = loadInvestigation(id);
+  if (!saved) return;
+  if (format === "json") {
+    console.log(JSON.stringify(saved, null, 2));
+    return;
+  }
+  renderNote(`Resumed investigation "${saved.id}" saved ${saved.savedAt}`);
+  renderBundle(saved.bundle, format);
+}
+
+export function diffInvestigations(saved: SavedInvestigation, fresh: ContextBundle): InvestigationDiff {
+  const prev = saved.bundle;
+  const addedEntities = fresh.entities.filter((e) => !prev.entities.some((p) => p.id === e.id));
+  const removedEntities = prev.entities.filter((p) => !fresh.entities.some((e) => e.id === p.id));
+  const addedRelationships = fresh.relationships.filter(
+    (r) => !prev.relationships.some((p) => p.src === r.src && p.dst === r.dst && p.predicate === r.predicate),
+  );
+  const removedRelationships = prev.relationships.filter(
+    (p) => !fresh.relationships.some((r) => r.src === p.src && r.dst === p.dst && r.predicate === p.predicate),
+  );
+  const addedEvidence = fresh.evidence.filter((e) => !prev.evidence.some((p) => p.id === e.id));
+  const removedEvidence = prev.evidence.filter((p) => !fresh.evidence.some((e) => e.id === p.id));
+  const addedClaims = fresh.claims.filter((c) => !prev.claims.some((p) => p.id === c.id));
+  const removedClaims = prev.claims.filter((p) => !fresh.claims.some((c) => c.id === p.id));
+
+  return {
+    schema: "ix-investigation-diff/1",
+    investigation: saved.id,
+    savedAt: saved.savedAt,
+    generatedAt: new Date().toISOString(),
+    target: fresh.target,
+    freshness: { previous: prev.freshness, current: fresh.freshness },
+    added: {
+      entities: addedEntities,
+      relationships: addedRelationships,
+      evidence: addedEvidence,
+      claims: addedClaims,
+    },
+    removed: {
+      entities: removedEntities,
+      relationships: removedRelationships,
+      evidence: removedEvidence,
+      claims: removedClaims,
+    },
+  };
+}
+
+interface InvestigationDiff {
+  schema: string;
+  investigation: string;
+  savedAt: string;
+  generatedAt: string;
+  target: ContextBundle["target"];
+  freshness: { previous: ContextBundle["freshness"]; current: ContextBundle["freshness"] };
+  added: { entities: ContextBundle["entities"]; relationships: ContextBundle["relationships"]; evidence: EvidenceItem[]; claims: ContextBundle["claims"] };
+  removed: { entities: ContextBundle["entities"]; relationships: ContextBundle["relationships"]; evidence: EvidenceItem[]; claims: ContextBundle["claims"] };
+}
+
+function renderInvestigationDiff(saved: SavedInvestigation, fresh: ContextBundle, format: string): void {
+  const prev = saved.bundle;
+  const diff = diffInvestigations(saved, fresh);
+
+  if (format === "json") {
+    console.log(JSON.stringify(diff, null, 2));
+    return;
+  }
+
+  renderSection(`Investigation diff: ${saved.id}`);
+  console.log(`  freshness: ${prev.freshness.classification} -> ${fresh.freshness.classification}`);
+  console.log(`  entities:  -${diff.removed.entities.length} +${diff.added.entities.length}`);
+  console.log(`  relationships: -${diff.removed.relationships.length} +${diff.added.relationships.length}`);
+  console.log(`  evidence:  -${diff.removed.evidence.length} +${diff.added.evidence.length}`);
+  console.log(`  claims:    -${diff.removed.claims.length} +${diff.added.claims.length}`);
+  if (diff.added.entities.length > 0) {
+    renderSection("Added entities");
+    for (const e of diff.added.entities) console.log(`  ${e.name} (${e.kind})`);
+  }
+  if (diff.removed.entities.length > 0) {
+    renderSection("Removed entities");
+    for (const e of diff.removed.entities) console.log(`  ${e.name} (${e.kind})`);
+  }
+  if (diff.added.evidence.length > 0) {
+    renderSection("Added evidence");
+    for (const e of diff.added.evidence) console.log(`  [${e.score}] ${e.kind} - ${e.title}`);
+  }
+  if (diff.removed.evidence.length > 0) {
+    renderSection("Removed evidence");
+    for (const e of diff.removed.evidence) console.log(`  [${e.score}] ${e.kind} - ${e.title}`);
+  }
+  console.log();
 }
 
 interface BuildInput {
