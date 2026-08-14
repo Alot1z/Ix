@@ -17,6 +17,7 @@ import { getEndpoint } from "../config.js";
 import { collectFacts, type EntityFacts } from "../explain/facts.js";
 import { printLlmLines } from "../llm.js";
 import { resolveFileOrEntity } from "../resolve.js";
+import { createStaleProbe } from "../stale.js";
 import { renderNote, renderSection, renderWarning } from "../ui.js";
 
 /**
@@ -478,6 +479,11 @@ interface BuildInput {
   asOfRev?: number;
   depth?: string;
   budgets: { maxEntities: number; maxRelationships: number; maxEvidence: number; maxChars: number };
+  /**
+   * Per-entity staleness probe. Injected so buildBundle stays a pure function
+   * under test; production passes nothing and gets the real baseline-backed one.
+   */
+  isStale?: (path: string) => boolean;
 }
 
 export function buildBundle(input: BuildInput): ContextBundle {
@@ -489,6 +495,13 @@ export function buildBundle(input: BuildInput): ContextBundle {
 
   // Entities: the target itself plus every referenced node, deduped by id and
   // ordered deterministically (kind, name, id) before budgeting.
+  // `stale` here is the TARGET's staleness, from the facts collector. It is
+  // right for the bundle-level `freshness`, but every other entity has to be
+  // asked about separately — stamping the target's answer onto all of them
+  // reported an untouched dependency as stale whenever the target was, and a
+  // genuinely stale one as current whenever the target was not. Staleness is
+  // the field an agent reads to decide whether to trust the rest, so a wrong
+  // one is worse than none.
   const seen = new Set<string>([resolved.id]);
   const entities: ContextBundle["entities"] = [
     {
@@ -507,7 +520,7 @@ export function buildBundle(input: BuildInput): ContextBundle {
       name: node.name,
       kind: node.kind,
       path: node.provenance?.sourceUri,
-      stale,
+      stale: false, // replaced below, for the entities that survive the budget
     });
   }
 
@@ -574,7 +587,15 @@ export function buildBundle(input: BuildInput): ContextBundle {
   // Apply budgets with explicit truncation metadata. Ordering is already
   // deterministic, so cutting from the tail is stable across runs.
   const entityLimit = Math.min(entities.length, budgets.maxEntities);
-  bundle.entities = entities.slice(0, entityLimit);
+  // Probe staleness after budgeting, so the cost is bounded by maxEntities
+  // rather than by however many nodes the context service returned. The target
+  // keeps the answer the facts collector already produced for it.
+  const probeStale = input.isStale ?? createStaleProbe();
+  bundle.entities = entities.slice(0, entityLimit).map((entity) =>
+    entity.id === resolved.id || !entity.path
+      ? entity
+      : { ...entity, stale: probeStale(entity.path) },
+  );
   bundle.truncation.entitiesTruncated = entities.length - entityLimit;
 
   const relLimit = Math.min(relationships.length, budgets.maxRelationships);

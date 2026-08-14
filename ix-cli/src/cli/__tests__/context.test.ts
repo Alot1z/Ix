@@ -138,6 +138,54 @@ describe("ix context bundle", () => {
     expect(bundle.truncation.evidenceTruncated).toBeGreaterThanOrEqual(0);
   });
 
+  it("asks about each entity's own staleness instead of copying the target's", () => {
+    // `freshness` is the target's, from the facts collector. Every other entity
+    // has its own source file and its own answer — stamping the target's onto
+    // all of them reported untouched dependencies as stale whenever the target
+    // was, which is the field an agent reads to decide what to trust.
+    const asked: string[] = [];
+    const bundle = buildBundle({
+      ...input(),
+      facts: makeFacts({ stale: true, path: "src/widget.ts" }),
+      isStale: (path) => {
+        asked.push(path);
+        return false; // the dependency is current even though the target is not
+      },
+    });
+
+    const target = bundle.entities.find((e) => e.id === "entity-1");
+    const dependency = bundle.entities.find((e) => e.id === "entity-2");
+    expect(target?.stale).toBe(true);
+    expect(dependency?.stale).toBe(false);
+    expect(bundle.freshness).toEqual({ stale: true, classification: "stale" });
+    // The target is not re-probed; its answer was already collected.
+    expect(asked).toEqual(["src/widget.ts"]);
+  });
+
+  it("probes no more entities than the budget keeps", () => {
+    const nodes = Array.from({ length: 40 }, (_, i) => ({
+      id: `n-${i}`,
+      kind: "method",
+      name: `m${i}`,
+      attrs: {},
+      provenance: { sourceUri: `src/f${i}.ts`, extractor: "tree-sitter", sourceType: "source", observedAt: "2026-01-01T00:00:00Z" },
+      createdRev: 1,
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+    })) as GraphNode[];
+    let probes = 0;
+
+    buildBundle({
+      ...input(),
+      context: makeContext({ nodes }),
+      budgets: { maxEntities: 5, maxRelationships: 100, maxEvidence: 25, maxChars: 12000 },
+      isStale: () => { probes += 1; return false; },
+    });
+
+    // 5 kept, minus the target whose answer is already known.
+    expect(probes).toBe(4);
+  });
+
   it("classifies staleness from the collected facts", () => {
     const stale = buildBundle({ ...input(), facts: makeFacts({ stale: true }) });
     expect(stale.freshness).toEqual({ stale: true, classification: "stale" });

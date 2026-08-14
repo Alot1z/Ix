@@ -136,25 +136,41 @@ export function detectStaleFiles(
  * this used to need was once a backend round-trip per file.
  */
 export function isFileStale(filePath: string): boolean {
+  return createStaleProbe()(filePath);
+}
+
+/**
+ * A staleness predicate that loads the ingest baseline once.
+ *
+ * `isFileStale` re-reads and re-parses the whole mtime cache on every call,
+ * which is fine for the handful of results `ix explain` / `ix locate` /
+ * `ix read` check but not for a caller asking about many files at once — that
+ * turns one JSON parse of a file holding every ingested path into N of them.
+ * Callers with a list should take a probe and reuse it.
+ */
+export function createStaleProbe(): (filePath: string) => boolean {
   const workspaceRoot = path.resolve(resolveWorkspaceRoot());
   const baseline = loadIngestBaseline(workspaceRoot);
-  if (!baseline) return false;
 
-  const absolutePath = path.isAbsolute(filePath)
-    ? path.resolve(filePath)
-    : path.resolve(workspaceRoot, filePath);
-  if (!fs.existsSync(absolutePath)) {
-    return baseline.files.has(absolutePath) || baseline.files.has(filePath);
-  }
+  return (filePath: string): boolean => {
+    if (!baseline) return false;
 
-  try {
-    return differsFromIngestBaseline(
-      absolutePath,
-      fs.statSync(absolutePath).mtimeMs,
-      baseline.files,
-      baseline.lastIngestAt,
-    );
-  } catch {
-    return false;
-  }
+    const absolutePath = path.isAbsolute(filePath)
+      ? path.resolve(filePath)
+      : path.resolve(workspaceRoot, filePath);
+    if (!fs.existsSync(absolutePath)) {
+      return baseline.files.has(absolutePath) || baseline.files.has(filePath);
+    }
+
+    try {
+      return differsFromIngestBaseline(
+        absolutePath,
+        fs.statSync(absolutePath).mtimeMs,
+        baseline.files,
+        baseline.lastIngestAt,
+      );
+    } catch {
+      return false;
+    }
+  };
 }
