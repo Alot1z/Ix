@@ -275,6 +275,25 @@ class User { public function save(): void {} }
     expect(resolveEdges([consumer, wrong])).toEqual([]);
   });
 
+  it('normalizes repeated namespace separators without regex backtracking', () => {
+    const provider = parseFile(
+      '/repo/src/Vendor/User.php',
+      '<?php namespace Vendor\\Package; class User {}',
+    )!;
+    const entity = provider.entities.find((candidate) => candidate.name === 'User')!;
+    entity.packageScope = `${'\\'.repeat(4096)}Vendor\\Package${'\\'.repeat(4096)}`;
+    const consumer = parseFile(
+      '/repo/src/Consumer.php',
+      '<?php use Vendor\\Package\\User; function run(User $user): void { new User(); }',
+    )!;
+
+    const edges = resolveEdges([consumer, provider]).filter(
+      (edge) => edge.dstFilePath === '/repo/src/Vendor/User.php',
+    );
+
+    expect(edges).toHaveLength(3);
+  });
+
   it('resolves PHP class imports, references, and calls by exact FQCN', () => {
     const consumer = parseFile(
       '/repo/Consumer.php',

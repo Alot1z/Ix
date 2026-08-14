@@ -2876,11 +2876,20 @@ function qualifiedKey(e: ParsedEntity): string {
 
 const PHP_TYPE_KINDS = new Set(['class', 'interface', 'trait', 'enum']);
 
+function trimPhpNamespace(namespace: string | undefined): string {
+  if (!namespace) return '';
+  let start = 0;
+  let end = namespace.length;
+  while (start < end && namespace.charCodeAt(start) === 92) start++;
+  while (end > start && namespace.charCodeAt(end - 1) === 92) end--;
+  return namespace.slice(start, end);
+}
+
 function phpTypeFqcn(entity: ParsedEntity): string | undefined {
   if (entity.language !== SupportedLanguages.PHP || !PHP_TYPE_KINDS.has(entity.kind) || entity.container) {
     return undefined;
   }
-  const namespace = entity.packageScope?.replace(/^\\+|\\+$/g, '');
+  const namespace = trimPhpNamespace(entity.packageScope);
   return `${namespace ? `${namespace}\\` : ''}${entity.name}`.toLowerCase();
 }
 
