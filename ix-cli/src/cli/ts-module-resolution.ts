@@ -293,7 +293,7 @@ export function createTypeScriptModuleResolver(
         if (star === undefined) continue;
         for (const target of rule.targets) {
           const matches = resolveCandidate(
-            nodePath.resolve(rule.baseDir, target.replace("*", star)),
+            nodePath.resolve(rule.baseDir, target.split("*").join(star)),
             sourcePath,
             kind,
           );

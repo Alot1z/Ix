@@ -63,6 +63,22 @@ describe("createTypeScriptModuleResolver", () => {
     expect(resolve("src/consumer.ts", "@core/missing")).toEqual([]);
   });
 
+  it("substitutes wildcard text without interpreting replacement tokens", () => {
+    const root = workspace();
+    const config = write(
+      root,
+      "tsconfig.json",
+      JSON.stringify({
+        compilerOptions: { paths: { "@core/*": ["src/core/*"] } },
+      }),
+    );
+    const consumer = write(root, "src/consumer.ts");
+    const target = write(root, "src/core/$&.ts");
+    const resolve = createTypeScriptModuleResolver(root, [config, consumer, target]);
+
+    expect(resolve("src/consumer.ts", "@core/$&")).toEqual(["src/core/$&.ts"]);
+  });
+
   it("resolves baseUrl modules", () => {
     const root = workspace();
     const config = write(
