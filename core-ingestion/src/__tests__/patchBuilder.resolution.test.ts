@@ -452,4 +452,24 @@ function handler(): void { log(); Logger::log(); }
 
     expect(callEdges).toHaveLength(1);
   });
+
+  it('emits one claim when two PHP call kinds name the same callee', () => {
+    // Same root cause as the edge case above, and it fires on ordinary untyped
+    // PHP: `handle()` and `$obj->handle()` are two relationships once
+    // phpCallKind splits the key, but a claim carries no kind, so the two ops
+    // are byte-identical.
+    const consumer = parseFile(
+      '/repo/Caller.php',
+      `<?php
+function handler($obj): void { handle(); $obj->handle(); }
+`,
+    )!;
+
+    const patch = buildPatchWithResolution(consumer, 'hash', '', []);
+    const claims = patch.ops.filter(
+      (op) => op.type === 'AssertClaim' && op.field === 'calls:handle',
+    );
+
+    expect(claims).toHaveLength(1);
+  });
 });

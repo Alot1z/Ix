@@ -366,12 +366,21 @@ export function buildPatch(
   }
 
   // AssertClaim for each relationship (feeds the confidence/conflict engine)
+  // phpCallKind splits the relationship dedup key, so `handle(); $obj->handle();`
+  // arrives as two relationships that produce byte-identical claims. The kind is
+  // not part of a claim, so nothing downstream can tell them apart.
+  const emittedClaims = new Set<string>();
   for (const r of relationships) {
     const srcKey = resolveKey(r.srcName);
+    const entityId = nodeId(idPath, srcKey);
+    const field = `${r.predicate.toLowerCase()}:${r.dstName}`;
+    const claimIdentity = `${entityId}\x00${field}`;
+    if (emittedClaims.has(claimIdentity)) continue;
+    emittedClaims.add(claimIdentity);
     ops.push({
       type: 'AssertClaim',
-      entityId: nodeId(idPath, srcKey),
-      field: `${r.predicate.toLowerCase()}:${r.dstName}`,
+      entityId,
+      field,
       value: r.dstName,
       confidence: null,
     });
@@ -684,12 +693,21 @@ export function buildPatchWithResolution(
     });
   }
 
+  // phpCallKind splits the relationship dedup key, so `handle(); $obj->handle();`
+  // arrives as two relationships that produce byte-identical claims. The kind is
+  // not part of a claim, so nothing downstream can tell them apart.
+  const emittedClaims = new Set<string>();
   for (const r of relationships) {
     const srcKey = resolveKey(r.srcName);
+    const entityId = nodeId(idPath, srcKey);
+    const field = `${r.predicate.toLowerCase()}:${r.dstName}`;
+    const claimIdentity = `${entityId}\x00${field}`;
+    if (emittedClaims.has(claimIdentity)) continue;
+    emittedClaims.add(claimIdentity);
     ops.push({
       type: 'AssertClaim',
-      entityId: nodeId(idPath, srcKey),
-      field: `${r.predicate.toLowerCase()}:${r.dstName}`,
+      entityId,
+      field,
       value: r.dstName,
       confidence: null,
     });

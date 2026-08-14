@@ -262,7 +262,7 @@ final class Union
 
   it(
     'scopes every declaration in a large file without rescanning the top level',
-    { timeout: 10_000 },
+    { timeout: 3_000 },
     () => {
       // Resolving each definition's namespace by rescanning the file's top-level
       // nodes is O(definitions x nodes). This file is ordinary, valid PSR-12 and
