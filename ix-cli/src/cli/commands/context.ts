@@ -16,6 +16,7 @@ import type {
 import { getEndpoint } from "../config.js";
 import { collectFacts, type EntityFacts } from "../explain/facts.js";
 import { printLlmLines } from "../llm.js";
+import { parsePickOption } from "../options.js";
 import { resolveFileOrEntity } from "../resolve.js";
 import { createStaleProbe } from "../stale.js";
 import { renderNote, renderSection, renderWarning } from "../ui.js";
@@ -29,7 +30,7 @@ const BUNDLE_SCHEMA = "ix-context-bundle/1";
 interface ContextOptions {
   kind?: string;
   path?: string;
-  pick?: string;
+  pick?: number;
   depth?: string;
   asOfRev?: string;
   maxEntities?: string;
@@ -119,7 +120,7 @@ export function registerContextCommand(program: Command): void {
     )
     .option("--kind <kind>", "Filter target entity by kind")
     .option("--path <path>", "Prefer symbols from files matching this path substring")
-    .option("--pick <n>", "Pick Nth candidate from ambiguous results (1-based)")
+    .option("--pick <n>", "Pick Nth candidate from ambiguous results (1-based)", parsePickOption)
     .option("--depth <depth>", "Context-graph expansion depth")
     .option("--as-of-rev <n>", "Historical context as of a graph revision")
     .option("--max-entities <n>", "Maximum entities in the bundle", "50")
@@ -162,7 +163,7 @@ export function registerContextCommand(program: Command): void {
       const resolved = await resolveFileOrEntity(client, target, {
         kind: opts.kind,
         path: opts.path,
-        pick: opts.pick ? parseInt(opts.pick, 10) : undefined,
+        pick: opts.pick,
       });
       if (!resolved) return;
 
@@ -243,14 +244,14 @@ export function registerContextCommand(program: Command): void {
 
 async function buildFreshBundle(
   target: string,
-  opts: { kind?: string; path?: string; pick?: string; depth?: string; asOfRev?: string },
+  opts: { kind?: string; path?: string; pick?: number; depth?: string; asOfRev?: string },
   budgets: { maxEntities: number; maxRelationships: number; maxEvidence: number; maxChars: number },
 ): Promise<ContextBundle | undefined> {
   const client = new IxClient(getEndpoint());
   const resolved = await resolveFileOrEntity(client, target, {
     kind: opts.kind,
     path: opts.path,
-    pick: opts.pick ? parseInt(opts.pick, 10) : undefined,
+    pick: opts.pick,
   });
   if (!resolved) return undefined;
 
