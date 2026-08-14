@@ -1,6 +1,6 @@
 # Ix-remap — Project Knowledge
 
-Last updated: 2026-08-14T22:55Z (refreshed after upstream PR status change: #428, #432, #438 → APPROVED)
+Last updated: 2026-08-14T23:10Z (full live sweep + upstream merge sync complete)
 
 ## Repository Architecture
 
@@ -44,17 +44,17 @@ https://github.com/ix-infrastructure/Ix/compare/main...Alot1z:Ix-remap:main
 ### Merged PRs (reference only — do NOT append)
 - **#422** `feat(context): deterministic bounded context bundles via ix context` — Hiro-Chiba → merged
 - **#423** `feat(mcp): annotate tools and expose structured output` — Hiro-Chiba → merged
-- **#426** `fix(mcp): truncate long error output` — Hiro-Chiba → closed, superseded by #436
-- **#430** `fix(cli): validate pick options consistently` — Hiro-Chiba → closed, superseded by #438
+- **#428** `fix(mcp): mark smells as mutating` — Hiro-Chiba → **MERGED** (commit `250db8a`, approved by KageBinary, fixes #427)
+- **#430** `fix(context): validate pick option` — Hiro-Chiba → closed, superseded by #438
+- **#432** `fix(mcp): reject conflicting ingest sources` — Hiro-Chiba → **MERGED** (commit `d8dfb82`, approved by KageBinary, fixes #431)
+- **#438** `fix(cli): validate pick options consistently` — Hiro-Chiba → **MERGED** (commit `043bc68`, approved by KageBinary, fixes #437; supersedes #430)
+- **#426** `fix(mcp): truncate long error output` — Hiro-Chiba → closed, superseded by #436/#444
 
-### Open PRs — Hiro-Chiba (live reviewDecision as of 22:55Z)
+### Open PRs — Hiro-Chiba (live reviewDecision as of 23:05Z; #428/#432/#438 now MERGED)
 | PR | Branch | reviewDecision | Notes |
 |---|---|---|---|
-| #428 | fix/mcp-smells-write-annotation | APPROVED | No Alot1z branch; approved, waiting on CI/branch protection |
-| #432 | fix/mcp-ingest-source-validation | APPROVED | -- |
 | #434 | fix/renamed-type-imports | REVIEW_REQUIRED | Supersession candidate: #443 more complete |
-| #436 | fix/mcp-error-output-cap | REVIEW_REQUIRED | Replaces #426 |
-| #438 | fix/shared-pick-validation | APPROVED | Replaces #430 |
+| #436 | fix/mcp-error-output-cap | REVIEW_REQUIRED | Replaces #426; extended by #444 |
 | #440 | fix/ts-module-resolution | REVIEW_REQUIRED | Superseded by #445 |
 | #442 | fix/php-namespace-resolution | REVIEW_REQUIRED | Superseded by #446 |
 
@@ -66,18 +66,18 @@ https://github.com/ix-infrastructure/Ix/compare/main...Alot1z:Ix-remap:main
 | #445 | fix/440-baseurl-authority | Updates #440 territory |
 | #446 | fix/442-php-use-clause-scope | Updates #442 territory (adds DoS fix) |
 
-### Open Issues (no Alot1z PR backing them all)
-| Issue | Title | Related PRs |
-|---|---|---|
-| #425 | MCP reports truncated in-process output as success | #436, #444 |
-| #427 | ix_smells advertised as read-only while storing claims | #428 |
-| #429 | ix context crashes on non-numeric --pick value | #438 |
-| #431 | ix_ingest silently ignores path when github is also set | -- |
-| #433 | Renamed TypeScript imports drop inheritance edges | #434, #443 |
-| #435 | Thrown command errors bypass the MCP output cap | #436, #444 |
-| #437 | Malformed --pick values accepted by non-context commands | #438 |
-| #439 | tsconfig paths and baseUrl ignored during edge resolution | #440, #445 |
-| #441 | PHP imports resolve to classes from wrong namespace | #442, #446 |
+### Open Issues (as of 23:05Z — 3 FIXED by merged PRs, 6 remain open)
+| Issue | Title | Status | Related PRs |
+|---|---|---|---|
+| #425 | MCP reports truncated in-process output as success | **OPEN** | #436, #444 |
+| #427 | ix_smells advertised as read-only while storing claims | **FIXED** (merged #428) | #428 |
+| #429 | ix context crashes on non-numeric --pick value | **OPEN** | #438 |
+| #431 | ix_ingest silently ignores path when github is also set | **FIXED** (merged #432) | #432 |
+| #433 | Renamed TypeScript imports drop inheritance edges | **OPEN** | #434, #443 |
+| #435 | Thrown command errors bypass the MCP output cap | **OPEN** | #436, #444 |
+| #437 | Malformed --pick values accepted by non-context commands | **FIXED** (merged #438) | #438 |
+| #439 | tsconfig paths and baseUrl ignored during edge resolution | **OPEN** | #440, #445 |
+| #441 | PHP imports resolve to classes from wrong namespace | **OPEN** | #442, #446 |
 
 > No Alot1z-authored open branches exist. Do NOT create new upstream PRs without explicit authorization.
 

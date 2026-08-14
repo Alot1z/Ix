@@ -44,10 +44,27 @@ Duration: ~20 min
 ### Session Verdict
 FINAL_GO: fork-main is 3 ahead, 0 behind; all 25 changed files are intentional
 fork-local infrastructure. No upstream-product leakage. Push confirmed.  
-## State Refresh 2026-08-14T22:55Z  
-  
-Source: live gh CLI, fetched 2026-08-14T22:55Z.  
-Change: #428, #432, #438 moved to APPROVED (all Hiro-Chiba).  
-All other open PRs remain REVIEW_REQUIRED (mergeStateStatus=BLOCKED).  
-Fork state unchanged: 3 ahead, 0 behind (HEAD=a443885).  
-No fork-main mutation since last commit.  
+## State Refresh 2026-08-14T23:10Z
+
+Source: full live sweep (all 11 PRs read via gh CLI, all 9 issues confirmed,
+full fef671c..origin/main commit audit, upstream merge sync completed).
+Upstream advanced: 3 Hiro-Chiba PRs merged since session start:
+  - 250db8a fix(mcp): mark smells as mutating (#428) — approved by KageBinary
+  - d8dfb82 fix(mcp): reject conflicting ingest sources (#432) — approved by KageBinary
+  - 043bc68 fix(cli): validate pick options consistently (#438) — approved by KageBinary
+
+Fork synced: merge from origin/main completed (HEAD=ea92674).
+Current fork state: 0 behind, 5 ahead (3 upstream merges + 2 fork-local commits).
+Upstream/main SHA: 043bc68f0fb7ddba736ee1490614cb3c68f8f819
+
+Corresponding issue fixes confirmed:
+  #427 → fixed by #428 (merged)
+  #431 → fixed by #432 (merged)
+  #437 → fixed by #438 (merged)
+
+Open issues remaining (6): #425, #429, #433, #435, #439, #441
+Open PRs remaining (8 Hiro-Chiba + 4 KageBinary): #434, #436, #440, #442,
+  #443, #444, #445, #446 — all REVIEW_REQUIRED, mergeStateStatus=BLOCKED.
+
+knowledge.md updated in place to reflect merged PRs and fixed-issue status.
+No fork-main mutation since last commit (merge was from upstream, not new work).  
