@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, rmSync, chmodSync, renameSync, realpathSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, rmSync, chmodSync, renameSync, realpathSync, mkdirSync } from "node:fs";
 import { isAbsolute, join, relative, resolve as resolvePath, sep } from "node:path";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
@@ -75,7 +75,14 @@ const OSS_OWNED_KEYS = new Set<keyof IxConfig>([
 ]);
 
 export function saveConfig(config: IxConfig): void {
-  const configPath = join(homedir(), ".ix", "config.yaml");
+  const configDir = join(homedir(), ".ix");
+  const configPath = join(configDir, "config.yaml");
+  // 0700, to match the 0600 the config itself is written with below: the file
+  // holds credentials (Pro's instances carry a tunnel JWT and a long-lived IdP
+  // refresh token), and a directory created at the default umask (typically
+  // 0755) lets anyone on the host list the names beside it. `mode` applies only
+  // to directories this call creates, so an existing ~/.ix keeps its own mode.
+  mkdirSync(configDir, { recursive: true, mode: 0o700 });
   let existing: Record<string, unknown> = {};
   if (existsSync(configPath)) {
     try {
