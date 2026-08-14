@@ -1,6 +1,6 @@
 # Ix-remap — Project Knowledge
 
-Last updated: 2026-08-14T22:35Z
+Last updated: 2026-08-14T22:55Z (refreshed after upstream PR status change: #428, #432, #438 → APPROVED)
 
 ## Repository Architecture
 
@@ -47,24 +47,24 @@ https://github.com/ix-infrastructure/Ix/compare/main...Alot1z:Ix-remap:main
 - **#426** `fix(mcp): truncate long error output` — Hiro-Chiba → closed, superseded by #436
 - **#430** `fix(cli): validate pick options consistently` — Hiro-Chiba → closed, superseded by #438
 
-### Open PRs — Hiro-Chiba (BLOCKED on review, all CI/CodeQL green)
-| PR | Branch | Notes |
-|---|---|---|
-| #428 | fix/mcp-smells-write-annotation | No Alot1z branch, do not rebase |
-| #432 | fix/mcp-ingest-source-validation | -- |
-| #434 | fix/renamed-type-imports | Supersession candidate: #443 more complete |
-| #436 | fix/mcp-error-output-cap | Replaces #426 |
-| #438 | fix/shared-pick-validation | Replaces #430 |
-| #440 | fix/ts-module-resolution | No replacement PR |
-| #442 | fix/php-namespace-resolution | No replacement PR |
+### Open PRs — Hiro-Chiba (live reviewDecision as of 22:55Z)
+| PR | Branch | reviewDecision | Notes |
+|---|---|---|---|
+| #428 | fix/mcp-smells-write-annotation | APPROVED | No Alot1z branch; approved, waiting on CI/branch protection |
+| #432 | fix/mcp-ingest-source-validation | APPROVED | -- |
+| #434 | fix/renamed-type-imports | REVIEW_REQUIRED | Supersession candidate: #443 more complete |
+| #436 | fix/mcp-error-output-cap | REVIEW_REQUIRED | Replaces #426 |
+| #438 | fix/shared-pick-validation | APPROVED | Replaces #430 |
+| #440 | fix/ts-module-resolution | REVIEW_REQUIRED | Superseded by #445 |
+| #442 | fix/php-namespace-resolution | REVIEW_REQUIRED | Superseded by #446 |
 
-### Open PRs — KageBinary (newer branches, potentially superseding Hiro-Chiba)
+### Open PRs — KageBinary (newer branches, potentially superseding Hiro-Chiba; all REVIEW_REQUIRED as of 22:55Z)
 | PR | Branch | Notes |
 |---|---|---|
 | #443 | fix/434-default-import-guard | More complete fix for #434 territory |
-| #444 | fix/436-truncated-failure-reason | Updates #436 territory |
+| #444 | fix/436-truncated-failure-reason | Updates #436 territory (keeps reason cap fix) |
 | #445 | fix/440-baseurl-authority | Updates #440 territory |
-| #446 | fix/442-php-use-clause-scope | Updates #442 territory |
+| #446 | fix/442-php-use-clause-scope | Updates #442 territory (adds DoS fix) |
 
 ### Open Issues (no Alot1z PR backing them all)
 | Issue | Title | Related PRs |
@@ -80,6 +80,12 @@ https://github.com/ix-infrastructure/Ix/compare/main...Alot1z:Ix-remap:main
 | #441 | PHP imports resolve to classes from wrong namespace | #442, #446 |
 
 > No Alot1z-authored open branches exist. Do NOT create new upstream PRs without explicit authorization.
+
+### Approvals since last refresh
+- **#428** fix(mcp): mark smells as mutating — APPROVED (Hiro-Chiba)
+- **#432** fix(mcp): reject conflicting ingest sources — APPROVED (Hiro-Chiba)
+- **#438** fix(cli): validate pick options consistently — APPROVED (Hiro-Chiba; replaces #430)
+- All others: REVIEW_REQUIRED (mergeStateStatus=BLOCKED across the board — branch protection / status checks still running)
 
 ## Ix CLI Facts (from CLAUDE.md)
 
