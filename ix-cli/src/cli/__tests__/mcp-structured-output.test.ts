@@ -86,4 +86,31 @@ describe("ix mcp structured output", () => {
     expect(byName.get("ix_locate")?.outputSchema).toBeUndefined();
     expect(byName.get("ix_stats")?.outputSchema).toBeUndefined();
   });
+
+  it("attaches structuredContent only where an outputSchema was declared", async () => {
+    // runJson serves the Pro tools too. They are left out of TOOL_OUTPUT_SCHEMA
+    // because their shape cannot be checked from this package — so attaching the
+    // parsed object to their results anyway would hand clients exactly the data
+    // the omission was meant to withhold, minus the contract to validate it.
+    const server = createIxMcpServer({
+      version: "test",
+      proAvailable: true,
+      runIx: async () => ({ ok: true, stdout: JSON.stringify({ shape: "unverified" }), stderr: "" }),
+    });
+    const client = new Client({ name: "ix-mcp-structured-pro-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    clients.push(client);
+
+    const declared = (await client.callTool({ name: "ix_map", arguments: {} })) as CallToolResult;
+    expect(declared.structuredContent).toEqual({ shape: "unverified" });
+
+    for (const name of ["ix_briefing", "ix_decisions"]) {
+      const result = (await client.callTool({ name, arguments: {} })) as CallToolResult;
+      expect(result.structuredContent, name).toBeUndefined();
+      // The answer is still there, as text.
+      expect(result.content[0], name).toEqual({ type: "text", text: JSON.stringify({ shape: "unverified" }) });
+    }
+  });
 });

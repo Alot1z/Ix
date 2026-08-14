@@ -84,8 +84,15 @@ gemini, openclaw and opencode lose only `ix_query` and the two composites.
   "an object": the real field shape is backend-defined and versioned, and
   promising specific fields would break tool calls the moment the backend
   renames one. The human-readable text result is preserved for clients that
-  prefer it. The remaining tools return their `llm`-format text, which has no
+  prefer it. Most remaining tools return their `llm`-format text, which has no
   stable object shape worth promising.
+
+  The Pro tools are the exception worth naming: they run in JSON too, but get
+  neither an `outputSchema` nor `structuredContent`, because their shape cannot
+  be checked from this package. Those two go together on purpose — attaching the
+  parsed object without the schema would hand clients the unverified value
+  anyway, minus the contract that would let them validate it. Their answer is
+  still returned, as text.
 
 ## Order of work
 

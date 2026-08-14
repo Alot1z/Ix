@@ -514,7 +514,16 @@ async function runJson(
   timeoutMs = DEFAULT_TIMEOUT_MS,
 ): Promise<CallToolResult> {
   const result = await runCommand(runIx, tool, toArgv(argv, "json"), timeoutMs);
-  return withStructuredContent(result);
+  // Only for tools that declared an outputSchema. runJson also serves the three
+  // Pro tools, whose shape cannot be checked from this package — which is the
+  // stated reason they have no schema. Attaching structuredContent to them
+  // anyway would hand clients the unverified object regardless, just without the
+  // contract that would let them validate it.
+  return declaresOutputSchema(tool) ? withStructuredContent(result) : result;
+}
+
+function declaresOutputSchema(tool: string): boolean {
+  return tool in TOOL_OUTPUT_SCHEMA;
 }
 
 async function runCommand(
