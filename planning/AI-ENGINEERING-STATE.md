@@ -225,3 +225,31 @@ Follow-up to the rule correction: substantive technical reviews posted on all 4 
 - After KageBinary responds to #443 test-gap items: confirm new regression tests added before merge
 - After KageBinary responds to #445 escaped-backslash risk: confirm detection logic covers \`\\\\d\` case and a test case exists
 - After KageBinary responds to #446 SIGTERM note: confirm behavioral contract is documented in PR body or code before merge
+
+### Second Live Upstream Sweep — 2026-08-15T00:20Z
+
+- Re-fetched origin: `043bc68f0fb7ddba736ee1490614cb3c68f8f819` (unchanged)
+- Re-fetched fork: `d1bd3ef84d2f382b42411f5b1e65edce11807cde` (confirmed pushed)
+- AHEAD/BEHIND: **0 behind, 8 ahead**
+  - 3 Hiro-Chiba merges: #428 `250db8a`, #432 `d8dfb82`, #438 `043bc68`
+  - Agent infrastructure commits: a443885 (infrastructure), ea92674 (sync), c74be0e (state), b13b187 (comments + quarantine), d1bd3ef (reviews + rule correction)
+- Open PRs: 8 (identical set) — all `REVIEW_REQUIRED`, `mergeStateStatus=BLOCKED`
+- Open issues: 6 (identical set)
+- No new objects, no state transitions, no supersession chain changes
+- All 12 substantive review comments verified present (4 supersession + 4 provenance + 4 technical)
+- All classifications from first sweep confirmed correct
+
+### Final Executable Authorized Work Assessment
+
+| Lane | Status | Reason |
+|---|---|---|
+| Supersession comments | DONE | All 4 Hiro-Chiba PRs documented |
+| Provenance lock comments | DONE | All 4 KageBinary PRs documented |
+| Substantive technical reviews | DONE | All 4 KageBinary PRs reviewed |
+| Execution rule correction | DONE | Commit-path rule corrected + state updated |
+| Fork-local infrastructure | PRESENT | 26 files, committed as a443885 → d1bd3ef |
+| Ix-findings rebuild | DEFERRED | Requires separate push authorization (AGENTS.md) |
+| New upstream PR | FORBIDDEN | No Alot1z-owned PR open; no authorization |
+| Commits to KageBinary branches | FORBIDDEN | Branch ownership is KageBinary's |
+
+Second live sweep finds no remaining executable authorized work.
