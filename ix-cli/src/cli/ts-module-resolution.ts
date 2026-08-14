@@ -290,10 +290,17 @@ export function createTypeScriptModuleResolver(
     .filter((config): config is LoadedConfig => config !== undefined)
     .sort((a, b) => b.dir.length - a.dir.length);
 
-  return (sourcePath: string, rawSpecifier: string, kind = "runtime"): string[] | undefined => {
-    const specifier = rawSpecifier.split(/[?#]/, 1)[0];
-    if (!specifier || specifier.startsWith(".") || specifier.startsWith("/")) return undefined;
-    const normalizedSource = normalizePath(sourcePath);
+  // Ingestion asks the same question repeatedly: resolution runs per bound
+  // relationship, and index.ts issues two full lookups of the same triple for
+  // each one. Only three things about a call change the answer — see the key.
+  const resolutionCache = new Map<string, string[] | undefined>();
+
+  const resolveUncached = (
+    sourcePath: string,
+    normalizedSource: string,
+    specifier: string,
+    kind: "runtime" | "types",
+  ): string[] | undefined => {
     const config = configs.find((candidate) => isWithinDir(normalizedSource, candidate.dir));
     // Only an *explicit* `paths` mapping licenses an authoritative "no match".
     // A bare `baseUrl` — and a catch-all `"*"` rule, which is the same thing
@@ -328,5 +335,26 @@ export function createTypeScriptModuleResolver(
       }
     }
     return mappedExplicitly ? [] : undefined;
+  };
+
+  return (sourcePath: string, rawSpecifier: string, kind = "runtime"): string[] | undefined => {
+    const specifier = rawSpecifier.split(/[?#]/, 1)[0];
+    if (!specifier || specifier.startsWith(".") || specifier.startsWith("/")) return undefined;
+    const normalizedSource = normalizePath(sourcePath);
+    // Config selection reads only the source *directory*; candidate ordering
+    // additionally reads the source *extension* (a .js caller prefers .js over
+    // .ts). Nothing else about the path is consulted, so this key is exact —
+    // keying on the directory alone would serve a .js caller's answer to a .ts
+    // caller in the same folder and silently flip the preference order.
+    const cacheKey = [
+      nodePath.posix.dirname(normalizedSource),
+      nodePath.posix.extname(normalizedSource).toLowerCase(),
+      specifier,
+      kind,
+    ].join(" ");
+    if (resolutionCache.has(cacheKey)) return resolutionCache.get(cacheKey);
+    const result = resolveUncached(sourcePath, normalizedSource, specifier, kind);
+    resolutionCache.set(cacheKey, result);
+    return result;
   };
 }

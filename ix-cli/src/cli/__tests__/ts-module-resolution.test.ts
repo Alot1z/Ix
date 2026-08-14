@@ -207,6 +207,35 @@ describe("createTypeScriptModuleResolver", () => {
     expect(resolve("src/consumer.js", "services/worker")).toEqual(["src/services/worker.js"]);
   });
 
+  it("does not serve one caller's language preference to another in the same directory", () => {
+    // Guards the memo key: results are cached, and callers in the same folder
+    // share a config but not a preference order. Keying on the directory alone
+    // would hand the .js answer to the .ts caller, or whichever ran first.
+    const root = workspace();
+    const config = write(
+      root,
+      "jsconfig.json",
+      JSON.stringify({ compilerOptions: { baseUrl: "src" } }),
+    );
+    const jsConsumer = write(root, "src/consumer.js");
+    const tsConsumer = write(root, "src/consumer.ts");
+    const javascript = write(root, "src/services/worker.js");
+    const typescript = write(root, "src/services/worker.ts");
+    const resolve = createTypeScriptModuleResolver(root, [
+      config,
+      jsConsumer,
+      tsConsumer,
+      javascript,
+      typescript,
+    ]);
+
+    // Order matters: whichever runs first would poison a directory-only key.
+    expect(resolve("src/consumer.js", "services/worker")).toEqual(["src/services/worker.js"]);
+    expect(resolve("src/consumer.ts", "services/worker")).toEqual(["src/services/worker.ts"]);
+    // And repeated asks, which is what the cache exists for, stay stable.
+    expect(resolve("src/consumer.js", "services/worker")).toEqual(["src/services/worker.js"]);
+  });
+
   it("matches mapped paths case-insensitively on case-insensitive filesystems", () => {
     const root = workspace();
     const config = write(
