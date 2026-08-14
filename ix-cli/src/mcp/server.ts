@@ -94,6 +94,19 @@ const WRITE_OPEN_WORLD: ToolAnnotations = {
   openWorldHint: true,
 };
 
+/**
+ * A title and nothing else — for tools whose behavior cannot be verified from
+ * this repository.
+ *
+ * The Pro tools are implemented in the separate `@ix/pro` package, which is why
+ * they are also left out of TOOL_OUTPUT_SCHEMA below. The same reasoning applies
+ * with more force to the behavioral hints: clients use `readOnlyHint` to decide
+ * whether a call needs the user's approval, so asserting it for code that is not
+ * in this tree would trade away a confirmation prompt on an unverified claim. An
+ * absent hint costs a prompt; a wrong one costs the prompt itself.
+ */
+const UNVERIFIED = (title: string): ToolAnnotations => ({ title });
+
 const TOOL_ANNOTATIONS: Record<(typeof IX_MCP_TOOL_NAMES)[number], ToolAnnotations> = {
   ix_health: { ...READ_ONLY, title: "Check Ix backend and graph readiness" },
   ix_locate: { ...READ_ONLY, title: "Resolve a symbol to its canonical target" },
@@ -101,7 +114,9 @@ const TOOL_ANNOTATIONS: Record<(typeof IX_MCP_TOOL_NAMES)[number], ToolAnnotatio
   ix_impact: { ...READ_ONLY, title: "Analyze the blast radius of changing a symbol" },
   ix_map: { ...WRITE, title: "Ingest or refresh the workspace architecture map" },
   ix_overview: { ...READ_ONLY, title: "Show the structural overview of a target" },
-  ix_read: { ...READ_ONLY, title: "Read graph-bounded source" },
+  // Not "graph-bounded": `ix read` resolves an exact file path before it
+  // consults the graph at all, so the title has to describe the whole command.
+  ix_read: { ...READ_ONLY, title: "Read source from the workspace" },
   ix_diff: { ...READ_ONLY, title: "Show the structural diff between revisions" },
   ix_callers: { ...READ_ONLY, title: "List incoming call edges" },
   ix_callees: { ...READ_ONLY, title: "List outgoing call edges" },
@@ -117,9 +132,10 @@ const TOOL_ANNOTATIONS: Record<(typeof IX_MCP_TOOL_NAMES)[number], ToolAnnotatio
   ix_subsystems: { ...READ_ONLY, title: "List graph-derived subsystems" },
   ix_history: { ...READ_ONLY, title: "Show provenance and patch history" },
   ix_ingest: { ...WRITE_OPEN_WORLD, title: "Ingest a path or GitHub repository into the graph" },
-  ix_briefing: { ...READ_ONLY, title: "Load the Ix Pro session briefing" },
-  ix_decisions: { ...READ_ONLY, title: "List Ix Pro architecture decisions" },
-  ix_decide: { ...WRITE, title: "Record an architecture decision" },
+  // Implemented in @ix/pro, so nothing here can check these are true.
+  ix_briefing: UNVERIFIED("Load the Ix Pro session briefing"),
+  ix_decisions: UNVERIFIED("List Ix Pro architecture decisions"),
+  ix_decide: UNVERIFIED("Record an architecture decision"),
 };
 
 /**

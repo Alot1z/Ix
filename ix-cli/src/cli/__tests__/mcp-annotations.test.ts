@@ -44,11 +44,40 @@ describe("ix mcp tool annotations", () => {
     const client = await connect(async () => ({ ok: true, stdout: "ok", stderr: "" }), true);
     const byName = new Map((await client.listTools()).tools.map((entry) => [entry.name, entry]));
 
-    for (const name of ["ix_map", "ix_ingest", "ix_decide"]) {
+    // ix_decide is deliberately absent: it lives in @ix/pro, so its behavior
+    // cannot be verified from here. See the Pro-tool case below.
+    for (const name of ["ix_map", "ix_ingest"]) {
       expect(byName.get(name)?.annotations?.destructiveHint, name).toBe(true);
       expect(byName.get(name)?.annotations?.readOnlyHint, name).toBe(false);
       expect(byName.get(name)?.annotations?.idempotentHint, name).toBe(false);
     }
+  });
+
+  it("asserts no behavioral hint for tools implemented outside this repository", async () => {
+    const client = await connect(async () => ({ ok: true, stdout: "ok", stderr: "" }), true);
+    const byName = new Map((await client.listTools()).tools.map((entry) => [entry.name, entry]));
+
+    // Clients use readOnlyHint to decide whether a call needs the user's
+    // approval. Claiming it for @ix/pro's code — which this package cannot see —
+    // would trade a confirmation prompt for an unverified claim. A title is the
+    // most these can honestly carry.
+    for (const name of ["ix_briefing", "ix_decisions", "ix_decide"]) {
+      const annotations = byName.get(name)?.annotations;
+      expect(annotations?.title, name).toBeTruthy();
+      expect(annotations?.readOnlyHint, name).toBeUndefined();
+      expect(annotations?.destructiveHint, name).toBeUndefined();
+      expect(annotations?.idempotentHint, name).toBeUndefined();
+      expect(annotations?.openWorldHint, name).toBeUndefined();
+    }
+  });
+
+  it("does not call ix_read graph-bounded, because it is not", async () => {
+    const client = await connect(async () => ({ ok: true, stdout: "ok", stderr: "" }));
+    const byName = new Map((await client.listTools()).tools.map((entry) => [entry.name, entry]));
+
+    // `ix read` resolves an exact file path before consulting the graph, so a
+    // title promising a graph bound describes only part of the command.
+    expect(byName.get("ix_read")?.annotations?.title).not.toMatch(/graph-bounded/i);
   });
 
   it("marks graph reads read-only and idempotent", async () => {
