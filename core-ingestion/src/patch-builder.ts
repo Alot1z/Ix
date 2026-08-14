@@ -671,7 +671,7 @@ export function buildPatchWithResolution(
     // node it instead mints two ids for one edge, and since the dedup downstream
     // keys on id, both commit. An edge is identified by (src, dst, predicate) —
     // two of those with empty attrs are indistinguishable in the graph.
-    const edgeIdentity = `${nodeId(idPath, srcKey)} ${dstNodeId} ${r.predicate}`;
+    const edgeIdentity = `${nodeId(idPath, srcKey)}\x00${dstNodeId}\x00${r.predicate}`;
     if (emittedEdgeIdentities.has(edgeIdentity)) continue;
     emittedEdgeIdentities.add(edgeIdentity);
     ops.push({
