@@ -386,7 +386,7 @@ export function createTypeScriptModuleResolver(
       nodePath.posix.extname(normalizedSource).toLowerCase(),
       specifier,
       kind,
-    ].join(" ");
+    ].join("\x00");
     if (resolutionCache.has(cacheKey)) return resolutionCache.get(cacheKey);
     const result = resolveUncached(sourcePath, normalizedSource, specifier, kind);
     resolutionCache.set(cacheKey, result);
