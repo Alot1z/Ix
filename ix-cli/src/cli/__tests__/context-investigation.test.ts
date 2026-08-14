@@ -25,8 +25,14 @@ let home: string;
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "ix-investigation-test-"));
   process.env.IX_HOME = home;
-  mkdirSync(join(home, ".ix", "investigations"), { recursive: true });
+  // IX_HOME is the Ix home directory; investigations live in a subdirectory of
+  // it, which saveInvestigation creates. Nothing is pre-created here — the tests
+  // below assert on where the code actually writes, not on a directory the test
+  // made itself.
 });
+
+/** Where saved investigations are expected to live, given IX_HOME. */
+const investigationsDir = () => join(home, "investigations");
 
 afterEach(() => {
   delete process.env.IX_HOME;
@@ -126,9 +132,27 @@ describe("ix context investigation state", () => {
     expect(loaded?.bundle.evidence).toEqual(bundle.evidence);
   });
 
+  it("writes into an investigations subdirectory of IX_HOME, not its root", () => {
+    // IX_HOME is the Ix home itself — it holds config.yaml, bin/, cli/ and
+    // dotfiles like .version-check.json. Saved state belongs in a subdirectory
+    // of it, not loose among them.
+    writeFileSync(join(home, "config.yaml"), "endpoint: http://localhost:8090\n");
+    writeFileSync(join(home, ".version-check.json"), JSON.stringify({ latest: "0.9.3" }));
+
+    saveInvestigation("widget-check", bundleWith([makeClaim("renders to DOM", 0.9)]));
+
+    expect(readdirSync(investigationsDir())).toEqual(["widget-check.json"]);
+    expect(readdirSync(home).sort()).toEqual([".version-check.json", "config.yaml", "investigations"]);
+  });
+
   it("refuses to resume a missing or malformed investigation", () => {
     expect(loadInvestigation("does-not-exist")).toBeUndefined();
-    writeFileSync(join(home, ".ix", "investigations", "broken.json"), "not json", "utf8");
+    // The fixture has to sit where the loader actually looks, or this passes
+    // because the file is absent rather than because it is malformed — and
+    // would keep passing with the JSON guard deleted.
+    mkdirSync(investigationsDir(), { recursive: true });
+    writeFileSync(join(investigationsDir(), "broken.json"), "not json", "utf8");
+    expect(existsSync(join(investigationsDir(), "broken.json"))).toBe(true);
     expect(loadInvestigation("broken")).toBeUndefined();
   });
 
@@ -136,7 +160,7 @@ describe("ix context investigation state", () => {
     const malformed = { ...bundleWith([]), entities: "not-an-array" } as unknown as ReturnType<typeof buildBundle>;
     saveInvestigation("bad-shape", malformed);
     expect(loadInvestigation("bad-shape")).toBeUndefined();
-    expect(existsSync(join(home, ".ix", "investigations", "bad-shape.json"))).toBe(false);
+    expect(existsSync(join(investigationsDir(), "bad-shape.json"))).toBe(false);
   });
 
   it("computes a deterministic delta between saved and fresh state", () => {
@@ -222,16 +246,23 @@ describe("ix context investigation state", () => {
     saveInvestigation("a/b", a);
     saveInvestigation("a?b", b);
     saveInvestigation("../../escape", a);
+    saveInvestigation(".version-check", b);
 
     expect(loadInvestigation("a/b")?.bundle.evidence).toEqual(a.evidence);
     expect(loadInvestigation("a?b")?.bundle.evidence).toEqual(b.evidence);
     expect(loadInvestigation("../../escape")?.bundle.target.name).toBe("Widget");
+    expect(loadInvestigation(".version-check")?.bundle.evidence).toEqual(b.evidence);
 
-    // Every hostile id lands as one single-segment file inside the IX_HOME
-    // investigations directory; nothing is written outside it.
-    const jsonFiles = readdirSync(home).filter((f) => f.endsWith(".json"));
-    expect(jsonFiles).toHaveLength(3);
-    for (const f of jsonFiles) expect(f).not.toContain("/");
+    // Every hostile id lands as one single-segment file inside the
+    // investigations directory; nothing is written outside it, and nothing
+    // becomes a dotfile that could shadow real Ix state.
+    const jsonFiles = readdirSync(investigationsDir()).filter((f) => f.endsWith(".json"));
+    expect(jsonFiles).toHaveLength(4);
+    for (const f of jsonFiles) {
+      expect(f).not.toContain("/");
+      expect(f.startsWith(".")).toBe(false);
+    }
     expect(existsSync(join(home, "..", "escape.json"))).toBe(false);
+    expect(existsSync(join(home, ".version-check.json"))).toBe(false);
   });
 });

@@ -209,6 +209,11 @@ describe("ix context bundle", () => {
     expect(sanitizeId("../../etc/passwd")).not.toContain("/");
     expect(sanitizeId("C:\\Windows")).not.toContain("\\");
     expect(sanitizeId("")).toBe("unnamed");
+    // No id may produce a dotfile, and encoding the dot only in first position
+    // keeps the mapping injective.
+    expect(sanitizeId(".version-check")).toBe("~2Eversion-check");
+    expect(sanitizeId(".version-check")).not.toBe(sanitizeId("~2Eversion-check"));
+    expect(sanitizeId("a.b")).toBe("a.b");
     const names = ["a/b", "a?b", "a:b", "a~2Fb", "C:\\Windows", "../..", "~"].map(sanitizeId);
     expect(new Set(names).size).toBe(names.length);
   });

@@ -267,7 +267,13 @@ async function buildFreshBundle(
 
 /** Saved investigation state lives under ~/.ix/investigations. */
 function investigationDir(): string {
-  return process.env.IX_HOME || join(homedir(), ".ix", "investigations");
+  // IX_HOME is the Ix home *directory*, not the investigations directory —
+  // backend-status.ts, docker.ts and upgrade.ts all read it as `IX_HOME ||
+  // ~/.ix` and then join their own subdirectory onto it. Putting the subdirectory
+  // only in the fallback made the two branches disagree: with IX_HOME set, saved
+  // investigations landed loose in the Ix home beside config.yaml, bin/ and cli/,
+  // and `investigations/` was never created at all.
+  return join(process.env.IX_HOME || join(homedir(), ".ix"), "investigations");
 }
 
 function investigationPath(id: string): string {
@@ -283,12 +289,17 @@ function investigationPath(id: string): string {
  * `~` in user input cannot be confused with an encoding: `a/b`, `a?b`, and
  * `a~2Fb` all land in distinct, single-segment files under the investigation
  * directory instead of silently colliding or escaping it.
+ *
+ * A leading `.` is encoded too, so no id can produce a dotfile. `.` is otherwise
+ * an ordinary character here, and encoding it only in first position keeps the
+ * mapping injective: `.a` becomes `~2Ea`, which no other id can also produce.
  */
 export function sanitizeId(id: string): string {
   let out = "";
   for (const ch of id) {
     out += /[A-Za-z0-9._-]/.test(ch) ? ch : `~${ch.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`;
   }
+  if (out.startsWith(".")) out = `~2E${out.slice(1)}`;
   return out || "unnamed";
 }
 
