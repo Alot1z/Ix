@@ -31,3 +31,8 @@ ix-cli/coverage/
 
 # SBT boot artifacts
 .sbt-boot/
+
+# Environment tooling artifacts (pre-existing, never commit)
+.code-index/
+cd/
+git/

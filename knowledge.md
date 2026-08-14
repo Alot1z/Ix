@@ -1,6 +1,6 @@
 # Ix-remap — Project Knowledge
 
-Last updated: 2026-08-14T23:10Z (full live sweep + upstream merge sync complete)
+Last updated: 2026-08-14T23:20Z (supersession comments posted on all 8 open PRs)
 
 ## Repository Architecture
 
@@ -86,6 +86,28 @@ https://github.com/ix-infrastructure/Ix/compare/main...Alot1z:Ix-remap:main
 - **#432** fix(mcp): reject conflicting ingest sources — APPROVED (Hiro-Chiba)
 - **#438** fix(cli): validate pick options consistently — APPROVED (Hiro-Chiba; replaces #430)
 - All others: REVIEW_REQUIRED (mergeStateStatus=BLOCKED across the board — branch protection / status checks still running)
+
+### Supersession documentation comments posted
+All 8 open PRs now carry technical supersession/provenance documentation:
+
+| PR | Type | Comment URL |
+|---|---|---|
+| #434 | Supersession record | https://github.com/ix-infrastructure/Ix/pull/434#issuecomment-5298622510 |
+| #436 | Supersession record | https://github.com/ix-infrastructure/Ix/pull/436#issuecomment-5298623086 |
+| #440 | Supersession record | https://github.com/ix-infrastructure/Ix/pull/440#issuecomment-5298635491 |
+| #442 | Supersession record | https://github.com/ix-infrastructure/Ix/pull/442#issuecomment-5298635881 |
+| #443 | Provenance lock | https://github.com/ix-infrastructure/Ix/pull/443#issuecomment-5298637348 |
+| #444 | Provenance lock | https://github.com/ix-infrastructure/Ix/pull/444#issuecomment-5298637764 |
+| #445 | Provenance lock | https://github.com/ix-infrastructure/Ix/pull/445#issuecomment-5298639620 |
+| #446 | Provenance lock | https://github.com/ix-infrastructure/Ix/pull/446#issuecomment-5298639947 |
+
+**Supersession chains confirmed:**
+- Hiro-Chiba #434 → KageBinary #443 (default-import guard)
+- Hiro-Chiba #436/#426 → KageBinary #444 (truncated failure reason)
+- Hiro-Chiba #440 → KageBinary #445 (regex security hardening: OOM + device-node + path traversal)
+- Hiro-Chiba #442 → KageBinary #446 (sticky truncation flag + DoS hardening)
+
+All comments posted as technical indexes only. No maintainer tags.
 
 ## Ix CLI Facts (from CLAUDE.md)
 
