@@ -259,4 +259,46 @@ final class Union
       phpCallKind: 'member',
     });
   });
+
+  it(
+    'scopes every declaration in a large file without rescanning the top level',
+    { timeout: 10_000 },
+    () => {
+      // Resolving each definition's namespace by rescanning the file's top-level
+      // nodes is O(definitions x nodes). This file is ordinary, valid PSR-12 and
+      // well under the 1 MB ingest cap, but took ~13s to parse that way against
+      // ~150ms now — and a 16k-declaration file took over three minutes, which
+      // pins a parse worker with no per-file timeout.
+      const count = 4_000;
+      let source = '<?php\nnamespace App\\Support;\n';
+      for (let i = 0; i < count; i += 1) source += `function helper${i}($a) { return $a; }\n`;
+
+      const result = parseFile('/repo/big.php', source)!;
+
+      const scoped = result.entities.filter((e) => e.packageScope === 'App\\Support');
+      expect(scoped).toHaveLength(count);
+    },
+  );
+
+  it('scopes declarations by the nearest preceding unbraced namespace', () => {
+    // The binary search must land on the *last* declaration starting before the
+    // node, not the first or the nearest by distance.
+    const result = parseFile(
+      '/repo/Sequential.php',
+      `<?php
+namespace First;
+function alpha() {}
+namespace Second;
+function beta() {}
+namespace Third;
+function gamma() {}
+`,
+    )!;
+
+    const scopeOf = (name: string) =>
+      result.entities.find((e) => e.name === name)?.packageScope;
+    expect(scopeOf('alpha')).toBe('First');
+    expect(scopeOf('beta')).toBe('Second');
+    expect(scopeOf('gamma')).toBe('Third');
+  });
 });

@@ -1986,19 +1986,55 @@ function unwrapRustCfgMacros(source: string): string {
 // Main parse function
 // ---------------------------------------------------------------------------
 
-function phpNamespaceForNode(rootNode: any, node: any): string | undefined {
+interface PhpNamespaceSpan {
+  startIndex: number;
+  namespace: string;
+}
+
+/**
+ * Start offsets of every unbraced `namespace X;` at file top level, ascending.
+ *
+ * Built once per parse. Doing this scan per definition instead made the file
+ * cost O(definitions x top-level nodes): a valid 890 KB PSR-12 file with ~16k
+ * functions took ~197s, against ~355ms without it.
+ *
+ * A braced `namespace X { ... }` scopes by containment rather than position and
+ * is handled by the ancestor walk in {@link phpNamespaceForNode}, so it is
+ * deliberately excluded here.
+ */
+function collectPhpNamespaceSpans(rootNode: any): PhpNamespaceSpan[] {
+  const spans: PhpNamespaceSpan[] = [];
+  // `namedChildren` materializes the list in a single walk; indexing
+  // `namedChild(i)` in a loop is what made the original scan expensive.
+  for (const child of rootNode.namedChildren ?? []) {
+    if (!child || child.type !== 'namespace_definition' || child.childForFieldName?.('body')) continue;
+    spans.push({
+      startIndex: child.startIndex,
+      namespace: child.childForFieldName?.('name')?.text?.replace(/\s+/g, '') ?? '',
+    });
+  }
+  return spans;
+}
+
+function phpNamespaceForNode(node: any, spans: PhpNamespaceSpan[]): string | undefined {
   for (let current = node.parent; current; current = current.parent) {
     if (current.type === 'namespace_definition') {
       return current.childForFieldName?.('name')?.text?.replace(/\s+/g, '') ?? '';
     }
   }
 
+  // The last unbraced declaration starting before this node wins.
+  let low = 0;
+  let high = spans.length - 1;
   let active: string | undefined;
-  for (let i = 0; i < rootNode.namedChildCount; i++) {
-    const child = rootNode.namedChild(i);
-    if (!child || child.startIndex >= node.startIndex) break;
-    if (child.type !== 'namespace_definition' || child.childForFieldName?.('body')) continue;
-    active = child.childForFieldName?.('name')?.text?.replace(/\s+/g, '') ?? '';
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    if (spans[mid].startIndex < node.startIndex) {
+      active = spans[mid].namespace;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
   }
   return active;
 }
@@ -2147,6 +2183,12 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
       }
     }
 
+    // Same idea for PHP: collect the file's namespace boundaries once rather
+    // than rescanning the top level for every definition.
+    const phpNamespaceSpans = language === SupportedLanguages.PHP
+      ? collectPhpNamespaceSpans(tree.rootNode)
+      : [];
+
     // --- First pass: collect definitions ---
     for (const match of pass1Matches) {
       // Definition captures: name + definition.*
@@ -2220,7 +2262,7 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
           container: effectiveContainer,
           packageScope: goPackage ?? (
             language === SupportedLanguages.PHP
-              ? phpNamespaceForNode(tree.rootNode, defNode)
+              ? phpNamespaceForNode(defNode, phpNamespaceSpans)
               : undefined
           ),
         });
