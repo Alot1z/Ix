@@ -109,6 +109,32 @@ describe('buildPatchWithResolution', () => {
     }));
   });
 
+  it('keeps same-named PHP constructor and function calls distinct', () => {
+    const consumer = parseFile(
+      '/repo/Consumer.php',
+      `<?php
+use Vendor\\Package\\Helper;
+function Helper(): void {}
+function run(): void { new Helper(); Helper(); }
+      `,
+    )!;
+    const provider = parseFile(
+      '/repo/Vendor/Package/Helper.php',
+      '<?php namespace Vendor\\Package; class Helper {}',
+    )!;
+    const resolved = resolveEdges([consumer, provider]);
+    const patch = buildPatchWithResolution(consumer, 'hash', '', resolved);
+    const callEdges = patch.ops.filter(op => op.type === 'UpsertEdge' && op.predicate === 'CALLS');
+
+    expect(callEdges).toHaveLength(2);
+    expect(callEdges).toContainEqual(expect.objectContaining({
+      dst: nodeId('/repo/Vendor/Package/Helper.php', 'Helper'),
+    }));
+    expect(callEdges).toContainEqual(expect.objectContaining({
+      dst: nodeId('/repo/Consumer.php', 'Helper'),
+    }));
+  });
+
   it('materialises external stub node for unresolved :: package calls', () => {
     const file = '/repo/model.R';
     const externalNodeId = nodeId('external://dplyr', 'dplyr::filter');

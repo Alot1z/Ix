@@ -1028,7 +1028,7 @@ export const PHP_QUERIES = `
 ; Simple: use App\\Models\\User;
 (namespace_use_declaration
   (namespace_use_clause
-    (qualified_name) @import.source)) @import
+    [(qualified_name) (name)] @import.source)) @import
 
 ; ── Function/method calls ────────────────────────────────────────────────────
 ; Regular function call: foo()

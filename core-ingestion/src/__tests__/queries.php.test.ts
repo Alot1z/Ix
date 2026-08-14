@@ -22,6 +22,83 @@ use Vendor\\Contracts\\DomainService;
     });
   });
 
+  it('records PHP namespace scope for semicolon and braced declarations', () => {
+    const result = parseFile(
+      '/repo/Types.php',
+      `<?php
+namespace First\\Space;
+class FirstType {}
+namespace Second\\Space;
+class SecondType {}
+      `,
+    );
+    const braced = parseFile(
+      '/repo/Braced.php',
+      `<?php
+namespace Vendor\\Package { class User {} }
+namespace { class GlobalThing {} }
+      `,
+    );
+
+    expect(result?.entities.find(entity => entity.name === 'FirstType')?.packageScope).toBe('First\\Space');
+    expect(result?.entities.find(entity => entity.name === 'SecondType')?.packageScope).toBe('Second\\Space');
+    expect(braced?.entities.find(entity => entity.name === 'User')?.packageScope).toBe('Vendor\\Package');
+    expect(braced?.entities.find(entity => entity.name === 'GlobalThing')?.packageScope).toBe('');
+  });
+
+  it('distinguishes function and constant imports from class imports', () => {
+    const result = parseFile(
+      '/repo/Imports.php',
+      `<?php
+use Vendor\\Package\\User;
+use function Vendor\\Package\\helper;
+use const Vendor\\Package\\FLAG;
+      `,
+    );
+
+    expect(result?.relationships.filter(rel => rel.predicate === 'IMPORTS')).toEqual([
+      {
+        srcName: 'Imports.php',
+        dstName: 'User',
+        predicate: 'IMPORTS',
+        importRaw: 'Vendor\\Package\\User',
+      },
+      {
+        srcName: 'Imports.php',
+        dstName: 'helper',
+        predicate: 'IMPORTS',
+        importRaw: 'Vendor\\Package\\helper',
+        importKind: 'function',
+      },
+      {
+        srcName: 'Imports.php',
+        dstName: 'FLAG',
+        predicate: 'IMPORTS',
+        importRaw: 'Vendor\\Package\\FLAG',
+        importKind: 'const',
+      },
+    ]);
+  });
+
+  it('distinguishes PHP constructors from function and member calls', () => {
+    const result = parseFile(
+      '/repo/Calls.php',
+      `<?php
+function run(Service $service): void {
+    new Service();
+    helper();
+    $service->execute();
+}
+      `,
+    );
+
+    expect(result?.relationships.filter(rel => rel.predicate === 'CALLS')).toEqual([
+      { srcName: 'run', dstName: 'Service', predicate: 'CALLS', phpCallKind: 'constructor' },
+      { srcName: 'run', dstName: 'helper', predicate: 'CALLS', phpCallKind: 'function' },
+      { srcName: 'run', dstName: 'Service.execute', predicate: 'CALLS', phpCallKind: 'member' },
+    ]);
+  });
+
   it('resolves calls through typed properties and method parameters', () => {
     const result = parseFile(
       '/repo/UseCase.php',
@@ -62,22 +139,24 @@ final class UseCase
     expect(result).not.toBeNull();
     expect(result!.relationships).toEqual(
       expect.arrayContaining([
-        { srcName: 'UseCase.create', dstName: 'DomainService.create', predicate: 'CALLS' },
-        { srcName: 'UseCase.create', dstName: 'Repository.create', predicate: 'CALLS' },
-        { srcName: 'UseCase.create', dstName: 'AuditLogger.write', predicate: 'CALLS' },
-        { srcName: 'UseCase.create', dstName: 'Logger.write', predicate: 'CALLS' },
-        { srcName: 'UseCase.create', dstName: 'UseCase.finish', predicate: 'CALLS' },
+        { srcName: 'UseCase.create', dstName: 'DomainService.create', predicate: 'CALLS', phpCallKind: 'member' },
+        { srcName: 'UseCase.create', dstName: 'Repository.create', predicate: 'CALLS', phpCallKind: 'member' },
+        { srcName: 'UseCase.create', dstName: 'AuditLogger.write', predicate: 'CALLS', phpCallKind: 'member' },
+        { srcName: 'UseCase.create', dstName: 'Logger.write', predicate: 'CALLS', phpCallKind: 'member' },
+        { srcName: 'UseCase.create', dstName: 'UseCase.finish', predicate: 'CALLS', phpCallKind: 'member' },
       ]),
     );
     expect(result!.relationships).not.toContainEqual({
       srcName: 'UseCase.create',
       dstName: 'create',
       predicate: 'CALLS',
+      phpCallKind: 'member',
     });
     expect(result!.relationships).not.toContainEqual({
       srcName: 'UseCase.create',
       dstName: 'UseCase.create',
       predicate: 'CALLS',
+      phpCallKind: 'member',
     });
   });
 
@@ -97,6 +176,7 @@ function run($service): void
       srcName: 'run',
       dstName: 'create',
       predicate: 'CALLS',
+      phpCallKind: 'member',
     });
   });
 
@@ -125,9 +205,9 @@ final class Nullable
     expect(result).not.toBeNull();
     expect(result!.relationships).toEqual(
       expect.arrayContaining([
-        { srcName: 'Nullable.run', dstName: 'Service.create', predicate: 'CALLS' },
-        { srcName: 'Nullable.run', dstName: 'Repository.find', predicate: 'CALLS' },
-        { srcName: 'Nullable.run', dstName: 'Logger.write', predicate: 'CALLS' },
+        { srcName: 'Nullable.run', dstName: 'Service.create', predicate: 'CALLS', phpCallKind: 'member' },
+        { srcName: 'Nullable.run', dstName: 'Repository.find', predicate: 'CALLS', phpCallKind: 'member' },
+        { srcName: 'Nullable.run', dstName: 'Logger.write', predicate: 'CALLS', phpCallKind: 'member' },
       ]),
     );
   });
@@ -149,8 +229,8 @@ function run(Service $service, ?Logger $logger): void
     expect(result).not.toBeNull();
     expect(result!.relationships).toEqual(
       expect.arrayContaining([
-        { srcName: 'run', dstName: 'Service.create', predicate: 'CALLS' },
-        { srcName: 'run', dstName: 'Logger.write', predicate: 'CALLS' },
+        { srcName: 'run', dstName: 'Service.create', predicate: 'CALLS', phpCallKind: 'member' },
+        { srcName: 'run', dstName: 'Logger.write', predicate: 'CALLS', phpCallKind: 'member' },
       ]),
     );
   });
@@ -176,6 +256,7 @@ final class Union
       srcName: 'Union.run',
       dstName: 'create',
       predicate: 'CALLS',
+      phpCallKind: 'member',
     });
   });
 });

@@ -134,12 +134,9 @@ export interface ParsedEntity {
   /** Direct enclosing class/interface/trait, if any (undefined for file-level entities). */
   container?: string;
   /**
-   * Package name for languages that group entities into namespaces (currently
-   * Go only). Used by downstream layers to prefix qualifiedName so the symbol
-   * table indexes entities under their fully-qualified path. Without this,
-   * bare-name resolution at edge-resolver collides between packages (e.g.
-   * kubernetes has 191 distinct `addKnownTypes` functions, one per API group)
-   * and CALL targets are picked non-deterministically.
+   * Package or namespace name for languages that group entities. Used by
+   * downstream resolution to distinguish identically named declarations and
+   * index entities under their fully-qualified path.
    */
   packageScope?: string;
 }
@@ -172,6 +169,12 @@ export interface ParsedRelationship {
   // that happens to flatten to the same stem ("core"). Absent on non-import rels
   // and on dotted/symbol imports where dstName is already the full identifier.
   importRaw?: string;
+  /** PHP namespace import category. Absent for all other languages. */
+  importKind?: 'type' | 'function' | 'const';
+  /** PHP aliases need binding metadata before exact FQCN resolution is safe. */
+  importAliased?: boolean;
+  /** PHP call shape used to distinguish constructors from same-named functions. */
+  phpCallKind?: 'constructor' | 'function' | 'member' | 'static';
   /**
    * JS/TS only: whether this identifier use is lexically bound to its matching
    * import. False means a parameter or local declaration shadows that import.
@@ -1983,6 +1986,23 @@ function unwrapRustCfgMacros(source: string): string {
 // Main parse function
 // ---------------------------------------------------------------------------
 
+function phpNamespaceForNode(rootNode: any, node: any): string | undefined {
+  for (let current = node.parent; current; current = current.parent) {
+    if (current.type === 'namespace_definition') {
+      return current.childForFieldName?.('name')?.text?.replace(/\s+/g, '') ?? '';
+    }
+  }
+
+  let active: string | undefined;
+  for (let i = 0; i < rootNode.namedChildCount; i++) {
+    const child = rootNode.namedChild(i);
+    if (!child || child.startIndex >= node.startIndex) break;
+    if (child.type !== 'namespace_definition' || child.childForFieldName?.('body')) continue;
+    active = child.childForFieldName?.('name')?.text?.replace(/\s+/g, '') ?? '';
+  }
+  return active;
+}
+
 export function parseFile(filePath: string, source: string): FileParseResult | null {
   const language = detectLanguageForSource(filePath, source);
   if (!language) return null;
@@ -2198,7 +2218,11 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
           lineEnd,
           language,
           container: effectiveContainer,
-          packageScope: goPackage,
+          packageScope: goPackage ?? (
+            language === SupportedLanguages.PHP
+              ? phpNamespaceForNode(tree.rootNode, defNode)
+              : undefined
+          ),
         });
 
         pendingChunks.push({
@@ -2456,8 +2480,26 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
           // Preserve the raw specifier (./core vs @nestjs/core) for the multi-repo
           // dependency gate; modName remains the flattened stem used everywhere else.
           const importRaw = unwrapImportSpecifier(importSource.node.text);
+          const importNode = match.captures.find((c: any) => c.name === 'import')?.node;
+          const phpImportText = language === SupportedLanguages.PHP ? importNode?.text ?? '' : '';
+          const importKind = language === SupportedLanguages.PHP
+            ? /^use\s+function\b/i.test(phpImportText)
+              ? 'function' as const
+              : /^use\s+const\b/i.test(phpImportText)
+                ? 'const' as const
+                : undefined
+            : undefined;
           entities.push({ name: modName, kind: 'module', lineStart: importSource.node.startPosition.row + 1, lineEnd: importSource.node.startPosition.row + 1, language });
-          relationships.push({ srcName: fileName, dstName: modName, predicate: 'IMPORTS', importRaw });
+          relationships.push({
+            srcName: fileName,
+            dstName: modName,
+            predicate: 'IMPORTS',
+            importRaw,
+            ...(importKind ? { importKind } : {}),
+            ...(language === SupportedLanguages.PHP && /\s+as\s+/i.test(phpImportText)
+              ? { importAliased: true }
+              : {}),
+          });
         }
         continue;
       }
@@ -2490,6 +2532,16 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
       if (callName) {
         const callee = callName.node.text;
         if (!callee || callee.length <= 1) continue;
+        const phpCallKind = language === SupportedLanguages.PHP
+          ? callName.node.parent?.type === 'object_creation_expression'
+            ? 'constructor' as const
+            : callName.node.parent?.type === 'member_call_expression' ||
+                callName.node.parent?.type === 'nullsafe_member_call_expression'
+              ? 'member' as const
+              : callName.node.parent?.type === 'scoped_call_expression'
+                ? 'static' as const
+                : 'function' as const
+          : undefined;
 
         // If a _qualifier capture is present (field_expression / stable_identifier
         // patterns like NodeKind.Decision, or Python attribute calls like
@@ -2662,9 +2714,15 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
           recordJsTsImportUse('CALLS', caller, effectiveCallee, callName.node, callee);
         }
 
-        if (!seen.has(effectiveCallee)) {
-          seen.add(effectiveCallee);
-          relationships.push({ srcName: caller, dstName: effectiveCallee, predicate: 'CALLS' });
+        const callKey = phpCallKind ? `${phpCallKind}:${effectiveCallee}` : effectiveCallee;
+        if (!seen.has(callKey)) {
+          seen.add(callKey);
+          relationships.push({
+            srcName: caller,
+            dstName: effectiveCallee,
+            predicate: 'CALLS',
+            ...(phpCallKind ? { phpCallKind } : {}),
+          });
         }
         continue;
       }
@@ -2804,6 +2862,7 @@ export interface ResolvedEdge {
   dstQualifiedKey: string;      // qualified key used for nodeId in the defining file
   predicate: string;            // "CALLS" | "EXTENDS"
   confidence: number;           // 0.9 import-scoped | 0.8 transitive | 0.5 global
+  phpCallKind?: ParsedRelationship['phpCallKind'];
 }
 
 // ---------------------------------------------------------------------------
@@ -2813,6 +2872,28 @@ export interface ResolvedEdge {
 /** Build the qualified key for an entity (mirrors buildPatch's entityQKey logic). */
 function qualifiedKey(e: ParsedEntity): string {
   return e.container ? `${e.container}.${e.name}` : e.name;
+}
+
+const PHP_TYPE_KINDS = new Set(['class', 'interface', 'trait', 'enum']);
+
+function phpTypeFqcn(entity: ParsedEntity): string | undefined {
+  if (entity.language !== SupportedLanguages.PHP || !PHP_TYPE_KINDS.has(entity.kind) || entity.container) {
+    return undefined;
+  }
+  const namespace = entity.packageScope?.replace(/^\\+|\\+$/g, '');
+  return `${namespace ? `${namespace}\\` : ''}${entity.name}`.toLowerCase();
+}
+
+function ambiguousPhpTypeNames(entities: ParsedEntity[]): Set<string> {
+  const counts = new Map<string, number>();
+  for (const entity of entities) {
+    if (entity.language !== SupportedLanguages.PHP || !PHP_TYPE_KINDS.has(entity.kind) || entity.container) {
+      continue;
+    }
+    const name = entity.name.toLowerCase();
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  return new Set([...counts].filter(([, count]) => count > 1).map(([name]) => name));
 }
 
 /**
@@ -2831,6 +2912,24 @@ function bestQKey(
   return qks.length === 1 ? qks[0] : null;
 }
 
+function bestPhpQKey(
+  fileQKeys: Map<string, Map<string, string[]>>,
+  filePath: string,
+  plainName: string,
+  preferredQKey?: string,
+): string | null {
+  const qks = [...new Set(
+    [...(fileQKeys.get(filePath) ?? [])]
+      .filter(([name]) => name.toLowerCase() === plainName.toLowerCase())
+      .flatMap(([, keys]) => keys),
+  )];
+  if (preferredQKey) {
+    const preferred = qks.find(key => key.toLowerCase() === preferredQKey.toLowerCase());
+    if (preferred) return preferred;
+  }
+  return qks.length === 1 ? qks[0] : null;
+}
+
 // ---------------------------------------------------------------------------
 // Global resolution index — pre-scan for cross-batch edge resolution
 // ---------------------------------------------------------------------------
@@ -2845,6 +2944,7 @@ export interface GlobalResolutionIndex {
   packageToFiles:   Map<string, string[]>;
   goPkgDirToFiles:  Map<string, string[]>;
   goPkgPathToFiles: Map<string, string[]>;
+  phpFqcnToTypes?:  Map<string, Array<{ filePath: string; typeName: string }>>;
 }
 
 /**
@@ -2869,6 +2969,7 @@ export function buildGlobalResolutionIndex(
   const packageToFiles = new Map<string, string[]>();
   const goPkgDirToFiles = new Map<string, string[]>();
   const goPkgPathToFiles = new Map<string, string[]>();
+  const phpFqcnToTypes = new Map<string, Array<{ filePath: string; typeName: string }>>();
 
   for (const fp of filePaths) {
     const ext = nodePath.extname(fp);
@@ -3025,11 +3126,20 @@ export function buildGlobalResolutionIndex(
       const parsed = preParsed?.get(fp) ?? parseFile(fp, src);
       if (!parsed) continue;
       const qkMap = new Map<string, string[]>();
+      const ambiguousTypes = ambiguousPhpTypeNames(parsed.entities);
       for (const e of parsed.entities) {
         if (e.kind === 'file' || e.kind === 'module') continue;
         const list = qkMap.get(e.name) ?? [];
         list.push(qualifiedKey(e));
         qkMap.set(e.name, list);
+        const fqcn = phpTypeFqcn(e);
+        if (fqcn && !ambiguousTypes.has(e.name.toLowerCase())) {
+          const entries = phpFqcnToTypes.get(fqcn) ?? [];
+          if (!entries.some(entry => entry.filePath === fp && entry.typeName === e.name)) {
+            entries.push({ filePath: fp, typeName: e.name });
+          }
+          phpFqcnToTypes.set(fqcn, entries);
+        }
       }
       if (qkMap.size > 0) {
         fileQKeys.set(fp, qkMap);
@@ -3078,6 +3188,7 @@ export function buildGlobalResolutionIndex(
     packageToFiles,
     goPkgDirToFiles,
     goPkgPathToFiles,
+    phpFqcnToTypes,
   };
 }
 
@@ -3200,6 +3311,26 @@ export function resolveEdges(
       let m = callBindings.get(r.filePath);
       if (!m) { m = new Map(); callBindings.set(r.filePath, m); }
       if (!m.has(b.local)) m.set(b.local, b.imported);
+    }
+  }
+  const phpFqcnImportsByLocal = new Map<string, Map<string, string | null>>();
+  for (const result of results) {
+    if (result.language !== SupportedLanguages.PHP) continue;
+    for (const rel of result.relationships) {
+      if (
+        rel.predicate !== 'IMPORTS' ||
+        rel.importKind === 'function' ||
+        rel.importKind === 'const' ||
+        rel.importAliased ||
+        typeof rel.importRaw !== 'string'
+      ) continue;
+      const fqcn = rel.importRaw.replace(/^\\+/, '').toLowerCase();
+      const local = fqcn.split('\\').pop();
+      if (!local) continue;
+      const imports = phpFqcnImportsByLocal.get(result.filePath) ?? new Map<string, string | null>();
+      if (!imports.has(local)) imports.set(local, fqcn);
+      else if (imports.get(local) !== fqcn) imports.set(local, null);
+      phpFqcnImportsByLocal.set(result.filePath, imports);
     }
   }
   // Cross-repo dependency graph: repo R depends on repo D when any file in R
@@ -3337,6 +3468,24 @@ export function resolveEdges(
   const fileHasSymbol = new Map<string, Set<string>>();
   for (const [fp, qkMap] of fileQKeys) {
     fileHasSymbol.set(fp, new Set(qkMap.keys()));
+  }
+
+  const phpFqcnToTypes = new Map<string, Array<{ filePath: string; typeName: string }>>();
+  for (const [fqcn, entries] of globalIndex?.phpFqcnToTypes ?? []) {
+    phpFqcnToTypes.set(fqcn, [...entries]);
+  }
+  for (const result of results) {
+    if (result.language !== SupportedLanguages.PHP) continue;
+    const ambiguousTypes = ambiguousPhpTypeNames(result.entities);
+    for (const entity of result.entities) {
+      const fqcn = phpTypeFqcn(entity);
+      if (!fqcn || ambiguousTypes.has(entity.name.toLowerCase())) continue;
+      const entries = phpFqcnToTypes.get(fqcn) ?? [];
+      if (!entries.some(entry => entry.filePath === result.filePath && entry.typeName === entity.name)) {
+        entries.push({ filePath: result.filePath, typeName: entity.name });
+      }
+      phpFqcnToTypes.set(fqcn, entries);
+    }
   }
 
   // resultsByPath: O(1) lookup replacing results.find() in transitive import loop
@@ -3847,6 +3996,28 @@ export function resolveEdges(
     );
   }
 
+  function importedPhpType(srcFilePath: string, rel: ParsedRelationship): {
+    entries: Array<{ filePath: string; typeName: string }>;
+    memberName?: string;
+  } | undefined {
+    if (rel.predicate === 'IMPORTS' && (rel.importKind === 'function' || rel.importKind === 'const')) {
+      return undefined;
+    }
+    const parts = rel.dstName.split('.');
+    if (rel.predicate === 'CALLS' && parts.length === 1 && rel.phpCallKind !== 'constructor') {
+      return undefined;
+    }
+    const imports = phpFqcnImportsByLocal.get(srcFilePath);
+    const local = parts[0].toLowerCase();
+    if (!imports?.has(local)) return undefined;
+    const fqcn = imports.get(local);
+    if (!fqcn) return { entries: [] };
+    return {
+      entries: phpFqcnToTypes.get(fqcn) ?? [],
+      memberName: parts.length > 1 ? parts[parts.length - 1] : undefined,
+    };
+  }
+
   const resolved: ResolvedEdge[] = [];
 
   for (const result of results) {
@@ -3860,6 +4031,13 @@ export function resolveEdges(
     for (const rel of result.relationships) {
       if (rel.predicate !== 'IMPORTS') continue;
       if (pythonHasRelativeModuleImport && rel.importRaw === undefined) continue;
+      const phpType = srcLanguage === SupportedLanguages.PHP
+        ? importedPhpType(srcFilePath, rel)
+        : undefined;
+      if (phpType) {
+        for (const entry of phpType.entries) importedFilePaths.add(entry.filePath);
+        continue;
+      }
       for (const fp of resolveImportTargets(srcFilePath, srcLanguage, rel.dstName, rel.importRaw)) {
         importedFilePaths.add(fp);
       }
@@ -3888,6 +4066,27 @@ export function resolveEdges(
       // name ("ClaimId"), find files registered under that package, then find
       // the one that defines the entity.
       if (rel.predicate === 'IMPORTS') {
+        const phpType = srcLanguage === SupportedLanguages.PHP
+          ? importedPhpType(srcFilePath, rel)
+          : undefined;
+        if (phpType) {
+          if (phpType.entries.length === 1) {
+            const fp = phpType.entries[0].filePath;
+            resolved.push({
+              srcFilePath,
+              srcName: rel.srcName,
+              dstFilePath: fp,
+              dstName: rel.dstName,
+              dstQualifiedKey: fileEntityName(fp),
+              predicate: 'IMPORTS',
+              confidence: 0.9,
+            });
+            stats.resolvedImport++;
+          } else if (phpType.entries.length > 1) {
+            stats.skippedAmbiguous++;
+          }
+          continue;
+        }
         if (result.language === SupportedLanguages.Scala || result.language === SupportedLanguages.Java) {
           const dstName = rel.dstName;
           const lastDot = dstName.lastIndexOf('.');
@@ -3957,6 +4156,36 @@ export function resolveEdges(
         // symbol resolution so the edge connects to the actual class node rather than a file.
         if (srcLanguage !== SupportedLanguages.Python || !/^[A-Z]/.test(rel.dstName)) continue;
         // fall through to Tier 1b → Tier 2 → Tier 3 below
+      }
+
+      const phpType = srcLanguage === SupportedLanguages.PHP
+        ? importedPhpType(srcFilePath, rel)
+        : undefined;
+      if (phpType) {
+        if (phpType.entries.length === 1) {
+          const entry = phpType.entries[0];
+          const plainName = phpType.memberName ?? entry.typeName;
+          const preferredQKey = phpType.memberName
+            ? `${entry.typeName}.${phpType.memberName}`
+            : entry.typeName;
+          const dstQualifiedKey = bestPhpQKey(fileQKeys, entry.filePath, plainName, preferredQKey);
+          if (dstQualifiedKey !== null) {
+            resolved.push({
+              srcFilePath,
+              srcName: rel.srcName,
+              dstFilePath: entry.filePath,
+              dstName: rel.dstName,
+              dstQualifiedKey,
+              predicate: rel.predicate,
+              confidence: 0.9,
+              ...(rel.phpCallKind ? { phpCallKind: rel.phpCallKind } : {}),
+            });
+            stats.resolvedQualifier++;
+          }
+        } else if (phpType.entries.length > 1) {
+          stats.skippedAmbiguous++;
+        }
+        continue;
       }
 
       const origDstName = rel.dstName;
