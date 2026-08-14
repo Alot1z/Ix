@@ -1,9 +1,11 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { Command } from "commander";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createIxMcpServer, type IxRunner } from "../../mcp/server.js";
+import { createInProcessRunner } from "../../mcp/runner.js";
 
 const clients: Client[] = [];
 
@@ -50,6 +52,33 @@ describe("ix mcp structured output", () => {
     // the raw text still carries the answer.
     expect(result.structuredContent).toEqual({});
     expect(result.content[0]).toEqual({ type: "text", text: "not json at all" });
+  });
+
+  it("returns an MCP error without structured content when in-process output is truncated", async () => {
+    const runIx = createInProcessRunner({
+      maxOutputBytes: 100,
+      createProgram: () => {
+        const program = new Command();
+        program
+          .command("map")
+          .option("--format <format>")
+          .action(() => console.log(JSON.stringify({ payload: "x".repeat(500) })));
+        return program;
+      },
+    });
+    const client = await connect(runIx);
+
+    const result = (await client.callTool({ name: "ix_map", arguments: {} })) as CallToolResult;
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toBeUndefined();
+    const content = result.content[0];
+    expect(content?.type).toBe("text");
+    const error = JSON.parse(content?.type === "text" ? content.text : "{}");
+    expect(error).toEqual({
+      error: "[ix mcp] output exceeded 100 bytes and was truncated",
+      tool: "ix_map",
+    });
   });
 
   it("exposes the filtered smell candidates as structuredContent", async () => {

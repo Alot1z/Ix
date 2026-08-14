@@ -403,7 +403,7 @@ describe("in-process ix runner", () => {
     });
   });
 
-  it("truncates output instead of growing the server heap without bound", async () => {
+  it("fails the run when output is truncated to protect the server heap", async () => {
     const run = createInProcessRunner({
       createProgram: createTestProgram,
       maxOutputBytes: 500,
@@ -411,6 +411,7 @@ describe("in-process ix runner", () => {
 
     const result = await run(["flood"]);
 
+    expect(result.ok).toBe(false);
     expect(result.stdout.length).toBeLessThanOrEqual(500);
     expect(result.stderr).toContain("exceeded 500 bytes and was truncated");
   });

@@ -468,7 +468,7 @@ async function executeInProcess(
     }
   }
 
-  const ok = failure === null && (commandExitCode === undefined || commandExitCode === 0);
+  const ok = !run.truncated && failure === null && (commandExitCode === undefined || commandExitCode === 0);
   return {
     ok,
     stdout: run.stdout.join(""),
