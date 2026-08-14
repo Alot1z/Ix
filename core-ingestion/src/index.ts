@@ -2489,6 +2489,15 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
                 ? 'const' as const
                 : undefined
             : undefined;
+          // Alias detection is per *clause*, not per statement. `use A\B, C\D as E;`
+          // is one declaration with two clauses, so testing the statement text
+          // flagged the un-aliased clause too and silently disabled FQCN
+          // resolution for it. Reading the node also drops an unanchored
+          // /\s+as\s+/ over repo-controlled text, which backtracks quadratically.
+          const phpUseClause = importSource.node.parent;
+          const phpImportAliased = language === SupportedLanguages.PHP
+            && phpUseClause?.type === 'namespace_use_clause'
+            && phpUseClause.namedChildCount > 1;
           entities.push({ name: modName, kind: 'module', lineStart: importSource.node.startPosition.row + 1, lineEnd: importSource.node.startPosition.row + 1, language });
           relationships.push({
             srcName: fileName,
@@ -2496,9 +2505,7 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
             predicate: 'IMPORTS',
             importRaw,
             ...(importKind ? { importKind } : {}),
-            ...(language === SupportedLanguages.PHP && /\s+as\s+/i.test(phpImportText)
-              ? { importAliased: true }
-              : {}),
+            ...(phpImportAliased ? { importAliased: true } : {}),
           });
         }
         continue;

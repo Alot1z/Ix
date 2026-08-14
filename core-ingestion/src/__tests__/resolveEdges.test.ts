@@ -294,6 +294,69 @@ class User { public function save(): void {} }
     expect(edges).toHaveLength(3);
   });
 
+  it('does not emit a phantom import for a PHP alias name', () => {
+    // The alias is a sibling (name) of the (qualified_name) inside the clause,
+    // so an unanchored capture treated `Admin` as a second imported module and
+    // matched it against an unrelated class of that name.
+    const consumer = parseFile(
+      '/repo/Consumer.php',
+      `<?php
+use Vendor\\Package\\User as Admin;
+function run(Admin $a): void { new Admin(); $a->save(); }
+      `,
+    )!;
+    const unrelated = parseFile(
+      '/repo/Admin.php',
+      '<?php class Admin { public function save(): void {} }',
+    )!;
+    const intended = parseFile(
+      '/repo/Vendor/Package/User.php',
+      '<?php namespace Vendor\\Package; class User { public function save(): void {} }',
+    )!;
+
+    const edges = resolveEdges([consumer, unrelated, intended]);
+
+    expect(
+      edges.filter(
+        (edge) => edge.predicate === 'IMPORTS' && edge.dstFilePath === '/repo/Admin.php',
+      ),
+    ).toEqual([]);
+    expect(
+      edges.filter((edge) => edge.dstFilePath === '/repo/Admin.php' && edge.confidence === 0.9),
+    ).toEqual([]);
+  });
+
+  it('resolves an un-aliased clause in a comma-separated PHP use statement', () => {
+    // `importAliased` was derived from the whole statement, so one alias
+    // anywhere in the list disabled FQCN resolution for every clause.
+    const consumer = parseFile(
+      '/repo/Consumer.php',
+      `<?php
+use Vendor\\One\\Alpha, Vendor\\Two\\Beta as Bee;
+function run(Alpha $a): void { new Alpha(); }
+      `,
+    )!;
+    const intended = parseFile(
+      '/repo/Vendor/One/Alpha.php',
+      '<?php namespace Vendor\\One; class Alpha {}',
+    )!;
+    const decoy = parseFile(
+      '/repo/Other/Alpha.php',
+      '<?php namespace Other\\Place; class Alpha {}',
+    )!;
+
+    const edges = resolveEdges([consumer, intended, decoy]);
+
+    expect(
+      edges.filter(
+        (edge) => edge.predicate === 'IMPORTS'
+          && edge.dstFilePath === '/repo/Vendor/One/Alpha.php'
+          && edge.confidence === 0.9,
+      ),
+    ).toHaveLength(1);
+    expect(edges.filter((edge) => edge.dstFilePath === '/repo/Other/Alpha.php')).toEqual([]);
+  });
+
   it('resolves PHP class imports, references, and calls by exact FQCN', () => {
     const consumer = parseFile(
       '/repo/Consumer.php',
