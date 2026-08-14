@@ -132,9 +132,33 @@ function parseJsonc(text: string): unknown {
   return JSON.parse(normalized);
 }
 
+/**
+ * Config files are read while the resolver is built, which happens *before*
+ * ingestion's own size gate, so they need their own. Mirrors `MAX_FILE_BYTES`
+ * in `ingest.ts`: anything larger is not a tsconfig, and parsing one is how a
+ * 64 MB JSONC file takes the process out with an uncatchable OOM.
+ */
+const MAX_CONFIG_BYTES = 1024 * 1024;
+
 function readObject(filePath: string): Record<string, unknown> | undefined {
   try {
-    const parsed = parseJsonc(fs.readFileSync(filePath, "utf8"));
+    // Open once and fstat the same handle so the checks and the read observe the
+    // same inode — no stat-then-read window (CodeQL js/file-system-race). This is
+    // the pattern ingest.ts already uses.
+    const handle = fs.openSync(filePath, "r");
+    let text: string;
+    try {
+      const stats = fs.fstatSync(handle);
+      // `openSync` follows symlinks, so fstat describes the *target*. Refusing
+      // anything that is not a regular file is what stops a link to /dev/zero
+      // (unbounded read) or a FIFO (blocks the event loop forever) — neither of
+      // which a size check catches, since both report size 0.
+      if (!stats.isFile() || stats.size > MAX_CONFIG_BYTES) return undefined;
+      text = fs.readFileSync(handle, "utf8");
+    } finally {
+      fs.closeSync(handle);
+    }
+    const parsed = parseJsonc(text);
     return parsed && typeof parsed === "object" && !Array.isArray(parsed)
       ? (parsed as Record<string, unknown>)
       : undefined;
@@ -149,10 +173,21 @@ function readObject(filePath: string): Record<string, unknown> | undefined {
  * reads each one and `readObject` already reports an unreadable file as
  * `undefined`, so there is no check-then-use window (CodeQL js/file-system-race).
  */
-function resolveExtends(configPath: string, value: unknown): string[] {
+function resolveExtends(workspaceRoot: string, configPath: string, value: unknown): string[] {
   if (typeof value !== "string" || !value.startsWith(".")) return [];
   const unresolved = nodePath.resolve(nodePath.dirname(configPath), value);
-  return [unresolved, `${unresolved}.json`, nodePath.join(unresolved, "tsconfig.json")];
+  return [unresolved, `${unresolved}.json`, nodePath.join(unresolved, "tsconfig.json")].filter(
+    // `startsWith(".")` is not containment: `nodePath.resolve` clamps at the
+    // filesystem root, so "../../../../../../.." names any absolute path from
+    // any depth. The config is repo content, so without this an ingested repo
+    // chooses which files on the machine get read.
+    (candidate) => isWithinWorkspace(workspaceRoot, candidate),
+  );
+}
+
+function isWithinWorkspace(workspaceRoot: string, candidate: string): boolean {
+  const relative = nodePath.relative(nodePath.resolve(workspaceRoot), candidate);
+  return relative !== "" && !relative.startsWith("..") && !nodePath.isAbsolute(relative);
 }
 
 function loadConfig(
@@ -174,7 +209,7 @@ function loadConfig(
   }
 
   let parent: LoadedConfig | undefined;
-  for (const candidate of resolveExtends(absoluteConfig, raw.extends)) {
+  for (const candidate of resolveExtends(workspaceRoot, absoluteConfig, raw.extends)) {
     parent = loadConfig(workspaceRoot, candidate, cache, loading);
     if (parent) break;
   }

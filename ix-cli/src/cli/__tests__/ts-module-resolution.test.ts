@@ -1,6 +1,6 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -166,6 +166,64 @@ describe("createTypeScriptModuleResolver", () => {
 
     expect(resolve("src/consumer.ts", "@core/thing")).toEqual(["src/@core/thing.ts"]);
   });
+
+  it("ignores a config larger than the size cap instead of parsing it", () => {
+    // The resolver is built before ingestion's MAX_FILE_BYTES gate, so a repo
+    // could hand it a 64 MB JSONC file and take the process out with an
+    // uncatchable OOM. Small here; the cap is what is under test.
+    const root = workspace();
+    const config = write(
+      root,
+      "tsconfig.json",
+      `{/*${"a".repeat(1024 * 1024 + 16)}*/"compilerOptions":{"paths":{"@core":["src/worker"]}}}`,
+    );
+    const consumer = write(root, "src/consumer.ts");
+    const worker = write(root, "src/worker.ts");
+    const resolve = createTypeScriptModuleResolver(root, [config, consumer, worker]);
+
+    // Config ignored entirely -> no mapping, and no opinion.
+    expect(resolve("src/consumer.ts", "@core")).toBeUndefined();
+  });
+
+  it("refuses an extends that escapes the workspace", () => {
+    // `startsWith(".")` is not containment: resolve() clamps at the filesystem
+    // root, so enough `..` segments name any absolute path.
+    const root = workspace();
+    const outside = mkdtempSync(join(tmpdir(), "ix-outside-"));
+    workspaces.push(outside);
+    writeFileSync(
+      join(outside, "tsconfig.json"),
+      JSON.stringify({ compilerOptions: { paths: { "@evil": ["target"] } } }),
+    );
+    const escape = relative(root, join(outside, "tsconfig.json")).split(sep).join("/");
+    const config = write(root, "tsconfig.json", JSON.stringify({ extends: `./${escape}` }));
+    const consumer = write(root, "src/consumer.ts");
+    const target = write(root, "target.ts");
+    const resolve = createTypeScriptModuleResolver(root, [config, consumer, target]);
+
+    expect(resolve("src/consumer.ts", "@evil")).toBeUndefined();
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "refuses an extends that reaches a device node through a symlink",
+    () => {
+      // Containment alone does not cover this: the link sits inside the
+      // workspace and only the *target* is a character device, which reports
+      // size 0 and would read forever.
+      const root = workspace();
+      const link = join(root, "linked.json");
+      try {
+        symlinkSync("/dev/zero", link);
+      } catch {
+        return; // no permission to symlink (e.g. restricted CI) — nothing to assert
+      }
+      const config = write(root, "tsconfig.json", JSON.stringify({ extends: "./linked.json" }));
+      const consumer = write(root, "src/consumer.ts");
+      const resolve = createTypeScriptModuleResolver(root, [config, consumer, link]);
+
+      expect(resolve("src/consumer.ts", "@core")).toBeUndefined();
+    },
+  );
 
   it("follows a relative extends that names a directory", () => {
     // Previously an existsSync probe stopped at the directory itself and never
