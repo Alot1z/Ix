@@ -287,6 +287,115 @@ describe('resolveEdges', () => {
     });
   });
 
+  it('prefers configured JS/TS module targets over unrelated stem matches', () => {
+    const consumer = parseFile(
+      '/repo/src/consumer.ts',
+      'import { execute } from "@core";\nexport function run() { return execute(); }\n',
+    )!;
+    const intended = parseFile(
+      '/repo/src/adapters/worker.ts',
+      'export function execute() { return "worker"; }\n',
+    )!;
+    const unrelated = parseFile(
+      '/repo/legacy/core.ts',
+      'export function execute() { return "legacy"; }\n',
+    )!;
+
+    const resolved = resolveEdges([consumer, intended, unrelated], undefined, undefined, {
+      resolveModuleSpecifier: (_source, specifier) =>
+        specifier === '@core' ? ['/repo/src/adapters/worker.ts'] : undefined,
+    });
+
+    expect(resolved).toContainEqual(expect.objectContaining({
+      srcFilePath: '/repo/src/consumer.ts',
+      dstFilePath: '/repo/src/adapters/worker.ts',
+      predicate: 'IMPORTS',
+      confidence: 0.9,
+    }));
+    expect(resolved).toContainEqual(expect.objectContaining({
+      srcFilePath: '/repo/src/consumer.ts',
+      dstFilePath: '/repo/src/adapters/worker.ts',
+      predicate: 'CALLS',
+      confidence: 0.9,
+    }));
+    expect(resolved.some(edge => edge.dstFilePath === '/repo/legacy/core.ts')).toBe(false);
+  });
+
+  it('uses mapped runtime files for calls and declaration files for references', () => {
+    const consumer = parseFile(
+      '/repo/src/consumer.ts',
+      'import { run, type Foo } from "@pkg";\n'
+        + 'export function call() { return run(); }\n'
+        + 'export function use(value: Foo) { return value; }\n',
+    )!;
+    const runtime = parseFile('/repo/lib/index.js', 'export function run() { return 1; }\n')!;
+    const declarations = parseFile('/repo/lib/index.d.ts', 'export interface Foo { id: string; }\n')!;
+
+    const resolved = resolveEdges([consumer, runtime, declarations], undefined, undefined, {
+      resolveModuleSpecifier: (_source, _specifier, kind) =>
+        kind === 'types' ? ['/repo/lib/index.d.ts'] : ['/repo/lib/index.js'],
+    });
+
+    expect(resolved).toContainEqual(expect.objectContaining({
+      dstFilePath: '/repo/lib/index.js',
+      predicate: 'CALLS',
+      confidence: 0.9,
+    }));
+    expect(resolved).toContainEqual(expect.objectContaining({
+      dstFilePath: '/repo/lib/index.d.ts',
+      predicate: 'REFERENCES',
+      confidence: 0.9,
+    }));
+  });
+
+  it('does not fall back to a stem when a configured JS/TS import is unresolved', () => {
+    const consumer = parseFile(
+      '/repo/src/consumer.ts',
+      'import { execute } from "@core";\nexport function run() { return execute(); }\n',
+    )!;
+    const unrelated = parseFile(
+      '/repo/legacy/core.ts',
+      'export function execute() { return "legacy"; }\n',
+    )!;
+
+    expect(resolveEdges([consumer, unrelated], undefined, undefined, {
+      resolveModuleSpecifier: () => [],
+    })).toEqual([]);
+  });
+
+  it('keeps transitive resolution when a configured module target is a barrel', () => {
+    const consumer = parseFile(
+      '/repo/app/consumer.ts',
+      'import { execute } from "@pkg";\nexport function run() { return execute(); }\n',
+    )!;
+    const barrel = parseFile(
+      '/repo/pkg/index.ts',
+      'export { execute } from "./worker.js";\n',
+    )!;
+    const worker = parseFile(
+      '/repo/pkg/worker.ts',
+      'export function execute() { return "worker"; }\n',
+    )!;
+
+    const resolved = resolveEdges([consumer, barrel, worker], undefined, undefined, {
+      resolveModuleSpecifier: (_source, specifier) =>
+        specifier === '@pkg' ? ['/repo/pkg/index.ts'] : undefined,
+    });
+
+    expect(resolved).toContainEqual(expect.objectContaining({
+      srcFilePath: '/repo/app/consumer.ts',
+      dstFilePath: '/repo/pkg/index.ts',
+      predicate: 'IMPORTS',
+      confidence: 0.9,
+    }));
+    expect(resolved).toContainEqual(expect.objectContaining({
+      srcFilePath: '/repo/app/consumer.ts',
+      dstFilePath: '/repo/pkg/worker.ts',
+      predicate: 'CALLS',
+      confidence: 0.8,
+    }));
+  });
+
   it('resolves a call through a provider export alias', () => {
     const provider = parseFile(
       '/repo/provider.ts',

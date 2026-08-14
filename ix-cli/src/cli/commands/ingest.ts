@@ -20,6 +20,7 @@ import { detectSystem, repoWorkspaceIdFor, lookupPackage, readPackageNames, read
 import { CLIENT_EXPECTED_SCHEMA_VERSION } from '../backend-status.js';
 import { SUPPORTED_EXTENSIONS } from '../supported-extensions.js';
 import { canRenderProgress } from '../stderr.js';
+import { createTypeScriptModuleResolver } from '../ts-module-resolution.js';
 import {
   deterministicId,
   transformIssue,
@@ -770,7 +771,7 @@ export async function ingestFiles(
   const packageRegistry = detectedSystem?.packageRegistry ?? {};
   const packageOf = (mod: string): string | undefined => lookupPackage(packageRegistry, mod);
   const declaredRepoDeps = detectedSystem?.repoDeps;
-  const resolveOpts = systemId ? { repoOf, packageOf, declaredRepoDeps } : undefined;
+  const crossRepoResolveOpts = systemId ? { repoOf, packageOf, declaredRepoDeps } : undefined;
 
   // ── Path-2 separate-ingest stitcher (Ix#225 Half A) ──────────────────
   // Co-ingest already forms cross-repo edges in-batch, so the stitcher only runs
@@ -1043,6 +1044,10 @@ export async function ingestFiles(
         ? (isSupportedSourceFile(resolvedPath) ? [resolvedPath] : [])
         : (tryGitLsFiles(resolvedPath, opts.recursive ?? true) ?? Array.from(walkFiles(resolvedPath, opts.recursive ?? true))),
     );
+    const resolveOpts = {
+      ...crossRepoResolveOpts,
+      resolveModuleSpecifier: createTypeScriptModuleResolver(workspaceRoot, filePaths),
+    };
 
     filesDiscovered = filePaths.length;
     const discovered = performance.now();
