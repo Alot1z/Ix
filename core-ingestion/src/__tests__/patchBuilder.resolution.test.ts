@@ -427,4 +427,29 @@ describe('multi-repo co-ingest identity convergence', () => {
 
     expect(callsDst).toBe(svcbUtilNode);
   });
+
+  it('emits one edge when two PHP call kinds resolve to the same node', () => {
+    // `log()` and `Logger::log()` are two relationships once phpCallKind splits
+    // the dedup key. Both resolve to the same member here, so salting the edge
+    // id by call kind would mint two ids for one edge — and the dedup
+    // downstream keys on id, so both would commit.
+    const consumer = parseFile(
+      '/repo/Caller.php',
+      `<?php
+use Vendor\\Package\\Logger;
+function handler(): void { log(); Logger::log(); }
+`,
+    )!;
+    const logger = parseFile(
+      '/repo/Vendor/Package/Logger.php',
+      '<?php namespace Vendor\\Package; class Logger { public static function log(): void {} }',
+    )!;
+
+    const patch = buildPatchWithResolution(consumer, 'hash', '', resolveEdges([consumer, logger]));
+    const callEdges = patch.ops.filter(
+      (op) => op.type === 'UpsertEdge' && op.predicate === 'CALLS',
+    );
+
+    expect(callEdges).toHaveLength(1);
+  });
 });

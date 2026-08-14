@@ -357,6 +357,37 @@ function run(Alpha $a): void { new Alpha(); }
     expect(edges.filter((edge) => edge.dstFilePath === '/repo/Other/Alpha.php')).toEqual([]);
   });
 
+  it('does not leak a PHP use across braced namespace blocks', () => {
+    // `use` is scoped to its namespace block. `go` lives in namespace B, which
+    // declares its own Thing, so it must not resolve to the Thing imported by
+    // namespace A.
+    const consumer = parseFile(
+      '/repo/Multi.php',
+      `<?php
+namespace A {
+    use Vendor\\Package\\Thing;
+    function run(Thing $t): void { new Thing(); }
+}
+namespace B {
+    class Thing {}
+    function go(Thing $t): void { new Thing(); }
+}
+`,
+    )!;
+    const vendor = parseFile(
+      '/repo/Vendor/Package/Thing.php',
+      '<?php namespace Vendor\\Package; class Thing {}',
+    )!;
+
+    const edges = resolveEdges([consumer, vendor]);
+
+    expect(
+      edges.filter(
+        (edge) => edge.srcName === 'go' && edge.dstFilePath === '/repo/Vendor/Package/Thing.php',
+      ),
+    ).toEqual([]);
+  });
+
   it('resolves PHP class imports, references, and calls by exact FQCN', () => {
     const consumer = parseFile(
       '/repo/Consumer.php',

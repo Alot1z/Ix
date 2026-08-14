@@ -617,6 +617,7 @@ export function buildPatchWithResolution(
   }
 
   const seenExternalNodes2 = new Set<string>();
+  const emittedEdgeIdentities = new Set<string>();
   const relationshipShapeCounts = new Map<string, number>();
   for (const relationship of relationships) {
     const key = `${relationship.srcName}:${relationship.predicate}:${relationship.dstName}`;
@@ -665,6 +666,14 @@ export function buildPatchWithResolution(
     const edgeDstKey = r.phpCallKind && (relationshipShapeCounts.get(baseResolutionKey) ?? 0) > 1
       ? `${dstKey}:${r.phpCallKind}`
       : dstKey;
+    // The phpCallKind salt above exists so `foo()` and `Bar::foo()` keep distinct
+    // ids when they resolve to *different* targets. When they resolve to the same
+    // node it instead mints two ids for one edge, and since the dedup downstream
+    // keys on id, both commit. An edge is identified by (src, dst, predicate) —
+    // two of those with empty attrs are indistinguishable in the graph.
+    const edgeIdentity = `${nodeId(idPath, srcKey)} ${dstNodeId} ${r.predicate}`;
+    if (emittedEdgeIdentities.has(edgeIdentity)) continue;
+    emittedEdgeIdentities.add(edgeIdentity);
     ops.push({
       type: 'UpsertEdge',
       id: edgeId(idPath, srcKey, edgeDstKey, r.predicate),

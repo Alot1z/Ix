@@ -3332,6 +3332,18 @@ export function resolveEdges(
   const phpFqcnImportsByLocal = new Map<string, Map<string, string | null>>();
   for (const result of results) {
     if (result.language !== SupportedLanguages.PHP) continue;
+    // A `use` is scoped to its namespace *block*, but this index is per file.
+    // In a file with several braced namespaces, an import in one block would be
+    // applied to the others — resolving a name that a later block declares
+    // itself, and pointing it confidently at the wrong file. One namespace per
+    // file is the PSR-12 norm, so skip the rare multi-block file entirely
+    // rather than mis-resolve it; it simply keeps the pre-existing behaviour.
+    const namespaceScopes = new Set(
+      result.entities
+        .filter(entity => entity.kind !== 'file' && typeof entity.packageScope === 'string')
+        .map(entity => entity.packageScope as string),
+    );
+    if (namespaceScopes.size > 1) continue;
     for (const rel of result.relationships) {
       if (
         rel.predicate !== 'IMPORTS' ||
