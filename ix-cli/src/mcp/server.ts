@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { CallToolResult, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { contextBundleSchema } from "../cli/context-bundle-schema.js";
 
 import {
   createProtocolStdout,
@@ -45,6 +46,7 @@ export const IX_MCP_OSS_TOOL_NAMES = [
   "ix_stats",
   "ix_subsystems",
   "ix_history",
+  "ix_context",
   "ix_ingest",
 ] as const;
 
@@ -132,6 +134,9 @@ const TOOL_ANNOTATIONS: Record<(typeof IX_MCP_TOOL_NAMES)[number], ToolAnnotatio
   ix_subsystems: { ...READ_ONLY, title: "List graph-derived subsystems" },
   ix_history: { ...READ_ONLY, title: "Show provenance and patch history" },
   ix_ingest: { ...WRITE_OPEN_WORLD, title: "Ingest a path or GitHub repository into the graph" },
+  // Reads the graph and composes a bundle; the CLI's --save and --out, which are
+  // the only parts of `ix context` that write anything, are not exposed here.
+  ix_context: { ...READ_ONLY, title: "Build a bounded context bundle for a target" },
   // Implemented in @ix/pro, so nothing here can check these are true.
   ix_briefing: UNVERIFIED("Load the Ix Pro session briefing"),
   ix_decisions: UNVERIFIED("List Ix Pro architecture decisions"),
@@ -174,7 +179,12 @@ interface CreateServerOptions {
 type ToolInput = Record<string, unknown>;
 
 /**
- * One Ix invocation, with its options kept apart from its positional values.
+ * `ix_context` output schema — shared contract from the CLI bundle module so
+ * the MCP surface and persisted investigation state validate the same shape.
+ */
+
+/**
+ * One Ix invocationation, with its options kept apart from its positional values.
  *
  * The split is what lets every positional go behind a `--` separator. Appending
  * them as bare tokens let commander read any value beginning with `-` as a
@@ -390,6 +400,36 @@ export function createIxMcpServer(options: CreateServerOptions = {}): McpServer 
   );
   registerTool(
     server,
+    "ix_context",
+    "Build a bounded, deterministic context bundle for a symbol, file, or entity",
+    {
+      target: z.string().min(1),
+      as_of_rev: z.number().int().nonnegative().optional().describe("graph revision for historical context"),
+      max_entities: z.number().int().min(1).max(500).optional(),
+      max_relationships: z.number().int().min(1).max(1000).optional(),
+      max_evidence: z.number().int().min(1).max(200).optional(),
+      max_chars: z
+        .number()
+        .int()
+        .min(1000)
+        .max(1_000_000)
+        .optional()
+        .describe("exact serialized-character budget for the evidence list"),
+    },
+    async (input) => {
+      const options: string[] = [];
+      if (typeof input.as_of_rev === "number") options.push(`--as-of-rev=${numberArg(input, "as_of_rev")}`);
+      if (typeof input.max_entities === "number") options.push(`--max-entities=${numberArg(input, "max_entities")}`);
+      if (typeof input.max_relationships === "number")
+        options.push(`--max-relationships=${numberArg(input, "max_relationships")}`);
+      if (typeof input.max_evidence === "number") options.push(`--max-evidence=${numberArg(input, "max_evidence")}`);
+      if (typeof input.max_chars === "number") options.push(`--max-chars=${numberArg(input, "max_chars")}`);
+      return runJsonStructured(runIx, "ix_context", ix("context", [stringArg(input, "target")], options));
+    },
+    contextBundleSchema,
+  );
+  registerTool(
+    server,
     "ix_ingest",
     "Ingest a path, or issues/PRs/commits from a GitHub repository, into the graph",
     {
@@ -473,6 +513,7 @@ function registerTool(
   description: string,
   inputSchema: z.ZodRawShape,
   handler: (input: ToolInput) => Promise<CallToolResult>,
+  outputSchema?: z.ZodType,
 ): void {
   server.registerTool(
     name,
@@ -480,7 +521,9 @@ function registerTool(
       description,
       inputSchema,
       annotations: TOOL_ANNOTATIONS[name as keyof typeof TOOL_ANNOTATIONS],
-      outputSchema: TOOL_OUTPUT_SCHEMA[name as keyof typeof TOOL_OUTPUT_SCHEMA],
+      // ix_context passes its schema as an argument rather than through the
+      // table, because the shape is owned by the CLI bundle module.
+      outputSchema: outputSchema ?? TOOL_OUTPUT_SCHEMA[name as keyof typeof TOOL_OUTPUT_SCHEMA],
     },
     async (input) => handler(input as ToolInput),
   );
@@ -524,6 +567,39 @@ async function runJson(
 
 function declaresOutputSchema(tool: string): boolean {
   return tool in TOOL_OUTPUT_SCHEMA;
+}
+
+/**
+ * Run a command in JSON format and surface the parsed result as MCP
+ * `structuredContent` alongside the text payload. The context bundle carries
+ * its own versioned schema (`ix-context-bundle/1`), so the structured copy is
+ * stable across releases; when the output does not parse into a usable object
+ * we omit structured content and keep the text result authoritative rather
+ * than throwing.
+ */
+async function runJsonStructured(
+  runIx: IxRunner,
+  tool: string,
+  argv: IxArgv,
+): Promise<CallToolResult> {
+  const result = await runIx(toArgv(argv, "json"), DEFAULT_TIMEOUT_MS);
+  if (!result.ok) {
+    const detail = result.stderr.trim() || result.stdout.trim() || `${argv.command} failed without output`;
+    return textResult(JSON.stringify({ error: detail, tool }), true);
+  }
+  const text = result.stdout.trim() || "{}";
+  const parsed = parseJsonOutput(text);
+  // The CLI contract for `--format=json` is a parseable bundle; when stdout is
+  // not a usable object the tool genuinely failed, and returning an MCP error
+  // is more truthful than inventing a bundle (the output schema requires
+  // schema-valid structured content on every result).
+  if (!isRecord(parsed) || Object.keys(parsed).length === 0) {
+    return textResult(text || JSON.stringify({ error: `${argv.command} produced no parseable JSON`, tool }), true);
+  }
+  return {
+    content: [{ type: "text", text }],
+    structuredContent: parsed,
+  };
 }
 
 async function runCommand(

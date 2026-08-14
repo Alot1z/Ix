@@ -28,6 +28,34 @@ async function connect(runIx: IxRunner, proAvailable = false): Promise<Client> {
   return client;
 }
 
+/**
+ * A complete `ix-context-bundle/1`.
+ *
+ * `ix_context` declares an outputSchema, and the MCP SDK validates
+ * structuredContent against it, so any stub short of a whole bundle comes back
+ * as an output-validation error rather than a result. Tests that only meant to
+ * assert on argv still need a valid one.
+ */
+function contextBundle() {
+  return {
+    schema: "ix-context-bundle/1",
+    generatedAt: "2026-01-01T00:00:00Z",
+    target: { id: "e1", name: "Widget", kind: "class", resolutionMode: "exact" },
+    entities: [{ id: "e1", name: "Widget", kind: "class", stale: false }],
+    relationships: [],
+    claims: [],
+    decisions: [],
+    conflicts: [],
+    intents: [],
+    provenance: {},
+    freshness: { stale: false, classification: "current" },
+    evidence: [],
+    budgets: { maxEntities: 50, maxRelationships: 100, maxEvidence: 25, maxChars: 12000 },
+    truncation: { entitiesTruncated: 0, relationshipsTruncated: 0, evidenceTruncated: 0, charactersTruncated: 0 },
+    metadata: { rankingRule: "deterministic-tier" },
+  };
+}
+
 describe("ix mcp", () => {
   it("exposes only the OSS catalog when Pro is not installed", async () => {
     const client = await connect(async () => ({ ok: true, stdout: "ok", stderr: "" }));
@@ -77,6 +105,88 @@ describe("ix mcp", () => {
 
     expect(calls).toEqual([["locate", "--format=llm", "--", "Widget"]]);
     expect(result.content).toEqual([{ type: "text", text: "match name=Widget" }]);
+  });
+
+  it("forwards ix_context target and bounded budgets as the CLI contract", async () => {
+    const calls: string[][] = [];
+    const client = await connect(async (args) => {
+      calls.push(args);
+      // A whole bundle, not `{schema}` alone: ix_context declares an
+      // outputSchema, and the SDK rejects structuredContent that does not match
+      // it. Stubbing a partial bundle made this pass on a tool call that had
+      // actually returned isError with an output-validation failure.
+      return { ok: true, stdout: JSON.stringify(contextBundle()), stderr: "" };
+    });
+
+    const result = await client.callTool({
+      name: "ix_context",
+      arguments: { target: "Widget", max_entities: 20, max_evidence: 5 },
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(calls).toEqual([
+      ["context", "--max-entities=20", "--max-evidence=5", "--format=json", "--", "Widget"],
+    ]);
+  });
+
+  it("surfaces an output-schema violation instead of passing it off as a result", async () => {
+    // The guard the test above used to lack: a bundle missing required fields
+    // must not reach the caller looking like a successful call.
+    const client = await connect(async () => ({
+      ok: true,
+      stdout: JSON.stringify({ schema: "ix-context-bundle/1" }),
+      stderr: "",
+    }));
+
+    const result = await client.callTool({ name: "ix_context", arguments: { target: "Widget" } });
+
+    expect(result.isError).toBe(true);
+  });
+
+  it("forwards ix_context max_chars to the CLI contract", async () => {
+    const calls: string[][] = [];
+    const client = await connect(async (args) => {
+      calls.push(args);
+      return { ok: true, stdout: JSON.stringify(contextBundle()), stderr: "" };
+    });
+
+    const result = await client.callTool({ name: "ix_context", arguments: { target: "Widget", max_evidence: 3, max_chars: 5000 } });
+
+    expect(result.isError).toBeFalsy();
+    expect(calls).toEqual([["context", "--max-evidence=3", "--max-chars=5000", "--format=json", "--", "Widget"]]);
+  });
+
+  it("returns ix_context structuredContent with the parsed bundle", async () => {
+    const bundle = contextBundle();
+    const client = await connect(async () => ({ ok: true, stdout: JSON.stringify(bundle), stderr: "" }));
+
+    const result = await client.callTool({ name: "ix_context", arguments: { target: "Widget" } });
+
+    expect(result.structuredContent).toEqual(bundle);
+    expect(result.content).toEqual([{ type: "text", text: JSON.stringify(bundle) }]);
+  });
+
+  it("marks an unparseable bundle output as an MCP error", async () => {
+    const client = await connect(async () => ({ ok: true, stdout: "not json at all", stderr: "" }));
+
+    const result = await client.callTool({ name: "ix_context", arguments: { target: "Widget" } });
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toBeUndefined();
+    expect(result.content).toEqual([{ type: "text", text: "not json at all" }]);
+  });
+
+  it("omits unset context budgets rather than sending empty flags", async () => {
+    const calls: string[][] = [];
+    const client = await connect(async (args) => {
+      calls.push(args);
+      return { ok: true, stdout: JSON.stringify(contextBundle()), stderr: "" };
+    });
+
+    const result = await client.callTool({ name: "ix_context", arguments: { target: "src/main.ts" } });
+
+    expect(result.isError).toBeFalsy();
+    expect(calls).toEqual([["context", "--format=json", "--", "src/main.ts"]]);
   });
 
   it("marks Ix command failures as MCP errors", async () => {

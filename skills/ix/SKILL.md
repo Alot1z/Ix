@@ -51,6 +51,7 @@ Map → Explain → Trace → Impact
 |---|---|---|
 | Build/refresh the graph | `ix map` | `ix map .` |
 | Understand a component | `ix explain` | `ix explain IngestionService` |
+| Bounded deterministic context | `ix context` | `ix context IngestionService --max-entities 20` |
 | Trace a flow | `ix trace` | `ix trace user_login_flow` |
 | Analyze impact | `ix impact` | `ix impact verify_token --format llm` |
 
