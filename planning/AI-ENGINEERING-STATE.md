@@ -136,3 +136,92 @@ Duration: ~5 min
 
 ### Session Verdict
 ALL_AUTHORIZED_WORK_COMPLETE: supersession/provenance documentation posted across all 8 open PRs; state files updated; .gitignore quarantined pre-existing artifacts; second live sweep confirmed no new executable authorized work.
+
+## Execution Logic Correction — 2026-08-15T00:10Z
+
+Source: post-hoc analysis of this session's execution against the execution prompt's
+commit-target rule. The analysis was verified against actual GitHub state.
+
+### What the execution prompt said (incorrect for this case)
+> "COMMITS are restricted to EXISTING OPEN ALOT1Z-BACKED PR BRANCHES ONLY."
+
+That rule is SAFE but INCOMPLETE for the actual upstream workflow. It does not
+encode the maintainer-consolidation pathway.
+
+### What actually happened upstream
+Hiro-Chiba opened PRs from branches owned by an Alot1z-backed account. Those PRs
+were reviewed by KageBinary, who consolidated the fixes into NEW branches under
+KageBinary's own account (#443, #444, #445, #446). KageBinary's PRs carry
+Hiro-Chiba's authorship on the relevant commits, plus KageBinary's own hardening
+fixes. The Hiro-Chiba originals remain open but are functionally superseded.
+
+KageBinary explicitly documented this in PR #446 (and the others): "your commits
+are already carried in #446, authorship preserved."
+
+### The correct commit-target rule
+```
+A commit may only be pushed by the executor to a branch the executor is
+authorized to write.
+
+Existing upstream PRs owned by other contributors or maintainers must never be
+directly modified.
+
+HOWEVER: if a maintainer consolidation PR already incorporates Alot1z-authored
+commits that originated from an earlier branch, those commits count as an actual
+upstream contribution. In that case:
+
+    DO NOT duplicate those commits
+    DO NOT push to the maintainer branch
+    DO NOT create a replacement PR
+    DO NOT treat the work as "not contributed"
+
+Instead:
+    verify the commits are present and their authorship preserved
+    verify their content matches the original intent
+    verify the maintainer's follow-up fixes (security, correctness)
+    review the resulting consolidation PR substantively
+    comment where technically useful (not just provenance lock)
+    identify any remaining independent gap
+```
+
+### Three distinct things (must not be conflated)
+| Thing | Current status |
+|---|---|
+| Alot1z's historical commits | Incorporated/preserved in upstream via KageBinary consolidation PRs |
+| New commits onto KageBinary's branch | NOT ALLOWED — branch ownership is KageBinary's |
+| Technical review/comments on KageBinary's PR | ALLOWED and useful — this was done, but comments were too narrow |
+
+### What the agent did vs. what it should have done
+- **Did**: Posted "provenance lock" comments — technically correct but narrow
+- **Should also have done**: Substantive technical review of KageBinary's hardening
+  additions (OOM fix in #445, sticky truncation flag in #446, default-import guard
+  in #443, bounded failure-reason copy in #444)
+
+### Correct execution priority for KageBinary's PRs
+1. Verify Hiro-Chiba's commits are present and authorship preserved
+2. Review KageBinary's additions independently for correctness, security, regression
+3. Comment with substantive findings where there's independent technical value
+4. Check whether any remaining gap justifies a separate Alot1z contribution path
+   (currently: no Alot1z-owned PR open; would require new PR authorization)
+
+### Applicable to this session's work
+- PR #443: verify default-import guard correctness + test coverage
+- PR #444: verify bounded failure-reason copy + truncation semantics  
+- PR #445: verify OOM fix + device-node rejection + path-traversal rejection
+- PR #446: verify sticky truncation flag + SIGTERM/SIGINT handling + bounded failure reason
+
+### Substantive Technical Reviews Posted — 2026-08-15T00:15Z
+
+Follow-up to the rule correction: substantive technical reviews posted on all 4 KageBinary consolidation PRs, beyond the narrow provenance-lock comments posted earlier.
+
+| PR | Review focus | Comment URL | Trust level | Key findings |
+|---|---|---|---|---|
+| #443 | Default-import guard correctness | https://github.com/ix-infrastructure/Ix/pull/443#issuecomment-5298685426 | Medium | Guard logic correct; flagged redundant-fix risk (rename-step ordering) + two test-gap items (negative named-default case, \`export {x as default}\` edge case) |
+| #444 | Bounded failure-reason copy + truncation semantics | https://github.com/ix-infrastructure/Ix/pull/444#issuecomment-5298686949 | Medium | Fix direction correct; flagged copy-must-precede-cap-check ordering + 2 KB cap interaction (push before vs after re-check) + sigil edge case where empty reason delivers sentinel |
+| #445 | OOM (back-ref) + device-node + path-traversal | https://github.com/ix-infrastructure/Ix/pull/445#issuecomment-5298688773 | Medium | Three independent vectors each verified; flagged escaped-backslash false-positive risk in back-ref detection + device-node check must cover both ReadFile entry points (config + post-resolve) + Windows device syntax + TOCTOU window on symlink swap worth documenting |
+| #446 | Sticky truncation flag + SIGTERM/SIGINT + bounded reason | https://github.com/ix-infrastructure/Ix/pull/446#issuecomment-5298691286 | Medium-high | Sticky flag and bounded reason copy correct; flagged SIGTERM/SIGINT behavioral contract change explicitly (orchestrators relying on SIGTERM to abort must now check \`run.truncated\` instead); recommended code comment documenting this |
+
+### Reviews pending future verification (post-merge)
+- After KageBinary responds to #443 test-gap items: confirm new regression tests added before merge
+- After KageBinary responds to #445 escaped-backslash risk: confirm detection logic covers \`\\\\d\` case and a test case exists
+- After KageBinary responds to #446 SIGTERM note: confirm behavioral contract is documented in PR body or code before merge
