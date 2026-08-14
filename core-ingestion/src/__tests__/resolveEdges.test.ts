@@ -616,6 +616,25 @@ describe('resolveEdges', () => {
     });
   });
 
+  it('does not bind a default import to a provider member named "default"', () => {
+    // `imported` is the sentinel 'default' for `import run from "./m"`, not an
+    // export name. Without the guard, the renamed-import fallback matches the
+    // *method* `M.default` and emits a confident edge to the wrong member.
+    const provider = parseFile(
+      '/repo/m.ts',
+      'export class M { default() { return 1; } }\nexport default new M();\n',
+    )!;
+    const consumer = parseFile(
+      '/repo/n.ts',
+      'import run from "./m";\nexport function go() { return run(); }\n',
+    )!;
+
+    const resolved = resolveEdges([consumer, provider]);
+    expect(
+      resolved.filter((e) => e.srcName === 'go' && e.dstQualifiedKey === 'M.default'),
+    ).toEqual([]);
+  });
+
   it('uses caller-supplied parse results instead of re-parsing', () => {
     // The CLI parses prescan sources on its worker pool and hands the results
     // in, so the index costs no main-thread parsing. Proven by supplying a
