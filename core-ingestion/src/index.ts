@@ -3989,7 +3989,8 @@ export function resolveEdges(
           ))];
           const publicMatches: Array<{ fp: string; local: string }> = [];
           for (const fp of providerFiles.length === 1 ? providerFiles : []) {
-            const local = filePublicNames.get(fp)?.get(binding.imported);
+            const local = filePublicNames.get(fp)?.get(binding.imported)
+              ?? (fileHasSymbol.get(fp)?.has(binding.imported) ? binding.imported : undefined);
             if (local && fileHasSymbol.get(fp)?.has(local)) publicMatches.push({ fp, local });
           }
           if (publicMatches.length === 1) {
