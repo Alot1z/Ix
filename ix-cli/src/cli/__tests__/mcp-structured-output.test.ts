@@ -81,6 +81,34 @@ describe("ix mcp structured output", () => {
     });
   });
 
+  it("caps thrown command errors before returning them through MCP", async () => {
+    const runIx = createInProcessRunner({
+      maxOutputBytes: 100,
+      createProgram: () => {
+        const program = new Command();
+        program
+          .command("map")
+          .option("--format <format>")
+          .action(() => {
+            throw new Error("E".repeat(500));
+          });
+        return program;
+      },
+    });
+    const client = await connect(runIx);
+
+    const result = (await client.callTool({ name: "ix_map", arguments: {} })) as CallToolResult;
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toBeUndefined();
+    const content = result.content[0];
+    const error = JSON.parse(content?.type === "text" ? content.text : "{}");
+    expect(error).toEqual({
+      error: "[ix mcp] output exceeded 100 bytes and was truncated",
+      tool: "ix_map",
+    });
+  });
+
   it("exposes the filtered smell candidates as structuredContent", async () => {
     const client = await connect(async () => ({
       ok: true,

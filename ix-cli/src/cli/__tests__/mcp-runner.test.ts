@@ -416,6 +416,26 @@ describe("in-process ix runner", () => {
     expect(result.stderr).toContain("exceeded 500 bytes and was truncated");
   });
 
+  it("applies the output cap to thrown error messages", async () => {
+    const run = createInProcessRunner({
+      maxOutputBytes: 500,
+      createProgram: () => {
+        const program = new Command();
+        program.command("throw-long").action(() => {
+          throw new Error("E".repeat(2_000));
+        });
+        return program;
+      },
+    });
+
+    const result = await run(["throw-long"]);
+
+    expect(result.ok).toBe(false);
+    expect(Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(500);
+    expect(result.stderr).toContain("exceeded 500 bytes and was truncated");
+    expect(result.stderr).not.toContain("E".repeat(500));
+  });
+
   it("reports an unknown command as a failure with commander's message", async () => {
     const run = testRunner();
 

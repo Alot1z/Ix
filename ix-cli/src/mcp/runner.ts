@@ -422,6 +422,7 @@ async function executeInProcess(
   } finally {
     commandExitCode = commandExitCode ?? (exitCodeIsOurs ? process.exitCode : undefined);
     process.exitCode = callerExitCode;
+    if (failure !== null) appendChunk(run, "stderr", failure);
     run.closed = true;
     activeRun = null;
 
@@ -472,7 +473,7 @@ async function executeInProcess(
   return {
     ok,
     stdout: run.stdout.join(""),
-    stderr: run.stderr.join("") + (failure ?? ""),
+    stderr: run.stderr.join(""),
   };
 }
 
