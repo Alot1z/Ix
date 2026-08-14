@@ -436,6 +436,29 @@ describe("in-process ix runner", () => {
     expect(result.stderr).not.toContain("E".repeat(500));
   });
 
+  it("keeps the failure reason when the cap already fired before the throw", async () => {
+    // Routing thrown text through appendChunk means it is dropped outright once
+    // the cap has fired, so a crash reaches the client as nothing but "output
+    // exceeded N bytes" — exactly when an operator most needs the reason.
+    const run = createInProcessRunner({
+      maxOutputBytes: 500,
+      createProgram: () => {
+        const program = new Command();
+        program.command("flood-then-throw").action(() => {
+          for (let i = 0; i < 20; i += 1) console.log("x".repeat(100));
+          throw new Error("backend refused the connection");
+        });
+        return program;
+      },
+    });
+
+    const result = await run(["flood-then-throw"]);
+
+    expect(result.ok).toBe(false);
+    expect(result.stderr).toContain("exceeded 500 bytes and was truncated");
+    expect(result.stderr).toContain("backend refused the connection");
+  });
+
   it("reports an unknown command as a failure with commander's message", async () => {
     const run = testRunner();
 
