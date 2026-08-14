@@ -415,6 +415,19 @@ describe("in-process ix runner", () => {
     expect(result.stderr).toContain("exceeded 500 bytes and was truncated");
   });
 
+  it("reports truncated output as a failure (ok: false)", async () => {
+    const run = createInProcessRunner({
+      createProgram: createTestProgram,
+      maxOutputBytes: 500,
+    });
+
+    const result = await run(["flood"]);
+
+    // When output is truncated, the result should be a failure
+    expect(result.ok).toBe(false);
+    expect(result.stderr).toContain("exceeded 500 bytes and was truncated");
+  });
+
   it("reports an unknown command as a failure with commander's message", async () => {
     const run = testRunner();
 

@@ -468,7 +468,10 @@ async function executeInProcess(
     }
   }
 
-  const ok = failure === null && (commandExitCode === undefined || commandExitCode === 0);
+  // Truncation is a failure condition: the command produced more output than
+  // the configured cap, so the result is incomplete. The MCP handler must
+  // surface this as an error, not a successful empty structuredContent.
+  const ok = failure === null && (commandExitCode === undefined || commandExitCode === 0) && !run.truncated;
   return {
     ok,
     stdout: run.stdout.join(""),
