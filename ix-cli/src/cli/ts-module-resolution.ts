@@ -143,11 +143,16 @@ function readObject(filePath: string): Record<string, unknown> | undefined {
   }
 }
 
-function resolveExtends(configPath: string, value: unknown): string | undefined {
-  if (typeof value !== "string" || !value.startsWith(".")) return undefined;
+/**
+ * Candidate paths a relative `extends` may name, in TypeScript's own order.
+ * Returns every candidate rather than probing with `existsSync`: the caller
+ * reads each one and `readObject` already reports an unreadable file as
+ * `undefined`, so there is no check-then-use window (CodeQL js/file-system-race).
+ */
+function resolveExtends(configPath: string, value: unknown): string[] {
+  if (typeof value !== "string" || !value.startsWith(".")) return [];
   const unresolved = nodePath.resolve(nodePath.dirname(configPath), value);
-  const candidates = [unresolved, `${unresolved}.json`, nodePath.join(unresolved, "tsconfig.json")];
-  return candidates.find((candidate) => fs.existsSync(candidate));
+  return [unresolved, `${unresolved}.json`, nodePath.join(unresolved, "tsconfig.json")];
 }
 
 function loadConfig(
@@ -168,8 +173,11 @@ function loadConfig(
     return undefined;
   }
 
-  const parentPath = resolveExtends(absoluteConfig, raw.extends);
-  const parent = parentPath ? loadConfig(workspaceRoot, parentPath, cache, loading) : undefined;
+  let parent: LoadedConfig | undefined;
+  for (const candidate of resolveExtends(absoluteConfig, raw.extends)) {
+    parent = loadConfig(workspaceRoot, candidate, cache, loading);
+    if (parent) break;
+  }
   const configDir = nodePath.dirname(absoluteConfig);
   const compilerOptions =
     raw.compilerOptions && typeof raw.compilerOptions === "object"
@@ -287,6 +295,12 @@ export function createTypeScriptModuleResolver(
     if (!specifier || specifier.startsWith(".") || specifier.startsWith("/")) return undefined;
     const normalizedSource = normalizePath(sourcePath);
     const config = configs.find((candidate) => isWithinDir(normalizedSource, candidate.dir));
+    // Only an *explicit* `paths` mapping licenses an authoritative "no match".
+    // A bare `baseUrl` — and a catch-all `"*"` rule, which is the same thing
+    // spelled differently — matches `react` exactly as readily as `@app/thing`,
+    // so treating its miss as authoritative would delete every third-party
+    // import edge in any repo that sets one.
+    let mappedExplicitly = false;
     if (config) {
       for (const rule of config.paths) {
         const star = matchPathPattern(rule.pattern, specifier);
@@ -299,8 +313,11 @@ export function createTypeScriptModuleResolver(
           );
           if (matches.length > 0) return matches;
         }
-        return [];
+        mappedExplicitly = rule.pattern !== "*";
+        break;
       }
+      // TypeScript tries `paths` first and then falls back to `baseUrl`, so a
+      // failed rule must not short-circuit the baseUrl lookup.
       if (config.baseUrl) {
         const matches = resolveCandidate(
           nodePath.resolve(config.baseUrl, specifier),
@@ -310,6 +327,6 @@ export function createTypeScriptModuleResolver(
         if (matches.length > 0) return matches;
       }
     }
-    return config?.baseUrl ? [] : undefined;
+    return mappedExplicitly ? [] : undefined;
   };
 }

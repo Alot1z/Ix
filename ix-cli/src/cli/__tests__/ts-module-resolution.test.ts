@@ -96,7 +96,10 @@ describe("createTypeScriptModuleResolver", () => {
     expect(resolve("src/consumer.ts", "services/worker")).toEqual(["src/services/worker.ts"]);
   });
 
-  it("treats an unresolved baseUrl module as authoritative", () => {
+  it("does not treat an unresolved baseUrl module as authoritative", () => {
+    // `baseUrl` matches every bare specifier, so its miss carries no information.
+    // Returning [] here tells the resolver "definitively not local", which drops
+    // the edge; `undefined` means "no opinion" and lets the stem fallback run.
     const root = workspace();
     const config = write(
       root,
@@ -109,7 +112,77 @@ describe("createTypeScriptModuleResolver", () => {
     const unrelated = write(root, "legacy/missing.ts");
     const resolve = createTypeScriptModuleResolver(root, [config, consumer, unrelated]);
 
-    expect(resolve("src/consumer.ts", "services/missing")).toEqual([]);
+    expect(resolve("src/consumer.ts", "services/missing")).toBeUndefined();
+  });
+
+  it("keeps third-party specifiers unresolved rather than authoritative under baseUrl", () => {
+    // The regression this guards: `baseUrl: "."` is the default in Next.js, CRA
+    // and most monorepo templates. Claiming authority over `react` there erased
+    // every third-party import edge in the graph.
+    const root = workspace();
+    const config = write(
+      root,
+      "tsconfig.json",
+      JSON.stringify({ compilerOptions: { baseUrl: "." } }),
+    );
+    const consumer = write(root, "packages/app/index.ts");
+    const sibling = write(root, "packages/lib/index.ts");
+    const resolve = createTypeScriptModuleResolver(root, [config, consumer, sibling]);
+
+    expect(resolve("packages/app/index.ts", "react")).toBeUndefined();
+    expect(resolve("packages/app/index.ts", "@org/lib")).toBeUndefined();
+  });
+
+  it("does not treat a catch-all paths rule as authoritative", () => {
+    // `"*": ["src/*"]` matches every specifier, so it is baseUrl by another name.
+    const root = workspace();
+    const config = write(
+      root,
+      "tsconfig.json",
+      JSON.stringify({
+        compilerOptions: { paths: { "*": ["src/*"] } },
+      }),
+    );
+    const consumer = write(root, "src/consumer.ts");
+    const resolve = createTypeScriptModuleResolver(root, [config, consumer]);
+
+    expect(resolve("src/consumer.ts", "lodash")).toBeUndefined();
+  });
+
+  it("falls back to baseUrl when a matching paths rule resolves nothing", () => {
+    // TypeScript tries `paths` first, then `baseUrl`. A failed rule must not
+    // short-circuit the baseUrl lookup.
+    const root = workspace();
+    const config = write(
+      root,
+      "tsconfig.json",
+      JSON.stringify({
+        compilerOptions: { baseUrl: "src", paths: { "@core/*": ["missing/*"] } },
+      }),
+    );
+    const consumer = write(root, "src/consumer.ts");
+    const actual = write(root, "src/@core/thing.ts");
+    const resolve = createTypeScriptModuleResolver(root, [config, consumer, actual]);
+
+    expect(resolve("src/consumer.ts", "@core/thing")).toEqual(["src/@core/thing.ts"]);
+  });
+
+  it("follows a relative extends that names a directory", () => {
+    // Previously an existsSync probe stopped at the directory itself and never
+    // tried <dir>/tsconfig.json, so the parent's paths were silently dropped.
+    const root = workspace();
+    write(
+      root,
+      "cfg/tsconfig.json",
+      JSON.stringify({ compilerOptions: { paths: { "@core": ["src/worker"] } } }),
+    );
+    const config = write(root, "tsconfig.json", JSON.stringify({ extends: "./cfg" }));
+    const consumer = write(root, "src/consumer.ts");
+    // `paths` in an extended config resolve against the config that declares them.
+    const worker = write(root, "cfg/src/worker.ts");
+    const resolve = createTypeScriptModuleResolver(root, [config, consumer, worker]);
+
+    expect(resolve("src/consumer.ts", "@core")).toEqual(["cfg/src/worker.ts"]);
   });
 
   it("prefers JavaScript for extensionless imports from JavaScript files", () => {
