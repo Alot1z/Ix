@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
@@ -224,6 +225,72 @@ describe("createTypeScriptModuleResolver", () => {
       expect(resolve("src/consumer.ts", "@core")).toBeUndefined();
     },
   );
+
+  it.skipIf(process.platform === "win32")(
+    "refuses an extends that reaches a FIFO without blocking on the open",
+    () => {
+      // The guard that rejects non-regular files runs *after* the open, and
+      // opening a FIFO for reading blocks until a writer appears — so without
+      // O_NONBLOCK the open never returns and no later check can save it. The
+      // /dev/zero case does not cover this: a character device opens fine.
+      const root = workspace();
+      const fifo = join(root, "piped.json");
+      try {
+        execFileSync("mkfifo", [fifo]);
+      } catch {
+        return; // no mkfifo available — nothing to assert
+      }
+      const config = write(root, "tsconfig.json", JSON.stringify({ extends: "./piped.json" }));
+      const consumer = write(root, "src/consumer.ts");
+      const resolve = createTypeScriptModuleResolver(root, [config, consumer, fifo]);
+
+      expect(resolve("src/consumer.ts", "@core")).toBeUndefined();
+    },
+  );
+
+  it("accepts a sibling directory whose name begins with dots", () => {
+    // Containment must compare path segments: `..shared` is inside the
+    // workspace, but a bare startsWith("..") reads it as an escape.
+    const root = workspace();
+    write(
+      root,
+      "..shared/tsconfig.json",
+      JSON.stringify({ compilerOptions: { paths: { "@core": ["src/worker"] } } }),
+    );
+    const config = write(root, "tsconfig.json", JSON.stringify({ extends: "./..shared" }));
+    const consumer = write(root, "src/consumer.ts");
+    const worker = write(root, "..shared/src/worker.ts");
+    const resolve = createTypeScriptModuleResolver(root, [config, consumer, worker]);
+
+    expect(resolve("src/consumer.ts", "@core")).toEqual(["..shared/src/worker.ts"]);
+  });
+
+  it("does not claim authority when an out-of-scope extends was dropped", () => {
+    // A scoped ingest roots containment at the ingest path, so a shared base
+    // config above it is dropped. Half-loading the remainder is worse than main:
+    // the local `paths` rule matches, fails against the missing baseUrl, and
+    // returns an authoritative [] that deletes an edge main resolves.
+    const outer = workspace();
+    writeFileSync(
+      join(outer, "tsconfig.base.json"),
+      JSON.stringify({ compilerOptions: { baseUrl: "." } }),
+    );
+    const scoped = join(outer, "packages", "web");
+    mkdirSync(scoped, { recursive: true });
+    const config = write(
+      scoped,
+      "tsconfig.json",
+      JSON.stringify({
+        extends: "../../tsconfig.base.json",
+        compilerOptions: { paths: { "@app/*": ["src/*"] } },
+      }),
+    );
+    const consumer = write(scoped, "src/consumer.ts");
+    const resolve = createTypeScriptModuleResolver(scoped, [config, consumer]);
+
+    // undefined ("no opinion") lets the stem fallback run; [] would delete the edge.
+    expect(resolve("src/consumer.ts", "@app/missing")).toBeUndefined();
+  });
 
   it("follows a relative extends that names a directory", () => {
     // Previously an existsSync probe stopped at the directory itself and never

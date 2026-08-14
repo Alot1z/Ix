@@ -145,14 +145,21 @@ function readObject(filePath: string): Record<string, unknown> | undefined {
     // Open once and fstat the same handle so the checks and the read observe the
     // same inode — no stat-then-read window (CodeQL js/file-system-race). This is
     // the pattern ingest.ts already uses.
-    const handle = fs.openSync(filePath, "r");
+    //
+    // O_NONBLOCK is load-bearing, not tidiness: opening a FIFO for reading
+    // *blocks until a writer appears*, so without it the open never returns and
+    // no later check can help. It is the one case a guard placed after the open
+    // cannot cover. Undefined on Windows, where `|` with undefined degrades to
+    // a plain read — and Windows has no FIFO to open this way.
+    const handle = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
     let text: string;
     try {
       const stats = fs.fstatSync(handle);
       // `openSync` follows symlinks, so fstat describes the *target*. Refusing
       // anything that is not a regular file is what stops a link to /dev/zero
-      // (unbounded read) or a FIFO (blocks the event loop forever) — neither of
-      // which a size check catches, since both report size 0.
+      // (an unbounded read) and a FIFO (which would otherwise deliver no data
+      // and no EOF) — neither of which a size check catches, since both
+      // report size 0.
       if (!stats.isFile() || stats.size > MAX_CONFIG_BYTES) return undefined;
       text = fs.readFileSync(handle, "utf8");
     } finally {
@@ -187,7 +194,14 @@ function resolveExtends(workspaceRoot: string, configPath: string, value: unknow
 
 function isWithinWorkspace(workspaceRoot: string, candidate: string): boolean {
   const relative = nodePath.relative(nodePath.resolve(workspaceRoot), candidate);
-  return relative !== "" && !relative.startsWith("..") && !nodePath.isAbsolute(relative);
+  // Compare path *segments*: a bare `..startsWith` also rejects a legitimate
+  // sibling directory whose name merely begins with dots, e.g. `..shared/`.
+  return (
+    relative !== "" &&
+    relative !== ".." &&
+    !relative.startsWith(`..${nodePath.sep}`) &&
+    !nodePath.isAbsolute(relative)
+  );
 }
 
 function loadConfig(
@@ -208,10 +222,24 @@ function loadConfig(
     return undefined;
   }
 
+  const extendsCandidates = resolveExtends(workspaceRoot, absoluteConfig, raw.extends);
   let parent: LoadedConfig | undefined;
-  for (const candidate of resolveExtends(workspaceRoot, absoluteConfig, raw.extends)) {
+  for (const candidate of extendsCandidates) {
     parent = loadConfig(workspaceRoot, candidate, cache, loading);
     if (parent) break;
+  }
+
+  // A scoped run (`ix map ./packages/web`) roots containment at the ingest path,
+  // so a monorepo's shared `tsconfig.base.json` one level up is dropped. Half-
+  // loading what remains is worse than not loading it: this config's own `paths`
+  // would still match, fail to resolve against the missing `baseUrl`, and return
+  // an *authoritative* empty — which suppresses the stem fallback and deletes an
+  // edge main resolves fine. Treat the config as unusable instead, which is
+  // exactly main's behaviour.
+  if (typeof raw.extends === "string" && raw.extends.startsWith(".") && !parent) {
+    cache.set(absoluteConfig, undefined);
+    loading.delete(absoluteConfig);
+    return undefined;
   }
   const configDir = nodePath.dirname(absoluteConfig);
   const compilerOptions =
