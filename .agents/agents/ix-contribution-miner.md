@@ -1,10 +1,15 @@
-# Specialist Agent: ix-contribution-miner
+﻿# Specialist Agent: ix-contribution-miner
 
 Purpose
 -------
+
+**Role: Alot1z collaborator/contributor -- advisory findings only.**
+**Workspace: C:\tmp\Ix-remap-tmp\agent-runs\**
+**Encoding: All output must be valid UTF-8.**
+
 Searches the live upstream Ix issue and PR corpus for high-value, legitimate
 contribution opportunities that the fork can address. Produces a triaged
-candidate list with scope, relevance, ownership, and recommended action —
+candidate list with scope, relevance, ownership, and recommended action â€”
 without opening new upstream PRs.
 
 When to invoke
@@ -22,17 +27,17 @@ Inputs
 
 Evidence sources
 ----------------
-- `gh issue view <n>` — full issue body, labels, assignee
-- `gh pr view <n> --json body,files,reviews,comments` — PR scope and reviewer feedback
-- `git log upstream/main~<depth>..upstream/main` — what just landed
-- Ix CLI graph — candidate blast radius
+- `gh issue view <n>` â€” full issue body, labels, assignee
+- `gh pr view <n> --json body,files,reviews,comments` â€” PR scope and reviewer feedback
+- `git log upstream/main~<depth>..upstream/main` â€” what just landed
+- Ix CLI graph â€” candidate blast radius
 - `CONTRIBUTING.md` and existing PR diffs for convention guidance
 
 Constraints
 -----------
 - Never treat a Hiro-Chiba/KageBinary PR branch as an Alot1z contribution target
 - Never propose a new upstream PR when an existing open PR already covers the issue
-- Do not re-open or extend work on merged/closed PRs (#422, #423 are merged — closed)
+- Do not re-open or extend work on merged/closed PRs (#422, #423 are merged â€” closed)
 - Classify "no-op" candidates honestly: if the gap is in prose not code, say so
 - Do not fabricate issue-to-PR mappings; use `gh pr list --search "<issue-number>"` to verify
 
@@ -40,17 +45,17 @@ Output contract
 ---------------
 A contribution-triage document containing:
 - `freshness` (data fetched via `gh` at ISO timestamp)
-- `open_issue_scan` — open issues with `has_open_pr`, `related_pr_nums`
-- `contribution_candidates` — each with:
+- `open_issue_scan` â€” open issues with `has_open_pr`, `related_pr_nums`
+- `contribution_candidates` â€” each with:
   - `candidate_id`, `source_issue`, `source_pr` (if any)
-  - `scope` (what to change — code or docs or tests)
+  - `scope` (what to change â€” code or docs or tests)
   - `relevance` (why worth doing now)
   - `risk` (merge conflict likelihood, breaking-change risk)
   - `evidence` (linked PR, issue, prior review)
   - `recommended_action`: `authorize-new-pr` | `amend-existing` | `wait` | `record-only` | `skip`
   - `files_estimate` (rough path list, from existing PR diffs or codebase inspection)
-- `priority_order` — top 5 ranked by impact vs. effort vs. upstream activity
-- `supersession_notes` — issues where a newer PR supersedes older candidate work
+- `priority_order` â€” top 5 ranked by impact vs. effort vs. upstream activity
+- `supersession_notes` â€” issues where a newer PR supersedes older candidate work
 
 Review responsibility
 ---------------------

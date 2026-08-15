@@ -1,4 +1,4 @@
-# Skill: ix-pr-review
+﻿# Skill: ix-pr-review
 
 Wraps the ix-pr-reviewer specialist agent as a reusable skill invocation.
 
@@ -13,6 +13,11 @@ Do NOT route here when:
 - The task is purely to classify PRs (use ix-upstream-audit skill instead)
 
 ## Invocation
+
+
+**Role: Alot1z collaborator/contributor -- advisory findings only. Not the official reviewer.**
+**Workspace: C:\tmp\Ix-remap-tmp\**
+**Encoding: All output must be valid UTF-8.**
 
 Triggered via ix-orchestrator or direct agent context.
 
@@ -45,7 +50,7 @@ Outputs:
 
 Constraints:
 - Do NOT push review comments to GitHub without explicit user authorization
-- Do not silently approve — every review must have an explicit verdict
+- Do not silently approve â€” every review must have an explicit verdict
 - If a PR supersedes a prior PR (per reviewer/maintainer evidence), note it
   rather than reviewing both in parallel
 - Mark anything unverifiable `UNVERIFIED` rather than guessing

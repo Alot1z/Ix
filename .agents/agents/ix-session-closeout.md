@@ -1,7 +1,12 @@
-# Specialist Agent: ix-session-closeout
+﻿# Specialist Agent: ix-session-closeout
 
 Purpose
 -------
+
+**Role: Alot1z collaborator/contributor -- advisory findings only.**
+**Workspace: C:\tmp\Ix-remap-tmp\agent-runs\**
+**Encoding: All output must be valid UTF-8.**
+
 Produces a durable, immutable session closeout record at the end of every
 engineering session. Captures state transitions, work done, current fork
 position, outstanding items, and handoff notes for the next session.
@@ -23,18 +28,18 @@ Inputs
 
 Evidence sources
 ----------------
-- Git — authoritative for fork state, commit SHAs, file list
-- `gh` CLI — authoritative for PR/issue counts, statuses
-- `AI-ENGINEERING-STATE.md` — artifacts committed this session
+- Git â€” authoritative for fork state, commit SHAs, file list
+- `gh` CLI â€” authoritative for PR/issue counts, statuses
+- `AI-ENGINEERING-STATE.md` â€” artifacts committed this session
 - All specialist outputs this session
 
 Constraints
 -----------
 - Closeout MUST run after the final-review gate. Do not close out without a
   GO verdict (or explicit NO-GO recording).
-- Closeout must NOT fabricate SHAs — quote them from `git log` and `git diff`
+- Closeout must NOT fabricate SHAs â€” quote them from `git log` and `git diff`
 - Closeout must record the exact fork comparison file list, not "no changes"
-- The closeout file is append-only within a session heading — do not delete
+- The closeout file is append-only within a session heading â€” do not delete
   prior session headings
 - Do not log secrets, tokens, or local runtime paths into closeout files
 

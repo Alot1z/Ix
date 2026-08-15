@@ -1,4 +1,4 @@
-# Skill: ix-findings-review
+﻿# Skill: ix-findings-review
 
 Wraps the ix-ix-findings-reviewer specialist agent as a reusable skill invocation.
 
@@ -14,18 +14,23 @@ Do NOT route here when:
 
 ## Invocation
 
+
+**Role: Alot1z collaborator/contributor -- advisory findings only. Not the official reviewer.**
+**Workspace: C:\tmp\Ix-remap-tmp\**
+**Encoding: All output must be valid UTF-8.**
+
 Triggered via ix-orchestrator or direct agent context.
 
 Inputs:
 - `knowledge.md` upstream state snapshot (as_of date, PR/issue counts, latest SHAs)
-- A local findings checkout (user-specified path — do not assume location)
+- A local findings checkout (user-specified path â€” do not assume location)
 - Live `gh` CLI:
   - `gh api repos/ix-infrastructure/Ix/commits?per_page=1`
   - `gh pr list --repo ix-infrastructure/Ix --state open`
   - `gh issue list --repo ix-infrastructure/Ix --state open`
 
 Steps:
-1. Determine `Last updated` in `knowledge.md` — this is the freshness baseline
+1. Determine `Last updated` in `knowledge.md` â€” this is the freshness baseline
 2. Fetch latest upstream commit SHA from `gh api`
 3. Compare open PR count and issue count from `gh` against what `knowledge.md` records
 4. If a local findings checkout is available, inspect `pull-requests.json`,
@@ -44,5 +49,5 @@ Constraints:
 - Findings review is output-only when no push authorization is granted
 - If the findings repo is not available locally, return `findings_status: LOCAL_ABSENT`
   and describe what would be checked if it were available
-- Do not mix findings review with fork engineering review — separate tasks, separate outputs
+- Do not mix findings review with fork engineering review â€” separate tasks, separate outputs
 - Do not modify any file in the findings repo during review (read-only role)

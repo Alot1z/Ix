@@ -1,4 +1,9 @@
-# Prompt: ix-session-startup
+﻿# Prompt: ix-session-startup
+
+
+**Role: Alot1z collaborator/contributor -- advisory findings only. Not the official reviewer.**
+**Workspace: C:\tmp\Ix-remap-tmp\**
+**Encoding: All output must be valid UTF-8.**
 
 Purpose
 -------
@@ -28,7 +33,7 @@ Sequence
 5. Fetch live GitHub state:
    `gh pr list --repo ix-infrastructure/Ix --state open`
    `gh issue list --repo ix-infrastructure/Ix --state open`
-6. Diff this fresh state against `knowledge.md` — flag any new PRs/issues
+6. Diff this fresh state against `knowledge.md` â€” flag any new PRs/issues
 7. Emit a one-paragraph session-start report:
    - fork position (ahead/behind, changed files)
    - new upstream items since last session
@@ -36,12 +41,12 @@ Sequence
 
 Contract
 --------
-Output is a session-start block. No decisions are made — this prompt only
+Output is a session-start block. No decisions are made â€” this prompt only
 establishes ground truth. All outputs are appended to the current session
 heading in `AI-ENGINEERING-STATE.md`.
 
 Constraints
 -----------
 - Use live GitHub state (`gh`), not cached data
-- Do not silently skip the `git diff --stat` — it is the fork-only file gate
-- Do not modify any branch or file during startup — read-only gate
+- Do not silently skip the `git diff --stat` â€” it is the fork-only file gate
+- Do not modify any branch or file during startup â€” read-only gate

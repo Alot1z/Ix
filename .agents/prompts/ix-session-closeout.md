@@ -1,4 +1,9 @@
-# Prompt: ix-session-closeout
+﻿# Prompt: ix-session-closeout
+
+
+**Role: Alot1z collaborator/contributor -- advisory findings only. Not the official reviewer.**
+**Workspace: C:\tmp\Ix-remap-tmp\**
+**Encoding: All output must be valid UTF-8.**
 
 Purpose
 -------
@@ -15,12 +20,12 @@ Sequence
 --------
 1. Confirm ix-final-reviewer verdict is recorded in this session's outputs
 2. Collect Git state:
-   - `git rev-parse origin/upstream/main` → upstream/main SHA
-   - `git rev-parse origin/fork/main` → fork/main SHA
-   - `git merge-base origin/upstream/main HEAD` → merge-base
-   - `git rev-list --left-right --count origin/upstream/main...HEAD` → ahead/behind
-   - `git log HEAD~<n>..HEAD --oneline` → this session's commits (where n = commit count)
-   - `git diff --stat origin/upstream/main...HEAD` → fork-only files
+   - `git rev-parse origin/upstream/main` â†’ upstream/main SHA
+   - `git rev-parse origin/fork/main` â†’ fork/main SHA
+   - `git merge-base origin/upstream/main HEAD` â†’ merge-base
+   - `git rev-list --left-right --count origin/upstream/main...HEAD` â†’ ahead/behind
+   - `git log HEAD~<n>..HEAD --oneline` â†’ this session's commits (where n = commit count)
+   - `git diff --stat origin/upstream/main...HEAD` â†’ fork-only files
 3. Collect GitHub state:
    - `gh pr list --repo ix-infrastructure/Ix --state open --json number,title,status`
    - `gh issue list --repo ix-infrastructure/Ix --state open --json number,title`
@@ -69,5 +74,5 @@ Constraints
 -----------
 - Append-only: do not delete prior session headings
 - Do not log secrets, tokens, absolute user paths, or local runtime values
-- Record actual `git diff` file list — never say "no changes" without inspecting
+- Record actual `git diff` file list â€” never say "no changes" without inspecting
 - If the final-reviewer verdict was NO-GO, record `State: NO-GO` and name the blocking item

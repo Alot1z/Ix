@@ -1,3 +1,34 @@
+## Session 2026-08-15T01:50Z -- Collaborator role update + comment cleanup
+
+State: IN_PROGRESS
+Role: Alot1z collaborator/contributor (NOT official reviewer)
+
+### Changes This Session
+- Updated AGENTS.md: added collaborator role, project-scoped workspace, UTF-8 requirements
+- Updated all 13 agent definitions: added collaborator preamble, workspace path, UTF-8 note
+- Updated all 5 prompts: added collaborator role, project-scoped tmp
+- Updated all 4 skills: added collaborator role
+- Updated knowledge.md: collaborator role header, project-scoped workspace
+- Deleted ALL previous Alot1z comments from PRs #434, #436, #440, #442, #443, #444, #445, #446
+  (previous comments were empty titles with no body -- encoding/content failure)
+
+### Pending
+- Commit agent system updates to fork/main
+- Run full Ix-agent system on all 8 PRs
+- Post substantive collaborator review comments (UTF-8 safe, object-specific)
+
+### Fork State
+- upstream/main SHA: 043bc68f0fb7ddba736ee1490614cb3c68f8f819
+- fork/main SHA: d3e11eede93e77959a326838c61bbe3331eaead0
+- merge-base: 043bc68f0fb7ddba736ee1490614cb3c68f8f819
+- ahead/behind: 9 ahead, 0 behind
+
+### Workspace
+- Project-scoped: C:\tmp\Ix-remap-tmp
+- All agent execution records: C:\tmp\Ix-remap-tmp\agent-runs
+
+---
+
 ## Session 2026-08-14T22:50Z
 
 State: FINAL_GO

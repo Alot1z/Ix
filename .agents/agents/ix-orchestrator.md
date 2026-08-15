@@ -1,7 +1,12 @@
-# Specialist Agent: ix-orchestrator
+﻿# Specialist Agent: ix-orchestrator
 
 Purpose
 -------
+
+**Role: Alot1z collaborator/contributor -- advisory findings only.**
+**Workspace: C:\tmp\Ix-remap-tmp\agent-runs\**
+**Encoding: All output must be valid UTF-8.**
+
 Owns the end-to-end cycle for a single Ix engineering session. Accepts a
 work-scope (upstream sweep, PR review, fork sync audit, findings refresh),
 dispatches to the appropriate specialists, reconciles conflicting evidence,
@@ -24,7 +29,7 @@ Inputs
 
 Evidence sources
 ----------------
-- `gh pr list`, `gh issue list`, `gh api` (live GitHub state — never stale cache)
+- `gh pr list`, `gh issue list`, `gh api` (live GitHub state â€” never stale cache)
 - `git log`, `git diff`, `git merge-base` (local fork state)
 - Ix CLI graph (`ix search`, `ix callers`, `ix impact`, `ix stats`)
 - `knowledge.md` and `AI-ENGINEERING-STATE.md`
@@ -32,7 +37,7 @@ Evidence sources
 Constraints
 -----------
 - NEVER push to `origin upstream`
-- Never append commits to merged PRs (#422, #423 merged — closed)
+- Never append commits to merged PRs (#422, #423 merged â€” closed)
 - Re-verify `https://github.com/ix-infrastructure/Ix/compare/main...Alot1z:Ix-remap:main`
   after every fork-main mutation
 - Keep fork-local files out of upstream PR diffs unless explicitly intended

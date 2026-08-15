@@ -2,6 +2,42 @@
 
 Rules for any agent (AI or human) working in this repository.
 
+## Collaborator role — NOT maintainer
+
+All agents operate as **Alot1z collaborator/contributor**. We are NOT:
+- the Ix maintainer or code owner
+- the official repository reviewer
+- the final approval authority
+- the merge authority
+
+We MAY: investigate, reproduce, inspect, review, comment, improve code/tests/docs,
+commit to writable branches, push to authorized remotes, and provide advisory
+findings to maintainers.
+
+All review conclusions are **advisory**. Never write "I approve this PR",
+"this should merge", or "this is officially approved". Use collaborator language:
+"From an implementation perspective...", "I verified...", "I recommend...",
+"This is ready for maintainer/code-owner consideration."
+
+The final decision belongs to the repository maintainers/code owners.
+
+## Project-scoped execution workspace
+
+All execution-generated temporary artifacts must remain inside:
+
+    C:\tmp\Ix-remap-tmp
+
+Subdirectories: execution/, agent-runs/, reviews/, patches/, evidence/, state/.
+
+Do NOT write to arbitrary /tmp/ or global temp directories.
+Sub-agents MUST inherit the same project-scoped workspace root.
+
+## UTF-8 encoding requirement
+
+All generated text artifacts (agent files, reviews, state, comments, commits)
+must remain valid UTF-8. Prevent mojibake (e.g., `â€"` instead of `—`).
+Before committing modified files, validate UTF-8 and verify no encoding corruption.
+
 ## No attribution footers — ever
 
 Commit messages, PR descriptions, issue bodies, and comments must never carry
@@ -22,8 +58,14 @@ line, then the body. No footer block, no attribution, no tool branding.
   upstream repository or to any unrelated repository.
 - No GitHub writes (issues, PRs, labels, comments, reviews, merges, reactions,
   branch mutations) without explicit per-action user authorization.
-- PR/issue comments, when authorized, are technical navigation indexes only:
-  no narrative, no authorship language, no AI attribution.
+- PR/issue comments are **advisory collaborator feedback**, not authoritative
+  review verdicts. Use collaborator language, not maintainer language.
+- Before posting any comment: enumerate existing Alot1z comments on that object,
+  classify as CURRENT_USEFUL/STALE/WRONG_CONTEXT/REDUNDANT/SUPERSEDED/LOW_VALUE/AI_SLOP,
+  and remove stale/low-value ones first.
+- Comments must be object-specific: never paste a PHP review on an MCP PR, or
+  MCP findings on a TypeScript resolver PR. Cross-object contamination is a
+  review failure.
 
 ## Verification before claims
 
@@ -70,14 +112,20 @@ and confirm none of the above appear unless the PR intentionally includes them.
 This repository contains a persistent fork-local agent system in `.agents/`.
 The system provides reusable specialist role definitions and workflows for:
 
-- forksyc archaeology and upstream triage
+- fork archaeology and upstream triage
 - MCP/architecture/security/PR/Git/security/context/test/docs review
 - Ix-findings validation
 - session closeout and handoff
 
+All agents operate as **collaborator/contributor**, not as official reviewers.
+Agent outputs are advisory findings for maintainer consideration.
+
 Use these artifacts as defaults for recurring work. Override only when the
 specific task genuinely requires deviation. Document deviations in
 `planning/AI-ENGINEERING-STATE.md`.
+
+Agent execution records go to `C:\tmp\Ix-remap-tmp\agent-runs/`.
+Do not create state-only Git commits merely because an agent ran.
 
 ## Source-of-truth discipline
 

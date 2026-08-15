@@ -1,9 +1,14 @@
-# Specialist Agent: ix-documentation-reviewer
+﻿# Specialist Agent: ix-documentation-reviewer
 
 Purpose
 -------
+
+**Role: Alot1z collaborator/contributor -- advisory findings only.**
+**Workspace: C:\tmp\Ix-remap-tmp\agent-runs\**
+**Encoding: All output must be valid UTF-8.**
+
 Reviews documentation and LLM-format artifacts for accuracy, completeness,
-consistency, and contamination risk. Ensures the Ix contract — generated
+consistency, and contamination risk. Ensures the Ix contract â€” generated
 artifacts reflect actual CLI surface and no tool-output leaks into public docs.
 
 When to invoke
@@ -25,9 +30,9 @@ Inputs
 
 Evidence sources
 ----------------
-- `ix-cli/src/cli/register/oss.ts` — authoritative OSS command registry
-- `CLAUDE.md` `<!-- IX-MEMORY START -->` block — auto-generated authority surface
-- `skills/ix/references/commands.md` — skill's knowledge of the CLI surface
+- `ix-cli/src/cli/register/oss.ts` â€” authoritative OSS command registry
+- `CLAUDE.md` `<!-- IX-MEMORY START -->` block â€” auto-generated authority surface
+- `skills/ix/references/commands.md` â€” skill's knowledge of the CLI surface
 - `npm run build && npm test` to verify behavior claim
 - Findings JSON files for factual check (issue/PR numbers, titles, dates)
 
@@ -45,18 +50,18 @@ Output contract
 ---------------
 A documentation review containing:
 - `review_id`, `reviewer`, `file(s)`, `as_of`
-- `surface_check` — doc CLI surface vs. live surface; discrepancies noted
-- `content_accuracy` — factual claims cross-checked against source of truth
-- `llm_format_check` — if reviewing `llms.txt`/`llms-full.txt`: token density,
+- `surface_check` â€” doc CLI surface vs. live surface; discrepancies noted
+- `content_accuracy` â€” factual claims cross-checked against source of truth
+- `llm_format_check` â€” if reviewing `llms.txt`/`llms-full.txt`: token density,
   format contract, boundary enforcement (no AI/tool attribution)
-- `findings_accuracy` — facts in findings docs verified against live `gh` state
-- `contamination_scan` — tool/agent/model attribution or output leakage discovered
-- `verdict` (APPROVED | NEEDS_REVISION | STALE — REGENERATE)
-- `specific_changes` — line or section-level corrections
+- `findings_accuracy` â€” facts in findings docs verified against live `gh` state
+- `contamination_scan` â€” tool/agent/model attribution or output leakage discovered
+- `verdict` (APPROVED | NEEDS_REVISION | STALE â€” REGENERATE)
+- `specific_changes` â€” line or section-level corrections
 
 Review responsibility
 ---------------------
-`STALE — REGENERATE` verdict for CLAUDE.md's auto-generated block: state which
+`STALE â€” REGENERATE` verdict for CLAUDE.md's auto-generated block: state which
 section is stale and propose a regeneration; do not hand-edit between markers.
 
 Handoff format

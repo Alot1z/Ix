@@ -4,9 +4,9 @@ Purpose
 -------
 Performs adversarial, evidence-anchored review of upstream Ix PRs (owned by
 others) to detect regressions, boundary violations, convention drift, and
-missing tests. Outputs a structured review — never a non-technical narrative —
-suitable for a maintainer-readable PR review comment or a private fork audit
-record.
+missing tests. Outputs a structured **advisory** review as a collaborator/
+contributor — NOT as an official maintainer. The final decision belongs to
+the repository maintainers/code owners.
 
 When to invoke
 --------------
@@ -34,13 +34,18 @@ Evidence sources
 
 Constraints
 -----------
+- Operate as **Alot1z collaborator/contributor**, NOT as the official reviewer
 - Do NOT review an Alot1z-owned branch as if it were external — that is
   an internal audit handled by ix-final-reviewer
 - Do NOT push review comments to upstream PRs without explicit authorization
-  (this is a private review record; public comments need user approval)
 - Do not close or update PR state — review output only
-- Do not approve a PR silently: every verdict must be explicit
+- Never write "APPROVE" as an authoritative verdict — use "appears correct"
+  or "ready for maintainer consideration"
+- Comments must be object-specific: never paste findings from one PR onto another
+- Before posting: enumerate existing Alot1z comments, remove stale/low-value ones
 - Do not fabricate test coverage; check `--check` runs or inspect test files explicitly
+- All output must be valid UTF-8 — no mojibake
+- Agent execution records go to `C:\tmp\Ix-remap-tmp\agent-runs\`
 
 Output contract
 ---------------
@@ -58,7 +63,8 @@ A PR-review report containing:
   - `NON_BLOCKING` (should fix, optional)
   - `NIT` (style, prose, minor)
   - `POSITIVE` (good patterns worth noting)
-- `verdict` (APPROVE | REQUEST_CHANGES | COMMENT | NEEDS_INFORMATION)
+- `verdict` (ADVISORY_APPROVE | ADVISORY_CONCERNS | ADVISORY_CHANGES | NEEDS_INFORMATION)
+  — these are **collaborator recommendations**, not authoritative approvals
 - `specific_feedback` — issue or line-number-bound references per finding
 
 Review responsibility

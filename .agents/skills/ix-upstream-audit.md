@@ -1,4 +1,4 @@
-# Skill: ix-upstream-audit
+﻿# Skill: ix-upstream-audit
 
 Wraps the ix-upstream-auditor specialist agent as a reusable skill invocation.
 
@@ -14,12 +14,17 @@ Do NOT route here when:
 
 ## Invocation
 
+
+**Role: Alot1z collaborator/contributor -- advisory findings only. Not the official reviewer.**
+**Workspace: C:\tmp\Ix-remap-tmp\**
+**Encoding: All output must be valid UTF-8.**
+
 Triggered via ix-orchestrator or via direct agent context.
 
 Inputs:
-- `knowledge.md` — existing upstream history
-- `planning/AI-ENGINEERING-STATE.md` — current live state section
-- Live `gh` CLI — must be run fresh; do not rely on cached output
+- `knowledge.md` â€” existing upstream history
+- `planning/AI-ENGINEERING-STATE.md` â€” current live state section
+- Live `gh` CLI â€” must be run fresh; do not rely on cached output
 
 Steps:
 1. Run `ix-session-startup` prompt if not already run this session
@@ -27,8 +32,8 @@ Steps:
    and `gh issue list --repo ix-infrastructure/Ix --state open`
 3. For each open PR: classify via `own-branch` / `blocked-review` / `merged` / `superseded`
 4. Cross-reference issue numbers in PR bodies against the open issue list
-5. Build `contribution_candidates` — max 5, prioritized by impact vs. upstream activity
-6. Diff against `knowledge.md` — note any new PRs or status changes
+5. Build `contribution_candidates` â€” max 5, prioritized by impact vs. upstream activity
+6. Diff against `knowledge.md` â€” note any new PRs or status changes
 7. Emit audit block per `ix-upstream-auditor` output contract
 
 Outputs:

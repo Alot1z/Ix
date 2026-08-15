@@ -1,4 +1,9 @@
-# Prompt: ix-fork-sync-and-contribution-gate
+﻿# Prompt: ix-fork-sync-and-contribution-gate
+
+
+**Role: Alot1z collaborator/contributor -- advisory findings only. Not the official reviewer.**
+**Workspace: C:\tmp\Ix-remap-tmp\**
+**Encoding: All output must be valid UTF-8.**
 
 Purpose
 -------
@@ -16,11 +21,11 @@ Pre-mutation gate
 Before mutating fork/main:
 1. `git fetch origin upstream && git fetch origin fork`
 2. Confirm: `git rev-list --left-right --count origin/upstream/main...HEAD`
-   → must show `0 <N>` (0 behind, N ahead) — if behind, stop and report
+   â†’ must show `0 <N>` (0 behind, N ahead) â€” if behind, stop and report
 3. Inspect: `git diff --stat origin/upstream/main...HEAD`
-   — every file must be accounted for as intentional fork-local infrastructure
+   â€” every file must be accounted for as intentional fork-local infrastructure
 4. Inspect any upstream-contribution branch diff (if applicable):
-   `git diff origin/upstream/main...HEAD` on that branch — must not contain
+   `git diff origin/upstream/main...HEAD` on that branch â€” must not contain
    `AGENTS.md`, `.agents/`, `knowledge.md`, `planning/`, or any fork-local file
 5. Emit pre-mutation gate record:
    - gate status: CLEAR | BLOCKED
@@ -32,9 +37,9 @@ Post-mutation gate
 ------------------
 After commit to fork/main (or after pushing a contribution branch):
 1. `git fetch origin upstream && git fetch origin fork`
-2. Recompute ahead/behind — confirm still 0 behind
+2. Recompute ahead/behind â€” confirm still 0 behind
 3. Inspect: `git diff --stat origin/upstream/main...HEAD`
-   — confirm changed files match the intent of the commit
+   â€” confirm changed files match the intent of the commit
 4. If upstream-contribution branch was pushed: re-inspect its diff against
    upstream/main for fork-local leakage
 5. Emit post-mutation gate record with SHA, file list, and comparison URL:
@@ -61,5 +66,5 @@ is intentional and authorized.
 Constraints
 -----------
 - A BLOCKED gate stops the write. Escalate to user for override.
-- Never say "verified" for the gate itself — the gate IS the verification.
+- Never say "verified" for the gate itself â€” the gate IS the verification.
 - Record both pre- and post-mutation gate states in `AI-ENGINEERING-STATE.md`.

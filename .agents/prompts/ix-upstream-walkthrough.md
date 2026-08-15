@@ -1,4 +1,9 @@
-# Prompt: ix-upstream-walkthrough
+﻿# Prompt: ix-upstream-walkthrough
+
+
+**Role: Alot1z collaborator/contributor -- advisory findings only. Not the official reviewer.**
+**Workspace: C:\tmp\Ix-remap-tmp\**
+**Encoding: All output must be valid UTF-8.**
 
 Purpose
 -------
@@ -28,22 +33,22 @@ Sequence
 
 Classification rules
 --------------------
-- `own-branch` — Alot1z-authored, branch exists in fork, open upstream PR
-- `blocked-review` — any other author, CI green, mergeStateStatus=BLOCKED
-- `merged` — closed+merged, do not touch
-- `superseded` — explicitly replaced by another PR/maintainer-stated
-- `zero-opportunity` — no gap; existing PR covers; duplicate; out of scope
-- `contribution-candidate` — genuine open work with no Alot1z-backed PR
+- `own-branch` â€” Alot1z-authored, branch exists in fork, open upstream PR
+- `blocked-review` â€” any other author, CI green, mergeStateStatus=BLOCKED
+- `merged` â€” closed+merged, do not touch
+- `superseded` â€” explicitly replaced by another PR/maintainer-stated
+- `zero-opportunity` â€” no gap; existing PR covers; duplicate; out of scope
+- `contribution-candidate` â€” genuine open work with no Alot1z-backed PR
 
 Output contract
 ---------------
 - `walkthrough_id`, `as_of`
 - `pr_register` with classification per PR
 - `issue_register` with `has_open_pr` flag
-- `supersession_chains` (old → new with evidence)
+- `supersession_chains` (old â†’ new with evidence)
 - `contribution_candidates` (top 5, rationale, scope, risk)
 - `fork_branch_inventory` (Alot1z branches in fork, mapped to upstream PRs)
-- `freshness_gap` — any state divergence from `knowledge.md`
+- `freshness_gap` â€” any state divergence from `knowledge.md`
 
 Constraints
 -----------

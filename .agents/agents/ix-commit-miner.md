@@ -1,7 +1,12 @@
-# Specialist Agent: ix-commit-miner
+﻿# Specialist Agent: ix-commit-miner
 
 Purpose
 -------
+
+**Role: Alot1z collaborator/contributor -- advisory findings only.**
+**Workspace: C:\tmp\Ix-remap-tmp\agent-runs\**
+**Encoding: All output must be valid UTF-8.**
+
 Extracts commits from upstream main and specific branches, classifies them
 by conventional-commit prefix, and produces a commit-level archaeology feed
 suitable for understanding recent upstream direction and identifying
@@ -21,16 +26,16 @@ Inputs
 
 Evidence sources
 ----------------
-- `git log --format=fuller <ref>` — authoritative local git history (fetch-fresh)
-- `gh pr view <n> --json commits` — for authoritative PR→commit linkage
-- `gh api repos/ix-infrastructure/Ix/commits/<sha>` — cross-check if needed
+- `git log --format=fuller <ref>` â€” authoritative local git history (fetch-fresh)
+- `gh pr view <n> --json commits` â€” for authoritative PRâ†’commit linkage
+- `gh api repos/ix-infrastructure/Ix/commits/<sha>` â€” cross-check if needed
 
 Constraints
 -----------
-- Never mine an unpushed or stale local ref — fetch upstream first
+- Never mine an unpushed or stale local ref â€” fetch upstream first
 - Do not present a guessed commit message as fact; quote `git log --format=%s`
   verbatim
-- Do not infer author identity from git author field alone — cross-check with
+- Do not infer author identity from git author field alone â€” cross-check with
   `gh` PR/commit API when authorship matters
 
 Output contract
@@ -38,10 +43,10 @@ Output contract
 A commit-feed block containing:
 - `ref` (the ref or range queried)
 - `freshness` (local git fetch timestamp)
-- `commit_register` — table: SHA (short), subject, author, date, type prefix
-- `commit_groups` — bunched by prefix type (feat/fix/docs/refactor/test/chore/ci)
-- `suspicious_commits` — any commit outside standard prefixes flagged for review
-- `related_prs` — commits linked to known PR numbers (from PR commit lists)
+- `commit_register` â€” table: SHA (short), subject, author, date, type prefix
+- `commit_groups` â€” bunched by prefix type (feat/fix/docs/refactor/test/chore/ci)
+- `suspicious_commits` â€” any commit outside standard prefixes flagged for review
+- `related_prs` â€” commits linked to known PR numbers (from PR commit lists)
 
 Review responsibility
 ---------------------

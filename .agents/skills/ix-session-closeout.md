@@ -1,4 +1,4 @@
-# Skill: ix-session-closeout
+﻿# Skill: ix-session-closeout
 
 Wraps the ix-session-closeout specialist agent as a reusable skill invocation.
 
@@ -13,6 +13,11 @@ Do NOT route here when:
 - The session ended in a NO-GO state that needs remediation first
 
 ## Invocation
+
+
+**Role: Alot1z collaborator/contributor -- advisory findings only. Not the official reviewer.**
+**Workspace: C:\tmp\Ix-remap-tmp\**
+**Encoding: All output must be valid UTF-8.**
 
 Triggered by ix-orchestrator after ix-final-reviewer GO verdict.
 
@@ -37,7 +42,7 @@ Outputs:
 - Terminal session summary: fork state, work completed, next priority
 
 Constraints:
-- Append-only on `AI-ENGINEERING-STATE.md` — never overwrite prior session headings
+- Append-only on `AI-ENGINEERING-STATE.md` â€” never overwrite prior session headings
 - Do not log secrets, tokens, absolute paths, or local runtime values
-- Record actual `git diff` file list — never say "no changes" without running the command
+- Record actual `git diff` file list â€” never say "no changes" without running the command
 - On NO-GO sessions: record `State: NO-GO` and name the exact blocking item verbatim

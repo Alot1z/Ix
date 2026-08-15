@@ -1,6 +1,17 @@
-# Ix-remap — Project Knowledge
+# Ix-remap -- Project Knowledge
 
-Last updated: 2026-08-14T23:20Z (supersession comments posted on all 8 open PRs)
+Last updated: 2026-08-15T01:50Z (agent system updated to collaborator role; all stale PR comments removed)
+
+## Collaborator Role
+
+All agents operate as **Alot1z collaborator/contributor** -- NOT as official
+Ix maintainers or reviewers. All review findings are advisory. The final
+decision belongs to the repository maintainers/code owners.
+
+## Project-Scoped Workspace
+
+All execution artifacts go to `C:\tmp\Ix-remap-tmp\` (not arbitrary /tmp/).
+All text output must be valid UTF-8 (no mojibake).
 
 ## Repository Architecture
 

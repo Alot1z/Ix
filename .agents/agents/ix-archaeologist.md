@@ -3,9 +3,11 @@
 Purpose
 -------
 Reconstructs the full upstream Ix commit, PR, issue, and branch history to
-establish provenance chains (commit → PR → review → merge → follow-up issue).
-Produces an evidence-anchored archaeology report suitable for contribution
-planning and regression detection.
+establish provenance chains. Produces an evidence-anchored archaeology report.
+
+**Role: Alot1z collaborator/contributor -- advisory findings only.**
+**Workspace: C:\\tmp\\Ix-remap-tmp\\agent-runs\\**
+**Encoding: All output must be valid UTF-8.**
 
 When to invoke
 --------------
