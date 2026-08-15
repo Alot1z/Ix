@@ -3000,7 +3000,11 @@ function trimPhpNamespace(namespace: string | undefined): string {
 }
 
 function phpTypeFqcn(entity: ParsedEntity): string | undefined {
-  if (entity.language !== SupportedLanguages.PHP || !PHP_TYPE_KINDS.has(entity.kind) || entity.container) {
+  // PHP types (class/interface/trait/enum) can never be nested, so a container
+  // on one is always an inclusive-line-range artifact from findEnclosing (two
+  // sibling declarations on the same line). Dropping it here would silently
+  // remove a legitimate type from the FQCN index — a false negative.
+  if (entity.language !== SupportedLanguages.PHP || !PHP_TYPE_KINDS.has(entity.kind)) {
     return undefined;
   }
   const namespace = trimPhpNamespace(entity.packageScope);
@@ -3010,7 +3014,9 @@ function phpTypeFqcn(entity: ParsedEntity): string | undefined {
 function ambiguousPhpTypeNames(entities: ParsedEntity[]): Set<string> {
   const counts = new Map<string, number>();
   for (const entity of entities) {
-    if (entity.language !== SupportedLanguages.PHP || !PHP_TYPE_KINDS.has(entity.kind) || entity.container) {
+    // Same rationale as phpTypeFqcn: a PHP type carrying a container is a
+    // same-line artifact, not a member, and still occupies its FQCN.
+    if (entity.language !== SupportedLanguages.PHP || !PHP_TYPE_KINDS.has(entity.kind)) {
       continue;
     }
     const name = entity.name.toLowerCase();

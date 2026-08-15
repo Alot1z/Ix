@@ -845,6 +845,55 @@ class One { public function make() { return new Thing(); } }
     ).toBeGreaterThan(0);
   });
 
+  it('indexes a PHP type that shares its line with a sibling declaration', () => {
+    // `class A {} class B {}` on one line is valid PHP. findEnclosing's inclusive
+    // line ranges treat B as nested inside A, so B carries a bogus container.
+    // PHP types can never be nested, so the FQCN index must not drop B — the
+    // pre-#446 baseline resolved this import at 0.9 and dropping it is a false
+    // negative.
+    const consumer = parseFile(
+      '/repo/Consumer.php',
+      `<?php
+use Vendor\\Package\\B;
+class C { public function make() { return new B(); } }
+      `,
+    )!;
+    const vendor = parseFile(
+      '/repo/Vendor/Package/B.php',
+      '<?php namespace Vendor\\Package; class A {} class B {}',
+    )!;
+
+    const edges = resolveEdges([consumer, vendor]).filter(
+      (edge) => edge.dstFilePath === '/repo/Vendor/Package/B.php',
+    );
+
+    expect(edges.filter((edge) => edge.predicate === 'IMPORTS')).toHaveLength(1);
+    expect(edges[0]?.confidence).toBe(0.9);
+  });
+
+  it('keeps resolving a PHP type declared on its own line', () => {
+    // Positive control: the same file layout split across lines gives B a clean
+    // top-level declaration and must keep resolving through the FQCN index.
+    const consumer = parseFile(
+      '/repo/Consumer.php',
+      `<?php
+use Vendor\\Package\\B;
+class C { public function make() { return new B(); } }
+      `,
+    )!;
+    const vendor = parseFile(
+      '/repo/Vendor/Package/B.php',
+      '<?php namespace Vendor\\Package; class A {}\nclass B {}',
+    )!;
+
+    const edges = resolveEdges([consumer, vendor]).filter(
+      (edge) => edge.dstFilePath === '/repo/Vendor/Package/B.php' && edge.predicate === 'IMPORTS',
+    );
+
+    expect(edges).toHaveLength(1);
+    expect(edges[0]?.confidence).toBe(0.9);
+  });
+
   it('resolves a TypeScript call when the imported definition is outside the parse batch', () => {
     const caller = fileResult(
       '/repo/consumer.ts',
