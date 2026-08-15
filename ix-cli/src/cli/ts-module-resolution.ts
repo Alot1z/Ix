@@ -140,7 +140,50 @@ function parseJsonc(text: string): unknown {
  */
 const MAX_CONFIG_BYTES = 1024 * 1024;
 
-function readObject(filePath: string): Record<string, unknown> | undefined {
+/**
+ * True when the file we are *holding open* lives inside the workspace.
+ *
+ * The lexical check in {@link isWithinWorkspace} cannot see through a symlinked
+ * directory: every segment of `./linked/tsconfig.json` is inside the workspace
+ * by path arithmetic even when `linked/` points somewhere else entirely. Only
+ * the resolved path shows that, so resolve it and re-check.
+ *
+ * Resolving the name a second time reopens the question of whether it still
+ * denotes the file we hold, so the resolved path is confirmed to be the same
+ * inode as the open handle. Without that, swapping the symlink between the open
+ * and the resolve would let an outside file be read under an inside name.
+ * (`ino` is 0 on filesystems that do not report one — chiefly some Windows
+ * configurations — where this degrades to the plain resolved-path check.)
+ *
+ * The ROOT is resolved too, and that is not symmetry for its own sake: a
+ * resolved file compared against an unresolved root rejects every config
+ * whenever the workspace is itself reached through a link — macOS `/var` ->
+ * `/private/var`, a home directory on a network mount, a `~/code` symlink. That
+ * would silently switch tsconfig resolution off for those users, and no CI
+ * runner here has a symlinked root to notice it.
+ */
+function openedWithinWorkspace(
+  workspaceRoot: string,
+  filePath: string,
+  opened: fs.Stats,
+): boolean {
+  try {
+    const resolved = fs.realpathSync(filePath);
+    const viaResolved = fs.statSync(resolved);
+    if (viaResolved.dev !== opened.dev || viaResolved.ino !== opened.ino) return false;
+    let resolvedRoot: string;
+    try {
+      resolvedRoot = fs.realpathSync(workspaceRoot);
+    } catch {
+      resolvedRoot = workspaceRoot; // unreadable root: fall back to the lexical check
+    }
+    return isWithinWorkspace(resolvedRoot, resolved);
+  } catch {
+    return false;
+  }
+}
+
+function readObject(workspaceRoot: string, filePath: string): Record<string, unknown> | undefined {
   try {
     // Open once and fstat the same handle so the checks and the read observe the
     // same inode — no stat-then-read window (CodeQL js/file-system-race). This is
@@ -161,6 +204,7 @@ function readObject(filePath: string): Record<string, unknown> | undefined {
       // and no EOF) — neither of which a size check catches, since both
       // report size 0.
       if (!stats.isFile() || stats.size > MAX_CONFIG_BYTES) return undefined;
+      if (!openedWithinWorkspace(workspaceRoot, filePath, stats)) return undefined;
       text = fs.readFileSync(handle, "utf8");
     } finally {
       fs.closeSync(handle);
@@ -215,7 +259,7 @@ function loadConfig(
   if (loading.has(absoluteConfig)) return undefined;
   loading.add(absoluteConfig);
 
-  const raw = readObject(absoluteConfig);
+  const raw = readObject(workspaceRoot, absoluteConfig);
   if (!raw) {
     cache.set(absoluteConfig, undefined);
     loading.delete(absoluteConfig);

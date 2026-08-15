@@ -206,6 +206,66 @@ describe("createTypeScriptModuleResolver", () => {
   });
 
   it.skipIf(process.platform === "win32")(
+    "refuses an extends that leaves the workspace through a symlinked directory",
+    () => {
+      // Every segment of "./linked/tsconfig.json" is inside the workspace by
+      // path arithmetic, so a lexical containment check passes it. Only the
+      // path we actually opened shows that `linked/` is a link to elsewhere.
+      const root = workspace();
+      const outside = mkdtempSync(join(tmpdir(), "ix-outside-"));
+      workspaces.push(outside);
+      writeFileSync(
+        join(outside, "tsconfig.json"),
+        JSON.stringify({ compilerOptions: { paths: { "@evil": ["target"] } } }),
+      );
+      try {
+        symlinkSync(outside, join(root, "linked"), "dir");
+      } catch {
+        return; // no permission to symlink (e.g. restricted CI) — nothing to assert
+      }
+      const config = write(root, "tsconfig.json", JSON.stringify({ extends: "./linked/tsconfig.json" }));
+      const consumer = write(root, "src/consumer.ts");
+      const target = write(root, "target.ts");
+      const resolve = createTypeScriptModuleResolver(root, [config, consumer, target]);
+
+      expect(resolve("src/consumer.ts", "@evil")).toBeUndefined();
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "still resolves when the workspace root is itself reached through a symlink",
+    () => {
+      // Comparing a resolved file path against an unresolved root rejects every
+      // config whenever the root is a link — macOS /var -> /private/var, a home
+      // on a network mount, a ~/code symlink. No CI runner here has one, so this
+      // is the only thing standing between that and a silent no-op for those
+      // users.
+      const real = workspace();
+      const link = join(mkdtempSync(join(tmpdir(), "ix-linkroot-")), "root");
+      workspaces.push(dirname(link));
+      try {
+        symlinkSync(real, link, "dir");
+      } catch {
+        return; // no permission to symlink (e.g. restricted CI) — nothing to assert
+      }
+      write(
+        real,
+        "tsconfig.json",
+        JSON.stringify({ compilerOptions: { baseUrl: ".", paths: { "@core": ["src/worker"] } } }),
+      );
+      write(real, "src/worker.ts");
+      write(real, "src/consumer.ts");
+      const resolve = createTypeScriptModuleResolver(link, [
+        join(link, "tsconfig.json"),
+        join(link, "src/worker.ts"),
+        join(link, "src/consumer.ts"),
+      ]);
+
+      expect(resolve("src/consumer.ts", "@core")).toEqual(["src/worker.ts"]);
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
     "refuses an extends that reaches a device node through a symlink",
     () => {
       // Containment alone does not cover this: the link sits inside the
