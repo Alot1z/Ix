@@ -3376,16 +3376,26 @@ export function resolveEdges(
     if (result.language !== SupportedLanguages.PHP) continue;
     // A `use` is scoped to its namespace *block*, but this index is per file.
     // In a file with several braced namespaces, an import in one block would be
-    // applied to the others — resolving a name that a later block declares
+    // applied to the others -- resolving a name that a later block declares
     // itself, and pointing it confidently at the wrong file. One namespace per
     // file is the PSR-12 norm, so skip the rare multi-block file entirely
     // rather than mis-resolve it; it simply keeps the pre-existing behaviour.
-    const namespaceScopes = new Set(
-      result.entities
-        .filter(entity => entity.kind !== 'file' && typeof entity.packageScope === 'string')
-        .map(entity => entity.packageScope as string),
+    //
+    // Count namespace-definition module entities (entities with kind 'module'
+    // that are not import-use modules). This is more accurate than counting
+    // distinct packageScope strings: two braced blocks sharing a namespace
+    // name produce one packageScope but two module entities, and a use-only
+    // block (no type definitions) adds no packageScope but still emits its
+    // own module entity.
+    const importModuleNames = new Set(
+      result.relationships
+        .filter(rel => rel.predicate === 'IMPORTS')
+        .map(rel => rel.dstName),
     );
-    if (namespaceScopes.size > 1) continue;
+    const namespaceModules = result.entities.filter(
+      entity => entity.kind === 'module' && !importModuleNames.has(entity.name),
+    ).length;
+    if (namespaceModules > 1) continue;
     for (const rel of result.relationships) {
       if (
         rel.predicate !== 'IMPORTS' ||

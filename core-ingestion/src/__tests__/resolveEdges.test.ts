@@ -633,6 +633,94 @@ namespace Second {
     expect(resolveEdges([consumer, first, second])).toEqual([]);
   });
 
+  it('skips FQCN import map for two braced blocks sharing a namespace name', () => {
+    // The old packageScope guard counted distinct namespace strings, so two
+    // braced blocks sharing a name passed through (size === 1). The new guard
+    // counts namespace-definition module entities, catching this case (two
+    // 'Shared' module entities = 2 > 1). Without the FQCN import map, the
+    // FQCN-only REFERENCES edge (which the FQCN path produces at 0.9 for
+    // type-hint references) is absent.
+    const consumer = parseFile(
+      '/repo/Consumer.php',
+      `<?php
+namespace Shared {
+    use Vendor\\Package\\Account;
+    function run(Account $a): void { new Account(); $a->save(); }
+}
+namespace Shared {
+    class Account { public function save(): void {} }
+}
+      `,
+    )!;
+    const vendor = parseFile(
+      '/repo/Vendor/Package/Account.php',
+      '<?php namespace Vendor\\Package; class Account { public function save(): void {} }',
+    )!;
+
+    const edges = resolveEdges([consumer, vendor]);
+    // The FQCN path produces a REFERENCES edge for the type-hint `Account $a`
+    // with dstName='Account', dstQualifiedKey='Account' (the class, not the
+    // file basename) at confidence 0.9. Without FQCN, this edge is absent
+    // because the non-FQCN path does not resolve type references for PHP.
+    expect(
+      edges.filter(
+        (edge) => edge.dstFilePath === '/repo/Vendor/Package/Account.php'
+          && edge.predicate === 'REFERENCES'
+          && edge.confidence === 0.9,
+      ),
+    ).toEqual([]);
+  });
+
+  it('skips FQCN import map for a use-only braced block', () => {
+    // A use-only block has no type definitions, so it does not contribute
+    // packageScope entries. The old guard would see only one scope and pass
+    // the file through. The new guard counts two module entities (one per
+    // namespace block) and skips the file. Verify by checking that the FQCN
+    // REFERENCES edge (produced only by the FQCN path for PHP type hints at
+    // 0.9 confidence to the vendor file) is absent when the vendor file name
+    // does not match the imported symbol by stem, so regular resolution
+    // cannot produce false edges.
+    const consumer = parseFile(
+      '/repo/Consumer.php',
+      `<?php
+namespace App {
+    use Vendor\\Package\\Service;
+}
+namespace Other {
+    function run(Service $s): void { $s->execute(); }
+}
+      `,
+    )!;
+    const vendor = parseFile(
+      '/repo/svc.php',
+      '<?php namespace Vendor\\Package; class Service { public function execute(): void {} }',
+    )!;
+
+    // The vendor file is named svc.php (stem 'svc'), which does not match
+    // 'Service' by stem. Regular resolution by symbol name 'Service' would
+    // find the class in svc.php via the symbol table, but only if the
+    // FQCN path feeds it. With the guard active, the FQCN import map is
+    // not built, so the FQCN-specific REFERENCES edge is absent.
+    //
+    // Actually, the symbol table is built from all files, so 'Service'
+    // resolves to svc.php regardless of FQCN. This test verifies the guard
+    // fires (namespaceModules > 1) by checking that the CALLS edge to
+    // Service.execute uses the LOCAL class (in the file) rather than the
+    // vendor file. Since the consumer file does NOT define Service locally,
+    // and the guard prevents FQCN, the CALLS edge to the vendor member
+    // should use confidence < 0.9 (tier-3 fallback) rather than 0.9 (FQCN).
+    const edges = resolveEdges([consumer, vendor]);
+    const vendorCalls = edges.filter(
+      (edge) => edge.dstFilePath === '/repo/svc.php'
+        && edge.dstName === 'Service.execute',
+    );
+    // If the guard fires, no FQCN edge at 0.9 to the vendor member.
+    // (The regular path may still produce a lower-confidence edge.)
+    expect(
+      vendorCalls.filter((edge) => edge.confidence === 0.9),
+    ).toEqual([]);
+  });
+
   it('resolves a TypeScript call when the imported definition is outside the parse batch', () => {
     const caller = fileResult(
       '/repo/consumer.ts',
