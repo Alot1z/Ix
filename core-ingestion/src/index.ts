@@ -3991,9 +3991,13 @@ export function resolveEdges(
           for (const fp of providerFiles.length === 1 ? providerFiles : []) {
             // `imported` is the literal sentinel 'default' for a default import, never a
             // real export name, so a provider member that happens to be *called* `default`
-            // (a method, getter, or static) must not satisfy the fallback.
+            // (a method, getter, or static) must not satisfy the fallback. The same holds
+            // for any other member: a class method can never be a module export, so a
+            // renamed `import { Base as LocalBase }` must not bind to `M.Base`. Requiring a
+            // plain (unqualified) qualified key restricts the fallback to top-level symbols.
             const local = filePublicNames.get(fp)?.get(binding.imported)
-              ?? (binding.imported !== 'default' && fileHasSymbol.get(fp)?.has(binding.imported)
+              ?? (binding.imported !== 'default'
+                  && fileQKeys.get(fp)?.get(binding.imported)?.includes(binding.imported) === true
                 ? binding.imported
                 : undefined);
             if (local && fileHasSymbol.get(fp)?.has(local)) publicMatches.push({ fp, local });

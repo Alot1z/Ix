@@ -635,6 +635,42 @@ describe('resolveEdges', () => {
     ).toEqual([]);
   });
 
+  it('does not bind a renamed EXTENDS import to a provider member', () => {
+    // `import { Base as LocalBase }` resolves by the *imported* name (`Base`),
+    // and the fallback matches any symbol in the provider file — including a
+    // class method. A method can never be a module export, so an edge to
+    // `M.Base` is confident and wrong; the PR base never emitted one.
+    const provider = parseFile(
+      '/repo/m.ts',
+      'export class M { Base() {} }\n',
+    )!;
+    const consumer = parseFile(
+      '/repo/n.ts',
+      'import { Base as LocalBase } from "./m";\nexport class Child extends LocalBase {}\n',
+    )!;
+
+    const resolved = resolveEdges([consumer, provider]);
+    expect(
+      resolved.filter((e) => e.predicate === 'EXTENDS' && e.dstQualifiedKey === 'M.Base'),
+    ).toEqual([]);
+  });
+
+  it('does not bind a renamed REFERENCES import to a provider member', () => {
+    const provider = parseFile(
+      '/repo/m.ts',
+      'export class M { User() {} }\n',
+    )!;
+    const consumer = parseFile(
+      '/repo/n.ts',
+      'import { type User as ExternalUser } from "./m";\nexport function use(value: ExternalUser) { return value; }\n',
+    )!;
+
+    const resolved = resolveEdges([consumer, provider]);
+    expect(
+      resolved.filter((e) => e.predicate === 'REFERENCES' && e.dstQualifiedKey === 'M.User'),
+    ).toEqual([]);
+  });
+
   it('uses caller-supplied parse results instead of re-parsing', () => {
     // The CLI parses prescan sources on its worker pool and hands the results
     // in, so the index costs no main-thread parsing. Proven by supplying a
