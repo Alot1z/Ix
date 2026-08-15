@@ -225,6 +225,13 @@ export interface FileParseResult {
    * Absent for non-PHP files and for PHP files in the global namespace.
    */
   phpNamespaceBlocks?: number;
+  /**
+   * PHP only: true when the file mixes the global scope with namespace blocks
+   * (a global `use` or type declaration alongside a `namespace` block), so a
+   * per-file import map would let one scope's `use` resolve another scope's
+   * names. Absent for non-PHP files and for single-scope PHP files.
+   */
+  phpMixedScope?: boolean;
   fileRole: RoleClassification;
 }
 
@@ -2003,6 +2010,12 @@ interface PhpNamespaces {
   spans: PhpNamespaceSpan[];
   /** Every top-level `namespace` declaration, braced or not. */
   blocks: number;
+  /**
+   * True when the file has a `use` or type declaration in the GLOBAL scope —
+   * before the first unbraced `namespace X;`, or outside any braced block.
+   * Such a file mixes scopes, so a per-file import map cannot be trusted.
+   */
+  globalScope: boolean;
 }
 
 /**
@@ -2020,21 +2033,47 @@ interface PhpNamespaces {
  * it is handled by the ancestor walk in {@link phpNamespaceForNode} and is
  * excluded from `spans` — but it still counts towards `blocks`.
  */
+/**
+ * Top-level PHP nodes that live in the GLOBAL scope when they appear outside a
+ * namespace: a `use` binds names, and a type declaration can be shadowed by (or
+ * shadow) a `use` in another scope, so either one makes a per-file import map
+ * cross a scope boundary. `php_tag` (the open tag), `declare_statement`,
+ * `function_definition` and `const_declaration` are deliberately absent — none
+ * of them changes which scope a type name resolves to for the FQCN import map.
+ * A global `use function` / `use const` / aliased `use` is flagged too even
+ * though it never enters that map; the skip is conservative, matching the
+ * existing multi-block guard.
+ */
+const PHP_GLOBAL_SCOPE_TYPES = new Set([
+  'namespace_use_declaration',
+  'class_declaration',
+  'interface_declaration',
+  'trait_declaration',
+  'enum_declaration',
+]);
+
 function collectPhpNamespaces(rootNode: any): PhpNamespaces {
   const spans: PhpNamespaceSpan[] = [];
   let blocks = 0;
+  let globalScope = false;
   // `namedChildren` materializes the list in a single walk; indexing
   // `namedChild(i)` in a loop is what made the original scan expensive.
   for (const child of rootNode.namedChildren ?? []) {
-    if (!child || child.type !== 'namespace_definition') continue;
-    blocks++;
-    if (child.childForFieldName?.('body')) continue;
-    spans.push({
-      startIndex: child.startIndex,
-      namespace: child.childForFieldName?.('name')?.text?.replace(/\s+/g, '') ?? '',
-    });
+    if (!child) continue;
+    if (child.type === 'namespace_definition') {
+      blocks++;
+      if (child.childForFieldName?.('body')) continue;
+      spans.push({
+        startIndex: child.startIndex,
+        namespace: child.childForFieldName?.('name')?.text?.replace(/\s+/g, '') ?? '',
+      });
+    } else if (spans.length === 0 && PHP_GLOBAL_SCOPE_TYPES.has(child.type)) {
+      // Before the first unbraced namespace, a top-level `use` or type is in
+      // the global scope (braced blocks never cover their top-level siblings).
+      globalScope = true;
+    }
   }
-  return { spans, blocks };
+  return { spans, blocks, globalScope };
 }
 
 function phpNamespaceForNode(node: any, spans: PhpNamespaceSpan[]): string | undefined {
@@ -2208,7 +2247,7 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
     // than rescanning the top level for every definition.
     const phpNamespaces: PhpNamespaces = language === SupportedLanguages.PHP
       ? collectPhpNamespaces(tree.rootNode)
-      : { spans: [], blocks: 0 };
+      : { spans: [], blocks: 0, globalScope: false };
 
     // --- First pass: collect definitions ---
     for (const match of pass1Matches) {
@@ -2904,6 +2943,7 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
       // file. A key that is present-but-undefined still serializes, which would
       // rewrite every checked-in parseFile snapshot for no behavioural reason.
       ...(phpNamespaces.blocks > 0 ? { phpNamespaceBlocks: phpNamespaces.blocks } : {}),
+      ...(phpNamespaces.blocks > 0 && phpNamespaces.globalScope ? { phpMixedScope: true } : {}),
       fileRole: classifyFileRole(filePath, source),
     };
   } catch (e) {
@@ -3412,7 +3452,12 @@ export function resolveEdges(
     // still two scopes), and a block containing only `use` statements declares
     // no entities at all (no scope string, but its imports are still confined
     // to it). Both were mis-classified as single-namespace files.
-    if ((result.phpNamespaceBlocks ?? 0) > 1) continue;
+    //
+    // The same leak crosses the global↔namespace boundary, which the block
+    // count cannot see: a GLOBAL `use` must not bind names inside a namespace
+    // block, and a block-scoped `use` must not bind names in the global scope.
+    // A file that mixes them carries `phpMixedScope`, so it is skipped here too.
+    if ((result.phpNamespaceBlocks ?? 0) > 1 || result.phpMixedScope === true) continue;
     for (const rel of result.relationships) {
       if (
         rel.predicate !== 'IMPORTS' ||

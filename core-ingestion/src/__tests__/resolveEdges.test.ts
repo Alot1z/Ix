@@ -718,6 +718,133 @@ namespace Second {
     expect(resolveEdges([consumer, first, second])).toEqual([]);
   });
 
+  it('does not resolve a block-scoped name to a GLOBAL use', () => {
+    // The `use` is in the global scope, so it must not bind names inside
+    // `namespace A` — where Thing is declared right in the block.
+    const consumer = parseFile(
+      '/repo/Consumer.php',
+      `<?php
+use Vendor\\Thing;
+namespace A {
+    class Thing {}
+    class One { public function make() { return new Thing(); } }
+}
+      `,
+    )!;
+    const vendor = parseFile(
+      '/repo/Vendor/Thing.php',
+      '<?php namespace Vendor; class Thing {}',
+    )!;
+
+    expect(
+      resolveEdges([consumer, vendor]).filter(
+        (edge) => edge.predicate === 'CALLS' && edge.dstFilePath === '/repo/Vendor/Thing.php',
+      ),
+    ).toEqual([]);
+  });
+
+  it('does not resolve a GLOBAL-scope name to a namespace-block use', () => {
+    // The `use` is scoped to namespace A, so it must not bind `Thing` in the
+    // global scope — where Thing is declared at the top level.
+    const consumer = parseFile(
+      '/repo/Consumer.php',
+      `<?php
+namespace A {
+    use Vendor\\Thing;
+    class One { public function make() { return new Thing(); } }
+}
+class Thing {}
+class GlobalOne { public function g() { return new Thing(); } }
+      `,
+    )!;
+    const vendor = parseFile(
+      '/repo/Vendor/Thing.php',
+      '<?php namespace Vendor; class Thing {}',
+    )!;
+
+    expect(
+      resolveEdges([consumer, vendor]).filter(
+        (edge) => edge.predicate === 'CALLS' && edge.srcName === 'GlobalOne.g' && edge.dstFilePath === '/repo/Vendor/Thing.php',
+      ),
+    ).toEqual([]);
+  });
+
+  it('does not resolve a GLOBAL use through a same-stem decoy file', () => {
+    // A global `use` must not bind `Thing` inside namespace A even when an
+    // unrelated App\\Thing shares the file stem.
+    const consumer = parseFile(
+      '/repo/Consumer.php',
+      `<?php
+use Vendor\\Thing;
+namespace A {
+    class One { public function make() { return new Thing(); } }
+}
+      `,
+    )!;
+    const vendor = parseFile(
+      '/repo/Vendor/Thing.php',
+      '<?php namespace Vendor; class Thing {}',
+    )!;
+    const decoy = parseFile(
+      '/repo/App/Thing.php',
+      '<?php namespace App; class Thing {}',
+    )!;
+
+    expect(
+      resolveEdges([consumer, vendor, decoy]).filter(
+        (edge) => edge.predicate === 'CALLS' && edge.dstFilePath === '/repo/Vendor/Thing.php',
+      ),
+    ).toEqual([]);
+  });
+
+  it('does not resolve an unbraced block name to a GLOBAL use', () => {
+    // Same leak, unbraced form: the global `use` comes before `namespace A;`,
+    // which declares its own Thing.
+    const consumer = parseFile(
+      '/repo/Consumer.php',
+      `<?php
+use Vendor\\Thing;
+namespace A;
+class Thing {}
+class One { public function make() { return new Thing(); } }
+      `,
+    )!;
+    const vendor = parseFile(
+      '/repo/Vendor/Thing.php',
+      '<?php namespace Vendor; class Thing {}',
+    )!;
+
+    expect(
+      resolveEdges([consumer, vendor]).filter(
+        (edge) => edge.predicate === 'CALLS' && edge.srcName === 'One.make' && edge.dstFilePath === '/repo/Vendor/Thing.php',
+      ),
+    ).toEqual([]);
+  });
+
+  it('still resolves a declare-strict single-namespace PHP file', () => {
+    // `declare(strict_types=1);` sits before `namespace` in the global scope but
+    // declares no symbol and must not disable FQCN resolution for the file.
+    const consumer = parseFile(
+      '/repo/Consumer.php',
+      `<?php
+declare(strict_types=1);
+namespace A;
+use Vendor\\Thing;
+class One { public function make() { return new Thing(); } }
+      `,
+    )!;
+    const vendor = parseFile(
+      '/repo/Vendor/Thing.php',
+      '<?php namespace Vendor; class Thing {}',
+    )!;
+
+    expect(
+      resolveEdges([consumer, vendor]).filter(
+        (edge) => edge.predicate === 'CALLS' && edge.dstFilePath === '/repo/Vendor/Thing.php',
+      ).length,
+    ).toBeGreaterThan(0);
+  });
+
   it('resolves a TypeScript call when the imported definition is outside the parse batch', () => {
     const caller = fileResult(
       '/repo/consumer.ts',
