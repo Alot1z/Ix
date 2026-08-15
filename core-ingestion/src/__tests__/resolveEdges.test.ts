@@ -388,6 +388,91 @@ namespace B {
     ).toEqual([]);
   });
 
+  it('does not leak a PHP use across two blocks that declare the same namespace', () => {
+    // Both blocks are `namespace A`, so every entity carries the one scope
+    // string "A". Counting distinct packageScope values sees a single scope and
+    // treats the file as safe to index per-file — but the blocks are still two
+    // separate `use` scopes, and the second declares its own Thing.
+    const consumer = parseFile(
+      '/repo/SameName.php',
+      `<?php
+namespace A {
+    use Vendor\\Package\\Thing;
+    function run(Thing $t): void { new Thing(); }
+}
+namespace A {
+    class Thing {}
+    function go(Thing $t): void { new Thing(); }
+}
+`,
+    )!;
+    const vendor = parseFile(
+      '/repo/Vendor/Package/Thing.php',
+      '<?php namespace Vendor\\Package; class Thing {}',
+    )!;
+
+    expect(consumer.phpNamespaceBlocks).toBe(2);
+    expect(
+      resolveEdges([consumer, vendor]).filter(
+        (edge) => edge.srcName === 'go' && edge.dstFilePath === '/repo/Vendor/Package/Thing.php',
+      ),
+    ).toEqual([]);
+  });
+
+  it('does not leak a PHP use out of a block that declares nothing else', () => {
+    // Namespace A holds only the `use`, so it contributes no entity and no
+    // packageScope at all. From the entity side the file looks like a plain
+    // single-namespace B file, and A's import would be applied to B — where
+    // Thing is locally declared.
+    const consumer = parseFile(
+      '/repo/UseOnly.php',
+      `<?php
+namespace A {
+    use Vendor\\Package\\Thing;
+}
+namespace B {
+    class Thing {}
+    function go(Thing $t): void { new Thing(); }
+}
+`,
+    )!;
+    const vendor = parseFile(
+      '/repo/Vendor/Package/Thing.php',
+      '<?php namespace Vendor\\Package; class Thing {}',
+    )!;
+
+    expect(consumer.phpNamespaceBlocks).toBe(2);
+    expect(
+      resolveEdges([consumer, vendor]).filter(
+        (edge) => edge.srcName === 'go' && edge.dstFilePath === '/repo/Vendor/Package/Thing.php',
+      ),
+    ).toEqual([]);
+  });
+
+  it('still indexes a single-namespace PHP file per file', () => {
+    // The guard must stay off for the overwhelmingly common shape, otherwise
+    // "skip the ambiguous file" quietly becomes "skip every file".
+    const consumer = parseFile(
+      '/repo/Single.php',
+      `<?php
+namespace A;
+use Vendor\\Package\\Thing;
+function go(Thing $t): void { new Thing(); }
+`,
+    )!;
+    const vendor = parseFile(
+      '/repo/Vendor/Package/Thing.php',
+      '<?php namespace Vendor\\Package; class Thing {}',
+    )!;
+
+    expect(consumer.phpNamespaceBlocks).toBe(1);
+    expect(
+      resolveEdges([consumer, vendor]).filter(
+        (edge) => edge.dstFilePath === '/repo/Vendor/Package/Thing.php',
+      ).length,
+    ).toBeGreaterThan(0);
+  });
+
   it('resolves PHP class imports, references, and calls by exact FQCN', () => {
     const consumer = parseFile(
       '/repo/Consumer.php',

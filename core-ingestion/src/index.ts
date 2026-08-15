@@ -218,6 +218,13 @@ export interface FileParseResult {
   importBindings?: ImportBinding[];
   /** JS/TS provider-side aliased/default public export names. */
   exportPublicNames?: ExportPublicName[];
+  /**
+   * PHP only: how many namespaces the file declares, braced or not. Consumers
+   * that key an index per FILE need this to detect the multi-namespace files
+   * where a per-file index would be wrong (a `use` is scoped to its block).
+   * Absent for non-PHP files and for PHP files in the global namespace.
+   */
+  phpNamespaceBlocks?: number;
   fileRole: RoleClassification;
 }
 
@@ -1991,29 +1998,43 @@ interface PhpNamespaceSpan {
   namespace: string;
 }
 
+interface PhpNamespaces {
+  /** Unbraced `namespace X;` declarations, ascending by start offset. */
+  spans: PhpNamespaceSpan[];
+  /** Every top-level `namespace` declaration, braced or not. */
+  blocks: number;
+}
+
 /**
- * Start offsets of every unbraced `namespace X;` at file top level, ascending.
+ * The file's namespace structure: start offsets of every unbraced
+ * `namespace X;` at top level (ascending), plus how many namespaces the file
+ * declares in total.
  *
- * Built once per parse. Doing this scan per definition instead made the file
- * cost O(definitions x top-level nodes): a valid 890 KB PSR-12 file with ~16k
- * functions took ~197s, against ~355ms without it.
+ * Built once per parse. Doing the span scan per definition instead made the
+ * file cost O(definitions x top-level nodes): a valid 890 KB PSR-12 file with
+ * ~16k functions took ~197s, against ~355ms without it. Both results come off
+ * that single walk on purpose — reading `namedChildren` a second time pays the
+ * whole node-wrapper materialization cost again, which is the dominant term.
  *
- * A braced `namespace X { ... }` scopes by containment rather than position and
- * is handled by the ancestor walk in {@link phpNamespaceForNode}, so it is
- * deliberately excluded here.
+ * A braced `namespace X { ... }` scopes by containment rather than position, so
+ * it is handled by the ancestor walk in {@link phpNamespaceForNode} and is
+ * excluded from `spans` — but it still counts towards `blocks`.
  */
-function collectPhpNamespaceSpans(rootNode: any): PhpNamespaceSpan[] {
+function collectPhpNamespaces(rootNode: any): PhpNamespaces {
   const spans: PhpNamespaceSpan[] = [];
+  let blocks = 0;
   // `namedChildren` materializes the list in a single walk; indexing
   // `namedChild(i)` in a loop is what made the original scan expensive.
   for (const child of rootNode.namedChildren ?? []) {
-    if (!child || child.type !== 'namespace_definition' || child.childForFieldName?.('body')) continue;
+    if (!child || child.type !== 'namespace_definition') continue;
+    blocks++;
+    if (child.childForFieldName?.('body')) continue;
     spans.push({
       startIndex: child.startIndex,
       namespace: child.childForFieldName?.('name')?.text?.replace(/\s+/g, '') ?? '',
     });
   }
-  return spans;
+  return { spans, blocks };
 }
 
 function phpNamespaceForNode(node: any, spans: PhpNamespaceSpan[]): string | undefined {
@@ -2185,9 +2206,9 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
 
     // Same idea for PHP: collect the file's namespace boundaries once rather
     // than rescanning the top level for every definition.
-    const phpNamespaceSpans = language === SupportedLanguages.PHP
-      ? collectPhpNamespaceSpans(tree.rootNode)
-      : [];
+    const phpNamespaces: PhpNamespaces = language === SupportedLanguages.PHP
+      ? collectPhpNamespaces(tree.rootNode)
+      : { spans: [], blocks: 0 };
 
     // --- First pass: collect definitions ---
     for (const match of pass1Matches) {
@@ -2262,7 +2283,7 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
           container: effectiveContainer,
           packageScope: goPackage ?? (
             language === SupportedLanguages.PHP
-              ? phpNamespaceForNode(defNode, phpNamespaceSpans)
+              ? phpNamespaceForNode(defNode, phpNamespaces.spans)
               : undefined
           ),
         });
@@ -2879,6 +2900,10 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
       importAliases: Object.keys(importAliases).length > 0 ? importAliases : undefined,
       importBindings: importBindings.length > 0 ? importBindings : undefined,
       exportPublicNames: exportPublicNames.length > 0 ? exportPublicNames : undefined,
+      // Spread rather than `: undefined` so the key is absent for every non-PHP
+      // file. A key that is present-but-undefined still serializes, which would
+      // rewrite every checked-in parseFile snapshot for no behavioural reason.
+      ...(phpNamespaces.blocks > 0 ? { phpNamespaceBlocks: phpNamespaces.blocks } : {}),
       fileRole: classifyFileRole(filePath, source),
     };
   } catch (e) {
@@ -3375,17 +3400,19 @@ export function resolveEdges(
   for (const result of results) {
     if (result.language !== SupportedLanguages.PHP) continue;
     // A `use` is scoped to its namespace *block*, but this index is per file.
-    // In a file with several braced namespaces, an import in one block would be
+    // In a file with several namespaces, an import in one block would be
     // applied to the others — resolving a name that a later block declares
     // itself, and pointing it confidently at the wrong file. One namespace per
     // file is the PSR-12 norm, so skip the rare multi-block file entirely
     // rather than mis-resolve it; it simply keeps the pre-existing behaviour.
-    const namespaceScopes = new Set(
-      result.entities
-        .filter(entity => entity.kind !== 'file' && typeof entity.packageScope === 'string')
-        .map(entity => entity.packageScope as string),
-    );
-    if (namespaceScopes.size > 1) continue;
+    //
+    // The count comes from the parser's `namespace_definition` nodes, NOT from
+    // the entities' packageScope. Two things are invisible from the entity side:
+    // two blocks may declare the SAME namespace name (one distinct scope string,
+    // still two scopes), and a block containing only `use` statements declares
+    // no entities at all (no scope string, but its imports are still confined
+    // to it). Both were mis-classified as single-namespace files.
+    if ((result.phpNamespaceBlocks ?? 0) > 1) continue;
     for (const rel of result.relationships) {
       if (
         rel.predicate !== 'IMPORTS' ||
