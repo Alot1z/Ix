@@ -4021,7 +4021,13 @@ export function resolveEdges(
           if (
             configuredBindingTargets !== undefined &&
             providerFiles.length === 1 &&
-            fileHasSymbol.get(providerFiles[0])?.has(binding.imported)
+            // A configured mapping names the module authoritatively, but it does
+            // not license binding the import to a *member* of the provider file:
+            // `import { Base as LocalBase } from "@core"` must not resolve to a
+            // method `W.Base` (which can never be a module export) at 0.9.
+            // Requiring a plain (unqualified) qualified key keeps the configured
+            // path restricted to top-level symbols, matching the fallback guard.
+            fileQKeys.get(providerFiles[0])?.get(binding.imported)?.includes(binding.imported) === true
           ) {
             const fp = providerFiles[0];
             const dstQualifiedKey = bestQKey(fileQKeys, fp, binding.imported);

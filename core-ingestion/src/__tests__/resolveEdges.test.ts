@@ -396,6 +396,48 @@ describe('resolveEdges', () => {
     }));
   });
 
+  it('does not bind a configured renamed EXTENDS import to a provider member', () => {
+    // A configured mapping names the module authoritatively, but it does not
+    // license binding `import { Base as LocalBase } from "@core"` to a method
+    // `W.Base` — a member can never be a module export. Without the plain-key
+    // requirement the configured path emits a confident edge the base never had.
+    const consumer = parseFile(
+      '/repo/consumer.ts',
+      'import { Base as LocalBase } from "@core";\nexport class Child extends LocalBase {}\n',
+    )!;
+    const provider = parseFile(
+      '/repo/worker.ts',
+      'export class W { Base() {} }\n',
+    )!;
+
+    const resolved = resolveEdges([consumer, provider], undefined, undefined, {
+      resolveModuleSpecifier: (_source, specifier) =>
+        specifier === '@core' ? ['/repo/worker.ts'] : undefined,
+    });
+    expect(
+      resolved.filter((e) => e.predicate === 'EXTENDS' && e.dstQualifiedKey === 'W.Base'),
+    ).toEqual([]);
+  });
+
+  it('does not bind a configured renamed REFERENCES import to a provider member', () => {
+    const consumer = parseFile(
+      '/repo/consumer.ts',
+      'import { type User as ExternalUser } from "@core";\nexport function use(value: ExternalUser) { return value; }\n',
+    )!;
+    const provider = parseFile(
+      '/repo/worker.ts',
+      'export class W { User() {} }\n',
+    )!;
+
+    const resolved = resolveEdges([consumer, provider], undefined, undefined, {
+      resolveModuleSpecifier: (_source, specifier) =>
+        specifier === '@core' ? ['/repo/worker.ts'] : undefined,
+    });
+    expect(
+      resolved.filter((e) => e.predicate === 'REFERENCES' && e.dstQualifiedKey === 'W.User'),
+    ).toEqual([]);
+  });
+
   it('resolves a call through a provider export alias', () => {
     const provider = parseFile(
       '/repo/provider.ts',
