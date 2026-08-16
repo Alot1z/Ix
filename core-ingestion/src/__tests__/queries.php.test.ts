@@ -22,6 +22,83 @@ use Vendor\\Contracts\\DomainService;
     });
   });
 
+  it('records PHP namespace scope for semicolon and braced declarations', () => {
+    const result = parseFile(
+      '/repo/Types.php',
+      `<?php
+namespace First\\Space;
+class FirstType {}
+namespace Second\\Space;
+class SecondType {}
+      `,
+    );
+    const braced = parseFile(
+      '/repo/Braced.php',
+      `<?php
+namespace Vendor\\Package { class User {} }
+namespace { class GlobalThing {} }
+      `,
+    );
+
+    expect(result?.entities.find(entity => entity.name === 'FirstType')?.packageScope).toBe('First\\Space');
+    expect(result?.entities.find(entity => entity.name === 'SecondType')?.packageScope).toBe('Second\\Space');
+    expect(braced?.entities.find(entity => entity.name === 'User')?.packageScope).toBe('Vendor\\Package');
+    expect(braced?.entities.find(entity => entity.name === 'GlobalThing')?.packageScope).toBe('');
+  });
+
+  it('distinguishes function and constant imports from class imports', () => {
+    const result = parseFile(
+      '/repo/Imports.php',
+      `<?php
+use Vendor\\Package\\User;
+use function Vendor\\Package\\helper;
+use const Vendor\\Package\\FLAG;
+      `,
+    );
+
+    expect(result?.relationships.filter(rel => rel.predicate === 'IMPORTS')).toEqual([
+      {
+        srcName: 'Imports.php',
+        dstName: 'User',
+        predicate: 'IMPORTS',
+        importRaw: 'Vendor\\Package\\User',
+      },
+      {
+        srcName: 'Imports.php',
+        dstName: 'helper',
+        predicate: 'IMPORTS',
+        importRaw: 'Vendor\\Package\\helper',
+        importKind: 'function',
+      },
+      {
+        srcName: 'Imports.php',
+        dstName: 'FLAG',
+        predicate: 'IMPORTS',
+        importRaw: 'Vendor\\Package\\FLAG',
+        importKind: 'const',
+      },
+    ]);
+  });
+
+  it('distinguishes PHP constructors from function and member calls', () => {
+    const result = parseFile(
+      '/repo/Calls.php',
+      `<?php
+function run(Service $service): void {
+    new Service();
+    helper();
+    $service->execute();
+}
+      `,
+    );
+
+    expect(result?.relationships.filter(rel => rel.predicate === 'CALLS')).toEqual([
+      { srcName: 'run', dstName: 'Service', predicate: 'CALLS', phpCallKind: 'constructor' },
+      { srcName: 'run', dstName: 'helper', predicate: 'CALLS', phpCallKind: 'function' },
+      { srcName: 'run', dstName: 'Service.execute', predicate: 'CALLS', phpCallKind: 'member' },
+    ]);
+  });
+
   it('captures every member of a grouped namespace use', () => {
     const result = parseFile(
       '/repo/UseCase.php',
@@ -114,22 +191,24 @@ final class UseCase
     expect(result).not.toBeNull();
     expect(result!.relationships).toEqual(
       expect.arrayContaining([
-        { srcName: 'UseCase.create', dstName: 'DomainService.create', predicate: 'CALLS' },
-        { srcName: 'UseCase.create', dstName: 'Repository.create', predicate: 'CALLS' },
-        { srcName: 'UseCase.create', dstName: 'AuditLogger.write', predicate: 'CALLS' },
-        { srcName: 'UseCase.create', dstName: 'Logger.write', predicate: 'CALLS' },
-        { srcName: 'UseCase.create', dstName: 'UseCase.finish', predicate: 'CALLS' },
+        { srcName: 'UseCase.create', dstName: 'DomainService.create', predicate: 'CALLS', phpCallKind: 'member' },
+        { srcName: 'UseCase.create', dstName: 'Repository.create', predicate: 'CALLS', phpCallKind: 'member' },
+        { srcName: 'UseCase.create', dstName: 'AuditLogger.write', predicate: 'CALLS', phpCallKind: 'member' },
+        { srcName: 'UseCase.create', dstName: 'Logger.write', predicate: 'CALLS', phpCallKind: 'member' },
+        { srcName: 'UseCase.create', dstName: 'UseCase.finish', predicate: 'CALLS', phpCallKind: 'member' },
       ]),
     );
     expect(result!.relationships).not.toContainEqual({
       srcName: 'UseCase.create',
       dstName: 'create',
       predicate: 'CALLS',
+      phpCallKind: 'member',
     });
     expect(result!.relationships).not.toContainEqual({
       srcName: 'UseCase.create',
       dstName: 'UseCase.create',
       predicate: 'CALLS',
+      phpCallKind: 'member',
     });
   });
 
@@ -149,6 +228,7 @@ function run($service): void
       srcName: 'run',
       dstName: 'create',
       predicate: 'CALLS',
+      phpCallKind: 'member',
     });
   });
 
@@ -177,9 +257,9 @@ final class Nullable
     expect(result).not.toBeNull();
     expect(result!.relationships).toEqual(
       expect.arrayContaining([
-        { srcName: 'Nullable.run', dstName: 'Service.create', predicate: 'CALLS' },
-        { srcName: 'Nullable.run', dstName: 'Repository.find', predicate: 'CALLS' },
-        { srcName: 'Nullable.run', dstName: 'Logger.write', predicate: 'CALLS' },
+        { srcName: 'Nullable.run', dstName: 'Service.create', predicate: 'CALLS', phpCallKind: 'member' },
+        { srcName: 'Nullable.run', dstName: 'Repository.find', predicate: 'CALLS', phpCallKind: 'member' },
+        { srcName: 'Nullable.run', dstName: 'Logger.write', predicate: 'CALLS', phpCallKind: 'member' },
       ]),
     );
   });
@@ -201,8 +281,8 @@ function run(Service $service, ?Logger $logger): void
     expect(result).not.toBeNull();
     expect(result!.relationships).toEqual(
       expect.arrayContaining([
-        { srcName: 'run', dstName: 'Service.create', predicate: 'CALLS' },
-        { srcName: 'run', dstName: 'Logger.write', predicate: 'CALLS' },
+        { srcName: 'run', dstName: 'Service.create', predicate: 'CALLS', phpCallKind: 'member' },
+        { srcName: 'run', dstName: 'Logger.write', predicate: 'CALLS', phpCallKind: 'member' },
       ]),
     );
   });
@@ -228,6 +308,49 @@ final class Union
       srcName: 'Union.run',
       dstName: 'create',
       predicate: 'CALLS',
+      phpCallKind: 'member',
     });
+  });
+
+  it(
+    'scopes every declaration in a large file without rescanning the top level',
+    { timeout: 3_000 },
+    () => {
+      // Resolving each definition's namespace by rescanning the file's top-level
+      // nodes is O(definitions x nodes). This file is ordinary, valid PSR-12 and
+      // well under the 1 MB ingest cap, but took ~13s to parse that way against
+      // ~150ms now — and a 16k-declaration file took over three minutes, which
+      // pins a parse worker with no per-file timeout.
+      const count = 4_000;
+      let source = '<?php\nnamespace App\\Support;\n';
+      for (let i = 0; i < count; i += 1) source += `function helper${i}($a) { return $a; }\n`;
+
+      const result = parseFile('/repo/big.php', source)!;
+
+      const scoped = result.entities.filter((e) => e.packageScope === 'App\\Support');
+      expect(scoped).toHaveLength(count);
+    },
+  );
+
+  it('scopes declarations by the nearest preceding unbraced namespace', () => {
+    // The binary search must land on the *last* declaration starting before the
+    // node, not the first or the nearest by distance.
+    const result = parseFile(
+      '/repo/Sequential.php',
+      `<?php
+namespace First;
+function alpha() {}
+namespace Second;
+function beta() {}
+namespace Third;
+function gamma() {}
+`,
+    )!;
+
+    const scopeOf = (name: string) =>
+      result.entities.find((e) => e.name === name)?.packageScope;
+    expect(scopeOf('alpha')).toBe('First');
+    expect(scopeOf('beta')).toBe('Second');
+    expect(scopeOf('gamma')).toBe('Third');
   });
 });

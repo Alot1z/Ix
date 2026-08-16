@@ -109,6 +109,32 @@ describe('buildPatchWithResolution', () => {
     }));
   });
 
+  it('keeps same-named PHP constructor and function calls distinct', () => {
+    const consumer = parseFile(
+      '/repo/Consumer.php',
+      `<?php
+use Vendor\\Package\\Helper;
+function Helper(): void {}
+function run(): void { new Helper(); Helper(); }
+      `,
+    )!;
+    const provider = parseFile(
+      '/repo/Vendor/Package/Helper.php',
+      '<?php namespace Vendor\\Package; class Helper {}',
+    )!;
+    const resolved = resolveEdges([consumer, provider]);
+    const patch = buildPatchWithResolution(consumer, 'hash', '', resolved);
+    const callEdges = patch.ops.filter(op => op.type === 'UpsertEdge' && op.predicate === 'CALLS');
+
+    expect(callEdges).toHaveLength(2);
+    expect(callEdges).toContainEqual(expect.objectContaining({
+      dst: nodeId('/repo/Vendor/Package/Helper.php', 'Helper'),
+    }));
+    expect(callEdges).toContainEqual(expect.objectContaining({
+      dst: nodeId('/repo/Consumer.php', 'Helper'),
+    }));
+  });
+
   it('materialises external stub node for unresolved :: package calls', () => {
     const file = '/repo/model.R';
     const externalNodeId = nodeId('external://dplyr', 'dplyr::filter');
@@ -400,5 +426,50 @@ describe('multi-repo co-ingest identity convergence', () => {
     const svcbUtilNode = svcbSolo.ops.find(op => op.type === 'UpsertNode' && op.name === 'util')!.id;
 
     expect(callsDst).toBe(svcbUtilNode);
+  });
+
+  it('emits one edge when two PHP call kinds resolve to the same node', () => {
+    // `log()` and `Logger::log()` are two relationships once phpCallKind splits
+    // the dedup key. Both resolve to the same member here, so salting the edge
+    // id by call kind would mint two ids for one edge — and the dedup
+    // downstream keys on id, so both would commit.
+    const consumer = parseFile(
+      '/repo/Caller.php',
+      `<?php
+use Vendor\\Package\\Logger;
+function handler(): void { log(); Logger::log(); }
+`,
+    )!;
+    const logger = parseFile(
+      '/repo/Vendor/Package/Logger.php',
+      '<?php namespace Vendor\\Package; class Logger { public static function log(): void {} }',
+    )!;
+
+    const patch = buildPatchWithResolution(consumer, 'hash', '', resolveEdges([consumer, logger]));
+    const callEdges = patch.ops.filter(
+      (op) => op.type === 'UpsertEdge' && op.predicate === 'CALLS',
+    );
+
+    expect(callEdges).toHaveLength(1);
+  });
+
+  it('emits one claim when two PHP call kinds name the same callee', () => {
+    // Same root cause as the edge case above, and it fires on ordinary untyped
+    // PHP: `handle()` and `$obj->handle()` are two relationships once
+    // phpCallKind splits the key, but a claim carries no kind, so the two ops
+    // are byte-identical.
+    const consumer = parseFile(
+      '/repo/Caller.php',
+      `<?php
+function handler($obj): void { handle(); $obj->handle(); }
+`,
+    )!;
+
+    const patch = buildPatchWithResolution(consumer, 'hash', '', []);
+    const claims = patch.ops.filter(
+      (op) => op.type === 'AssertClaim' && op.field === 'calls:handle',
+    );
+
+    expect(claims).toHaveLength(1);
   });
 });
