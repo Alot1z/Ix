@@ -3989,7 +3989,13 @@ export function resolveEdges(
           ))];
           const publicMatches: Array<{ fp: string; local: string }> = [];
           for (const fp of providerFiles.length === 1 ? providerFiles : []) {
-            const local = filePublicNames.get(fp)?.get(binding.imported);
+            // `imported` is the literal sentinel 'default' for a default import, never a
+            // real export name, so a provider member that happens to be *called* `default`
+            // (a method, getter, or static) must not satisfy the fallback.
+            const local = filePublicNames.get(fp)?.get(binding.imported)
+              ?? (binding.imported !== 'default' && fileHasSymbol.get(fp)?.has(binding.imported)
+                ? binding.imported
+                : undefined);
             if (local && fileHasSymbol.get(fp)?.has(local)) publicMatches.push({ fp, local });
           }
           if (publicMatches.length === 1) {
