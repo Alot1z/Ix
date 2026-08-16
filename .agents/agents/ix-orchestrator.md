@@ -20,6 +20,16 @@ When to invoke
 - After any upstream change that may require re-evaluation
 - When an authoritative session-closeout is required
 
+Contribution routing
+--------------------
+For any candidate finding/fix that may become a contribution (fork commit,
+PR comment, or upstream PR), run the **`ix-contribution-lifecycle` skill** —
+it is the deterministic pipeline (live upstream → duplicates → reproduction →
+classification → adversarial → publication → communication → report) and it
+calls the right specialist at each gate. The orchestrator reconciles gate
+outputs but must not skip a gate. Review-only and state-sweep work route
+through `ix-pr-review` / `ix-upstream-audit` directly.
+
 Inputs
 ------
 - Work-scope statement (free text or structured task brief)

@@ -22,6 +22,44 @@ Do NOT route here when:
 - The task is an external-PR review with no contribution intent (use `ix-pr-review`)
 - The task is purely local agent infrastructure (no upstream object involved)
 
+## Workflow state machine
+
+Track every candidate through explicit states; a gate transition requires the
+listed evidence. Terminal states end the lane.
+
+```text
+DISCOVERED
+   ↓ (context + existing-finding check)
+LIVE_STATE_VERIFIED        (fresh fetch + gh, current heads recorded)
+   ↓
+DUPLICATE_CHECKED          (multi-signal search: prs/issues/code/log/registry)
+   ↓
+REPRODUCED                 (valid fixture, fail-before on current upstream)
+   ↓
+ADVERSARIAL_TESTED         (controls + boundary matrix, no suppression found)
+   ↓
+PR_WORTHINESS_DECIDED      (live + incorrect + meaningful + fixable + testable)
+   ↓
+CONTRIBUTION_TARGET_SELECTED (existing-PR follow-up vs new PR)
+   ↓
+FORK_COMMIT_VERIFIED       (parent, --check, focused files)
+   ↓
+PUBLISHED                  (fork push + ls-remote verification)
+   ↓
+COMMUNICATION_VERIFIED     (comment ID/URL or PR number/URL/SHA; upstream head unchanged)
+   ↓
+FINDING_DOCUMENTED         (surgical registry update)
+   ↓
+FINAL_REPORT
+```
+
+Terminal states (stop the lane, do not publish):
+
+```text
+ALREADY_FIXED · DUPLICATE · ALREADY_BEING_FIXED · FALSE_POSITIVE ·
+LOW_VALUE · UNSAFE · BLOCKED
+```
+
 ## Pipeline (no step may be silently skipped)
 
 1. **DISCOVER / RECOVER CONTEXT** — read `knowledge.md` (fork) and
@@ -32,10 +70,10 @@ Do NOT route here when:
    + `git fetch origin`. A SHA from an old audit is a hypothesis.
 3. **SEARCH DUPLICATES** — `gh search prs/issues/code` + registry + git log
    on affected files, using multiple signals (symbols, test names, reproducer
-   shape). Competing work ⇒ stop that lane, document the relationship.
+   shape). Competing work ⇒ terminal state, document the relationship.
 4. **REPRODUCE** — smallest valid fixture; verify literal bytes (PHP
    backslashes, escaping); compare base vs PR head vs fixed state via
-   per-state worktrees and builds. Invalid reproducer ⇒ stop.
+   per-state worktrees and builds. Invalid reproducer ⇒ terminal state.
 5. **CLASSIFY** — exactly one of: CURRENT REGRESSION · CURRENT PRE-EXISTING
    BUG · HISTORICAL REGRESSION ALREADY FIXED · DUPLICATE · ALREADY BEING
    FIXED · FALSE POSITIVE · INFORMATIONAL · LOW VALUE · NEW ADDITIVE BUG.
