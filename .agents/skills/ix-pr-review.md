@@ -53,7 +53,9 @@ Outputs:
 - Verdict: APPROVE | REQUEST_CHANGES | COMMENT | NEEDS_INFORMATION
 
 Constraints:
-- Do NOT push review comments to GitHub without explicit user authorization
+- Do NOT push review comments to GitHub unless the workflow-authorization
+  governance applies (a genuine technical finding, not already surfaced — see
+  AGENTS.md); never post bookkeeping comments
 - Do not silently approve — every review must have an explicit verdict
 - If a PR supersedes a prior PR (per reviewer/maintainer evidence), note it
   rather than reviewing both in parallel
