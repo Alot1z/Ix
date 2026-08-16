@@ -22,6 +22,26 @@ engineering infrastructure: it MUST NOT appear in upstream Ix PR diffs
 | Mandatory agent behavior | `Alot1z/Ix-findings` `AGENTS.md` | AUTHORITATIVE | Contribution lifecycle, live-upstream gate, duplicates, tool honesty, ledger surgery, GitHub safety. |
 | Agent definitions/prompts/skills | `.agents/` (this repo) | AUTHORITATIVE | Reusable specialist roles; `ix-contribution-lifecycle` skill implements the pipeline. |
 
+## What belongs here (and what does not)
+
+```
+planning/
+├── README.md                  ← this index (intentionality rules)
+└── AI-ENGINEERING-STATE.md    ← session state log (append-only, dated entries)
+
+HISTORICAL audit artifacts (phases 3-29)  → preserved on `clean-rebuild` branch
+Temporary worktrees / probes / temp files → NEVER committed
+Contribution evidence / findings         → Ix-findings (registry + PR-audit report)
+Durable agent state & invariants         → Ix-findings `knowledge.md`
+Agent behavior rules                     → this repo `AGENTS.md` + Ix-findings `AGENTS.md`
+Findings evidence / ledger               → Ix-findings `planning/findings/registry.json`
+Machine-readable knowledge graph         → Ix-findings `knowledge/`
+```
+
+Nothing else may accumulate under `planning/`. If a new artifact type appears
+repeatedly, add a rule for it here first — do not let `planning/` become an
+uncontrolled dumping ground.
+
 ## Rule
 
 Session state and handoffs → `AI-ENGINEERING-STATE.md`.
