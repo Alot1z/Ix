@@ -2419,6 +2419,27 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
         continue;
       }
 
+      // PHP grouped use: `use Vendor\Package\{A, B};` (also `use function` /
+      // `use const`). Each member is its own namespace_use_clause under the
+      // group; the shared prefix arrives via @import.prefix. The clause's FIRST
+      // name child is the imported symbol (a second one is an `as` alias and
+      // must never become an import), so rebuild the FQCN from prefix + first
+      // name, matching the single-clause form's modName/importRaw shape.
+      const phpGroupPrefix = match.captures.find((c: any) => c.name === 'import.prefix')?.node.text;
+      const phpGroupClauses = match.captures.filter((c: any) => c.name === 'import.clause');
+      if (language === SupportedLanguages.PHP && phpGroupClauses.length > 0) {
+        for (const clause of phpGroupClauses) {
+          const firstName = clause.node.namedChildren.find((c: any) => c.type === 'name');
+          if (!firstName) continue;
+          const fqcn = phpGroupPrefix ? `${phpGroupPrefix}\\${firstName.text}` : firstName.text;
+          const modName = normalizeCapturedImport(fqcn, language);
+          const importRaw = unwrapImportSpecifier(fqcn);
+          entities.push({ name: modName, kind: 'module', lineStart: firstName.startPosition.row + 1, lineEnd: firstName.startPosition.row + 1, language });
+          relationships.push({ srcName: fileName, dstName: modName, predicate: 'IMPORTS', importRaw });
+        }
+        continue;
+      }
+
       // Import captures (JS/TS/Python path-based)
       const importSource = match.captures.find((c: any) => c.name === 'import.source');
       if (importSource) {

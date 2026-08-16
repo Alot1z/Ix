@@ -22,6 +22,58 @@ use Vendor\\Contracts\\DomainService;
     });
   });
 
+  it('captures every member of a grouped namespace use', () => {
+    const result = parseFile(
+      '/repo/UseCase.php',
+      `<?php
+namespace App;
+
+use Vendor\\Contracts\\{DomainService, Repo};
+      `,
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.relationships).toContainEqual({
+      srcName: 'UseCase.php',
+      dstName: 'DomainService',
+      predicate: 'IMPORTS',
+      importRaw: 'Vendor\\Contracts\\DomainService',
+    });
+    expect(result!.relationships).toContainEqual({
+      srcName: 'UseCase.php',
+      dstName: 'Repo',
+      predicate: 'IMPORTS',
+      importRaw: 'Vendor\\Contracts\\Repo',
+    });
+  });
+
+  it('captures grouped use members with the shared prefix, never the alias', () => {
+    const result = parseFile(
+      '/repo/UseCase.php',
+      `<?php
+namespace App;
+
+use Vendor\\Contracts\\{DomainService as DS, Repo};
+      `,
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.relationships).toContainEqual({
+      srcName: 'UseCase.php',
+      dstName: 'DomainService',
+      predicate: 'IMPORTS',
+      importRaw: 'Vendor\\Contracts\\DomainService',
+    });
+    expect(result!.relationships).toContainEqual({
+      srcName: 'UseCase.php',
+      dstName: 'Repo',
+      predicate: 'IMPORTS',
+      importRaw: 'Vendor\\Contracts\\Repo',
+    });
+    // The `as DS` alias is a local name, never an imported symbol.
+    expect(result!.relationships.filter((r) => r.predicate === 'IMPORTS' && r.dstName === 'DS')).toEqual([]);
+  });
+
   it('resolves calls through typed properties and method parameters', () => {
     const result = parseFile(
       '/repo/UseCase.php',
