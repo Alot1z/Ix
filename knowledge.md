@@ -1,6 +1,8 @@
 # Ix-remap -- Project Knowledge
 
-Last updated: 2026-08-15T07:47Z (PR-chain review #434–#446; mojibake repaired; duplicate-fix doctrine added; 0701040/83b9be4 disposition recorded)
+Last updated: 2026-08-16 (PR-audit era complete: F-014..F-021, five published
+contributions incl. PR #448; see "PR-Audit Era" section at the end; durable
+guidance consolidated in Alot1z/Ix-findings `knowledge.md` + `AGENTS.md`)
 
 ## Collaborator Role
 
@@ -91,8 +93,10 @@ https://github.com/ix-infrastructure/Ix/compare/main...Alot1z:Ix-remap:main
 | #439 | tsconfig paths and baseUrl ignored during edge resolution | **OPEN** | #440, #445 |
 | #441 | PHP imports resolve to classes from wrong namespace | **OPEN** | #442, #446 |
 
-> No Alot1z-authored upstream PRs exist. Do NOT create new upstream PRs without
-> explicit authorization. One fork-only reference branch exists (see below).
+> Alot1z-owned upstream PR: **#448** (fix(php): capture grouped use imports,
+> head `5efd8f1`, open 2026-08-16). Additional upstream PRs require
+> authorization from the controlling workflow. One fork-only reference branch
+> exists (see below).
 
 ### 0701040 / 83b9be4 — duplicate-fix case (recorded 2026-08-15T07:47Z)
 
@@ -120,16 +124,16 @@ The earlier supersession/provenance comments were REMOVED as bookkeeping noise
 (see AGENTS.md comment policy — supersession records and provenance locks are
 forbidden). Current live comment state (verified 2026-08-15T07:47Z):
 
-| PR | Live comments |
+| PR | Live comments (2026-08-16) |
 |---|---|
 | #434 | 2 × KageBinary (review + "#443 carries your commits") |
 | #436 | 2 × KageBinary (review + "#444 carries your commits") |
 | #440 | 3 × KageBinary (review + memoize + "#445 carries your commits") |
 | #442 | 3 × KageBinary (review + regressions + "#446 carries your commits") |
-| #443 | none |
+| #443 | 1 × Alot1z technical (F-016, `5305054711`) |
 | #444 | none |
-| #445 | 1 × KageBinary (symlink-gap commit) |
-| #446 | 1 × KageBinary (83b9be4 re-audit) + 1 × Alot1z (0701040 reference) |
+| #445 | 1 × KageBinary (symlink-gap commit) + 1 × Alot1z technical (F-017, `5305054778`) |
+| #446 | 1 × KageBinary (83b9be4 re-audit) + Alot1z (F-014 `5303306410`, F-019 `5305054642`) |
 
 **Supersession chains confirmed (by KageBinary in PR bodies):**
 - Hiro-Chiba #434 → KageBinary #443 (default-import guard)
@@ -162,3 +166,30 @@ This fork-local agent system builds ON these rules, adding them as constraints t
 
 Primary: `ix` (codebase intelligence via Ix CLI graph), `using-agent-skills` (skill discovery), `orchestration` (multi-agent coordination patterns), skill-authoring workflow from `system-connector`.
 Supporting: `parasite-skill` (skill routing, compose, scan).
+
+## PR-Audit Era 2026-08-15/16 — F-014..F-021
+
+Adversarial audit of all open PRs (#434–#448) found five live, maintainer-worthy
+defects; each was reproduced against the current upstream state, fixed with a
+minimal verified commit on a fork branch (parent aligned to the current PR
+head), published to `Alot1z/Ix-remap`, and surfaced (comment or PR). Full
+registry: `Alot1z/Ix-findings` `planning/findings/registry.json` + `PR-AUDIT-2026-08-15.md`.
+
+| Finding | Bug | Fix commit (parent) | Communication |
+|---|---|---|---|
+| F-014 | #446 global↔namespace scope-boundary regression → wrong CALLS @0.9 | `0a7d97f` (parent #446 head `83b9be4`) | #446 comment `5303306410` |
+| F-019 | #446 FQCN map drops same-line sibling types → NONE | `f577492` (parent `0a7d97f`) | #446 comment `5305054642` |
+| F-016 | #443 renamed-import fallback binds to provider member → wrong EXTENDS | `cba11a3` (parent #443 head `eab1075`) | #443 comment `5305054711` |
+| F-017 | #445 configured-mapping path same defect | `f9274cc` (parent #445 head `adc97c1`) | #445 comment `5305054778` |
+| F-021 | main: grouped `use Vendor\{A, B};` captures zero IMPORTS | `5efd8f1` (parent `043bc68`) | **PR #448** (open) |
+
+Recorded but not contributed: F-015 (pre-existing C7 use-leak, needs
+namespace-aware fallback), F-020 (single-char names, deliberate noise filter,
+low value), F-018 (upstream guard, informational), N-003 (#444/#447 audited
+clean). Duplicate-fix doctrine and pipeline rules are encoded in
+`Alot1z/Ix-findings/AGENTS.md` + `knowledge.md` (2026-08-16).
+
+Tool availability (honest): Ix CLI binary AVAILABLE; Ix backend/graph
+UNAVAILABLE (Docker down — never fake graph results); `.agents/` subagents
+UNAVAILABLE as spawned processes here (methodologies applied directly);
+RavelScope UNAVAILABLE for TS/tree-sitter (binary toolchain).
