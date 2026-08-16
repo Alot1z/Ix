@@ -256,6 +256,36 @@ describe('resolveEdges', () => {
     });
   });
 
+  it('resolves imports from a grouped PHP use statement', () => {
+    const consumer = parseFile(
+      '/repo/UseCase.php',
+      `<?php
+namespace App;
+
+use Vendor\\Contracts\\{DomainService, Repo};
+
+final class UseCase
+{
+    public function make(): void
+    {
+        $svc = new DomainService();
+    }
+}
+      `,
+    )!;
+    const provider = parseFile(
+      '/repo/DomainService.php',
+      '<?php namespace Vendor\\Contracts; class DomainService {}',
+    )!;
+
+    const resolved = resolveEdges([consumer, provider]);
+    expect(
+      resolved.filter(
+        (e) => e.predicate === 'IMPORTS' && e.dstFilePath === '/repo/DomainService.php',
+      ),
+    ).toHaveLength(1);
+  });
+
   it('resolves a TypeScript call when the imported definition is outside the parse batch', () => {
     const caller = fileResult(
       '/repo/consumer.ts',
