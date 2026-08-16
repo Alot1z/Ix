@@ -23,7 +23,8 @@ All text output must be valid UTF-8 (no mojibake).
 | Agent skill | `skills/ix/` | Shipped Ix agent skill for this repo (bootstrap, commands, refs) |
 | Root governance | `AGENTS.md` | Fork rules: no attribution, fork boundaries, verification policy |
 | Fork agent infra | `.agents/` (this tree) | Persistent specialist system — NOT upstream product |
-| Planning state | `planning/AI-ENGINEERING-STATE.md` | Verified current state, open work, invariants |
+| Planning state | `planning/AI-ENGINEERING-STATE.md` (restored 2026-08-16) | Session log; verified current state, open work, invariants |
+| Durable knowledge | `Alot1z/Ix-findings` `knowledge.md` + `AGENTS.md` | Authoritative environment knowledge + mandatory contribution governance |
 | Findings | `alot1z/Ix-findings` (separate repo) | Engineering evidence, public site, independent push auth |
 
 ## Repositories
@@ -155,10 +156,11 @@ forbidden). Current live comment state (verified 2026-08-15T07:47Z):
 
 ## AGENTS.md Policy Summary
 
-The existing `AGENTS.md` defines three rules:
+The existing `AGENTS.md` defines the core rules:
 1. **No attribution footers** — no Co-authored-by, AI:, Codebuff, or tool branding in any commit/PR/issue/comment
-2. **GitHub write policy** — no pushes to upstream, no GitHub writes without per-action authorization; bookkeeping comments (supersession records, provenance locks, status notes) are FORBIDDEN — post only genuine technical findings
+2. **GitHub write policy + workflow authorization** — no pushes to upstream; the contribution lifecycle is pre-authorized when the controlling workflow grants it (publish verified fork commits, update findings, post genuine technical comments, open warranted PRs) without per-action asking; writes outside the lifecycle still need per-action authorization; hard limits (no upstream branch modification, no force-push, no history rewrite, no duplicate contributions) are never liftable; bookkeeping comments are FORBIDDEN — post only genuine technical findings
 3. **Verification before claims** — run tests before claiming verification; never fabricate references
+4. **Self-upgrade rule** — agent-system improvements must be evidence-based, minimal, isolated, reversible, documented, non-destructive
 
 This fork-local agent system builds ON these rules, adding them as constraints to every specialist agent definition.
 

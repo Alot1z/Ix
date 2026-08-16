@@ -85,8 +85,18 @@ If a PR has no technical finding from our review, **post nothing**.
 
 - This is a personal fork of `ix-infrastructure/Ix`. Do not push to the
   upstream repository or to any unrelated repository.
-- No GitHub writes (issues, PRs, labels, comments, reviews, merges, reactions,
-  branch mutations) without explicit per-action user authorization.
+- Workflow authorization: when the controlling workflow (this governance +
+  `Alot1z/Ix-findings` `AGENTS.md`) has granted full authorization for the
+  contribution lifecycle, routine lifecycle writes are PRE-AUTHORIZED —
+  publish verified fork commits, update findings, post genuine technical
+  comments, open warranted PRs — without asking per action. Do not stall on
+  "should I publish?"; run the gates and execute.
+- Writes OUTSIDE the lifecycle (issues, labels, reviews, merges, reactions,
+  branch mutations, non-technical comments) still require explicit per-action
+  user authorization.
+- Hard limits no authorization can lift: never modify an upstream source
+  branch, never force-push, never rewrite history, never amend a published
+  commit, never create a duplicate contribution/comment/PR.
 - PR/issue comments are **advisory collaborator feedback**, not authoritative
   review verdicts. Use collaborator language, not maintainer language.
 - Before posting any comment: enumerate existing Alot1z comments on that object,
@@ -181,10 +191,33 @@ When facts are uncertain:
 
 ## Contribution discipline
 
-- Do not create new upstream PRs unless explicitly authorized per-action.
+- Open a new upstream PR only inside the contribution workflow and only when
+  every gate passes: live bug, meaningful impact, no duplicate, correct
+  ownership, clean verified fix. Otherwise record the issue and do not create
+  a PR (per-action authorization is otherwise required).
 - Do not append commits to merged PRs (#422, #423 are merged; do not touch their branches).
 - Do not delete or force-push upstream/main — this is a fork, not a fork backup.
-- If a new issue is found, record it in `planning/AI-ENGINEERING-STATE.md` and stop unless an existing open PR can legitimately address it.
+- If a new issue is found, record it in `planning/AI-ENGINEERING-STATE.md` and
+  stop unless an existing open PR can legitimately address it.
+
+## Self-upgrade rule
+
+The agent system may improve itself (prompts, skills, knowledge, governance),
+but upgrades must be:
+
+- **Evidence-based** — driven by a discovered gap, not speculation;
+- **Minimal** — the smallest change that fixes the gap;
+- **Isolated** — its own commit, never mixed with source/ledger changes;
+- **Reversible** — a plain commit that can be reverted;
+- **Documented** — the change and its rationale recorded in the commit body
+  and, when relevant, `planning/AI-ENGINEERING-STATE.md`;
+- **Non-destructive** — never silently rewrite historical evidence, session
+  records, or the findings registry; never regenerate derived data without
+  understanding its source and validation.
+
+Durable knowledge and governance changes belong in `Alot1z/Ix-findings`
+(`knowledge.md`/`AGENTS.md`); fork-local operational state belongs in
+`planning/`; agent implementations belong in `.agents/`.
 
 ## Upstream fix incorporation — sync, never duplicate
 
