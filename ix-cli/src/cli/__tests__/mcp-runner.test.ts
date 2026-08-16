@@ -403,7 +403,7 @@ describe("in-process ix runner", () => {
     });
   });
 
-  it("truncates output instead of growing the server heap without bound", async () => {
+  it("fails the run when output is truncated to protect the server heap", async () => {
     const run = createInProcessRunner({
       createProgram: createTestProgram,
       maxOutputBytes: 500,
@@ -411,8 +411,52 @@ describe("in-process ix runner", () => {
 
     const result = await run(["flood"]);
 
+    expect(result.ok).toBe(false);
     expect(result.stdout.length).toBeLessThanOrEqual(500);
     expect(result.stderr).toContain("exceeded 500 bytes and was truncated");
+  });
+
+  it("applies the output cap to thrown error messages", async () => {
+    const run = createInProcessRunner({
+      maxOutputBytes: 500,
+      createProgram: () => {
+        const program = new Command();
+        program.command("throw-long").action(() => {
+          throw new Error("E".repeat(2_000));
+        });
+        return program;
+      },
+    });
+
+    const result = await run(["throw-long"]);
+
+    expect(result.ok).toBe(false);
+    expect(Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(500);
+    expect(result.stderr).toContain("exceeded 500 bytes and was truncated");
+    expect(result.stderr).not.toContain("E".repeat(500));
+  });
+
+  it("keeps the failure reason when the cap already fired before the throw", async () => {
+    // Routing thrown text through appendChunk means it is dropped outright once
+    // the cap has fired, so a crash reaches the client as nothing but "output
+    // exceeded N bytes" — exactly when an operator most needs the reason.
+    const run = createInProcessRunner({
+      maxOutputBytes: 500,
+      createProgram: () => {
+        const program = new Command();
+        program.command("flood-then-throw").action(() => {
+          for (let i = 0; i < 20; i += 1) console.log("x".repeat(100));
+          throw new Error("backend refused the connection");
+        });
+        return program;
+      },
+    });
+
+    const result = await run(["flood-then-throw"]);
+
+    expect(result.ok).toBe(false);
+    expect(result.stderr).toContain("exceeded 500 bytes and was truncated");
+    expect(result.stderr).toContain("backend refused the connection");
   });
 
   it("reports an unknown command as a failure with commander's message", async () => {

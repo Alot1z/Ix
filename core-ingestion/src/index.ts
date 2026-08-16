@@ -2506,6 +2506,27 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
         continue;
       }
 
+      // PHP grouped use: `use Vendor\Package\{A, B};` (also `use function` /
+      // `use const`). Each member is its own namespace_use_clause under the
+      // group; the shared prefix arrives via @import.prefix. The clause's FIRST
+      // name child is the imported symbol (a second one is an `as` alias and
+      // must never become an import), so rebuild the FQCN from prefix + first
+      // name, matching the single-clause form's modName/importRaw shape.
+      const phpGroupPrefix = match.captures.find((c: any) => c.name === 'import.prefix')?.node.text;
+      const phpGroupClauses = match.captures.filter((c: any) => c.name === 'import.clause');
+      if (language === SupportedLanguages.PHP && phpGroupClauses.length > 0) {
+        for (const clause of phpGroupClauses) {
+          const firstName = clause.node.namedChildren.find((c: any) => c.type === 'name');
+          if (!firstName) continue;
+          const fqcn = phpGroupPrefix ? `${phpGroupPrefix}\\${firstName.text}` : firstName.text;
+          const modName = normalizeCapturedImport(fqcn, language);
+          const importRaw = unwrapImportSpecifier(fqcn);
+          entities.push({ name: modName, kind: 'module', lineStart: firstName.startPosition.row + 1, lineEnd: firstName.startPosition.row + 1, language });
+          relationships.push({ srcName: fileName, dstName: modName, predicate: 'IMPORTS', importRaw });
+        }
+        continue;
+      }
+
       // Import captures (JS/TS/Python path-based)
       const importSource = match.captures.find((c: any) => c.name === 'import.source');
       if (importSource) {
@@ -3359,6 +3380,14 @@ export function resolveEdges(
     // cross-repo gate so genuine edges survive even where import-to-package matching
     // can't bridge the gap (e.g. Java's Maven artifactId vs `import com.google...`).
     declaredRepoDeps?: Record<string, string[]>;
+    // Workspace-aware JS/TS module resolution supplied by the CLI. `undefined`
+    // preserves the existing fallback; an empty array is authoritative and
+    // prevents a configured import from falling through to an unrelated stem.
+    resolveModuleSpecifier?: (
+      srcFilePath: string,
+      specifier: string,
+      kind?: 'runtime' | 'types',
+    ) => string[] | undefined;
   },
 ): ResolvedEdge[] {
   // Provide a default no-op stats bag when caller passes none (backward compat).
@@ -3936,13 +3965,25 @@ export function resolveEdges(
     srcLanguage: SupportedLanguages,
     modName: unknown,
     importRaw?: unknown,
+    kind: 'runtime' | 'types' = 'runtime',
   ): string[] {
+    const configuredMatches =
+      (srcLanguage === SupportedLanguages.JavaScript || srcLanguage === SupportedLanguages.TypeScript) &&
+      typeof importRaw === 'string' &&
+      !importRaw.startsWith('./') &&
+      !importRaw.startsWith('../')
+        ? opts?.resolveModuleSpecifier?.(srcFilePath, importRaw, kind)
+        : undefined;
+    const indexedConfiguredMatches = configuredMatches?.flatMap(filePath =>
+      normalizedPathToFiles.get(normalizedPathKey(filePath)) ?? []
+    ).filter(filePath => normalizedPathKey(filePath) !== normalizedPathKey(srcFilePath));
     // fileLanguage only covers the current parse batch; cross-batch candidates
     // come from the global stem index, so fall back to the extension-derived
     // language (always available) — otherwise an undefined dst language would
     // slip cross-language matches (e.g. a Python import -> a Rust/Elixir file).
-    const importMatches = (resolveRelativeImportTargets(srcFilePath, srcLanguage, importRaw) ??
-      modNameToFiles(modName, srcFilePath))
+    const importMatches = (configuredMatches === undefined
+      ? resolveRelativeImportTargets(srcFilePath, srcLanguage, importRaw) ?? modNameToFiles(modName, srcFilePath)
+      : indexedConfiguredMatches ?? [])
       .filter(fp => importLanguageCompatible(srcLanguage, fileLanguage.get(fp) ?? languageFromPath(fp)));
     if (srcLanguage !== SupportedLanguages.Go || importMatches.length <= 1) return importMatches;
     return narrowGoImportCandidates(srcFilePath, modName, importMatches, files => {
@@ -4294,6 +4335,16 @@ export function resolveEdges(
       const binding = rel.importBinding === false
         ? undefined
         : importBindingsByLocal.get(srcFilePath)?.get(origDstName);
+      const configuredBindingTargets = binding &&
+        (srcLanguage === SupportedLanguages.JavaScript || srcLanguage === SupportedLanguages.TypeScript) &&
+        !binding.pkg.startsWith('./') &&
+        !binding.pkg.startsWith('../')
+          ? opts?.resolveModuleSpecifier?.(
+              srcFilePath,
+              binding.pkg,
+              rel.predicate === 'CALLS' ? 'runtime' : 'types',
+            )
+          : undefined;
 
       // Tier 1: same-file — already correct in buildPatch, skip here. Check the
       // call-site name before any import binding rewrite so a local shadow wins.
@@ -4312,10 +4363,37 @@ export function resolveEdges(
             srcLanguage,
             binding.pkg,
             binding.pkg,
+            rel.predicate === 'CALLS' ? 'runtime' : 'types',
           ))];
+          if (
+            configuredBindingTargets !== undefined &&
+            providerFiles.length === 1 &&
+            fileHasSymbol.get(providerFiles[0])?.has(binding.imported)
+          ) {
+            const fp = providerFiles[0];
+            const dstQualifiedKey = bestQKey(fileQKeys, fp, binding.imported);
+            if (dstQualifiedKey !== null) {
+              resolved.push({
+                srcFilePath,
+                srcName,
+                dstFilePath: fp,
+                dstName: origDstName,
+                dstQualifiedKey,
+                predicate: rel.predicate,
+                confidence: 0.9,
+              });
+              continue;
+            }
+          }
           const publicMatches: Array<{ fp: string; local: string }> = [];
           for (const fp of providerFiles.length === 1 ? providerFiles : []) {
-            const local = filePublicNames.get(fp)?.get(binding.imported);
+            // `imported` is the literal sentinel 'default' for a default import, never a
+            // real export name, so a provider member that happens to be *called* `default`
+            // (a method, getter, or static) must not satisfy the fallback.
+            const local = filePublicNames.get(fp)?.get(binding.imported)
+              ?? (binding.imported !== 'default' && fileHasSymbol.get(fp)?.has(binding.imported)
+                ? binding.imported
+                : undefined);
             if (local && fileHasSymbol.get(fp)?.has(local)) publicMatches.push({ fp, local });
           }
           if (publicMatches.length === 1) {
@@ -4446,6 +4524,7 @@ export function resolveEdges(
         resolved.push({ srcFilePath, srcName, dstFilePath: fp, dstName: origDstName, dstQualifiedKey, predicate: rel.predicate, confidence: 0.8 });
         continue;
       }
+      if (configuredBindingTargets?.length === 0) continue;
       if (rel.predicate === 'CALLS' && relativeCallBindings.get(srcFilePath)?.has(origDstName)) {
         stats.skippedAmbiguous++;
         continue;
