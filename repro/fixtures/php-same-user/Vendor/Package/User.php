@@ -1,0 +1,1 @@
+<?php namespace Vendor\Package; class A {} class User {}
