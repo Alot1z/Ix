@@ -13,7 +13,7 @@ targets are the single source of truth for routing work; agent files in
 
 | Agent | Responsibility | Inputs | Outputs | Skills | Writes | Upstream access |
 |---|---|---|---|---|---|---|
-| `ix-orchestrator` | End-to-end session cycle; dispatches specialists; reconciles evidence | work-scope, `knowledge.md`, `planning/AI-ENGINEERING-STATE.md`, live `gh` | decision / contribution candidate / findings patch / close-out record | `ix-contribution-lifecycle` | `planning/` (state) | read |
+| `ix-orchestrator` | End-to-end session cycle; dispatches specialists; reconciles evidence | work-scope, `knowledge.md`, `planning/AI-ENGINEERING-STATE.md`, live `gh` | decision / contribution candidate / findings patch / close-out record | `ix-contribution-lifecycle`, `authorization-check` | `planning/` (state) | read |
 | `ix-upstream-auditor` | Determine which upstream issues/PRs are legitimate high-value targets | `knowledge.md`, live `gh` | audit block + state matrix; `contribution_candidates` | `ix-upstream-audit` | `planning/`, `knowledge.md` refresh | read |
 | `ix-pr-reviewer` | Adversarial review of upstream PRs (regressions, boundary, tests) | PR metadata + diff, live `gh`, Ix graph | advisory review with verdict | `ix-pr-review` | `planning/`; gated technical comments | read + gated comment |
 | `ix-archaeologist` | Reconstruct commit/PR/issue/branch provenance chains | git history, `gh` | evidence-anchored archaeology report | — | `planning/` | read |
@@ -42,6 +42,7 @@ targets are the single source of truth for routing work; agent files in
 | Skill | Implements | Route when |
 |---|---|---|
 | `ix-contribution-lifecycle` | The DISCOVER → … → FINAL REPORT pipeline (state machine in-file) | Any candidate finding/fix lifecycle |
+| `authorization-check` | Standing-authorization decision tree (permission-asking is a failure mode; hard boundaries stop lanes) | Before any write or upstream interaction |
 | `ix-upstream-audit` | Upstream state sweep + classification | "what is the current upstream state" |
 | `ix-pr-review` | External-PR adversarial review | "review upstream PR #n" |
 | `ix-findings-review` | Ix-findings corpus validation | "is the findings corpus consistent" |

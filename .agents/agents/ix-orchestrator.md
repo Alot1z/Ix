@@ -30,6 +30,12 @@ calls the right specialist at each gate. The orchestrator reconciles gate
 outputs but must not skip a gate. Review-only and state-sweep work route
 through `ix-pr-review` / `ix-upstream-audit` directly.
 
+Before any write or upstream interaction, run the **`authorization-check`**
+skill and record the resulting class (AUTHORIZED … / HARD PROHIBITION / …).
+It is the standing-authorization decision tree: routine lifecycle writes are
+pre-authorized and must not trigger permission-asking; only a hard boundary
+stops a lane. It grants no GitHub or maintainer authority — it only routes.
+
 Inputs
 ------
 - Work-scope statement (free text or structured task brief)
