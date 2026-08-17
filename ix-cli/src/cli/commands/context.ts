@@ -438,12 +438,42 @@ interface InvestigationDiff {
   removed: { entities: ContextBundle["entities"]; relationships: ContextBundle["relationships"]; evidence: EvidenceItem[]; claims: ContextBundle["claims"] };
 }
 
-function renderInvestigationDiff(saved: SavedInvestigation, fresh: ContextBundle, format: string): void {
+export function renderInvestigationDiff(saved: SavedInvestigation, fresh: ContextBundle, format: string): void {
   const prev = saved.bundle;
   const diff = diffInvestigations(saved, fresh);
 
   if (format === "json") {
     console.log(JSON.stringify(diff, null, 2));
+    return;
+  }
+  if (format === "llm") {
+    // `ix context --diff --format llm` previously fell through to the prose
+    // renderer below because the diff path only branched on `json`. That made
+    // the most common agent path (`--diff --format llm`) the worst one: the
+    // prose scaling was the whole reason `llm` exists. Mirror `renderBundle`'s
+    // llm branch and emit one record per line in the same `key=value` wire
+    // format the rest of the CLI uses.
+    printLlmLines([
+      `diff investigation=${saved.id} target=${fresh.target.name}`,
+      `freshness_previous=${prev.freshness.classification}`,
+      `freshness_current=${fresh.freshness.classification}`,
+      `count added_entities=${diff.added.entities.length}`,
+      `count removed_entities=${diff.removed.entities.length}`,
+      `count added_relationships=${diff.added.relationships.length}`,
+      `count removed_relationships=${diff.removed.relationships.length}`,
+      `count added_evidence=${diff.added.evidence.length}`,
+      `count removed_evidence=${diff.removed.evidence.length}`,
+      `count added_claims=${diff.added.claims.length}`,
+      `count removed_claims=${diff.removed.claims.length}`,
+      ...diff.added.entities.map((e) => `+entity kind=${e.kind} name=${e.name}`),
+      ...diff.removed.entities.map((e) => `-entity kind=${e.kind} name=${e.name}`),
+      ...diff.added.relationships.map((r) => `+relationship src=${r.src} pred=${r.predicate} dst=${r.dst}`),
+      ...diff.removed.relationships.map((r) => `-relationship src=${r.src} pred=${r.predicate} dst=${r.dst}`),
+      ...diff.added.evidence.map((e) => `+evidence score=${e.score} kind=${e.kind} title=${e.title.replaceAll("\n", " ")}`),
+      ...diff.removed.evidence.map((e) => `-evidence score=${e.score} kind=${e.kind} title=${e.title.replaceAll("\n", " ")}`),
+      ...diff.added.claims.map((c) => `+claim id=${(c as { id?: string }).id ?? ""}`),
+      ...diff.removed.claims.map((c) => `-claim id=${(c as { id?: string }).id ?? ""}`),
+    ]);
     return;
   }
 
