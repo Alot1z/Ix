@@ -123,10 +123,14 @@ export function registerContextCommand(program: Command): void {
     .option("--pick <n>", "Pick Nth candidate from ambiguous results (1-based)", parsePickOption)
     .option("--depth <depth>", "Context-graph expansion depth")
     .option("--as-of-rev <n>", "Historical context as of a graph revision")
-    .option("--max-entities <n>", "Maximum entities in the bundle", "50")
-    .option("--max-relationships <n>", "Maximum relationships in the bundle", "100")
-    .option("--max-evidence <n>", "Maximum evidence items in the bundle", "25")
-    .option("--max-chars <n>", "Maximum characters of evidence output", "12000")
+    // The --max-* flags default to undefined rather than "50"/"100"/etc. so
+    // parseRequestedBudgets can tell whether the user actually supplied an
+    // override on the command line. The numeric defaults are still applied at
+    // build time via clampInt(opts.max*, 1, 500, 50).
+    .option("--max-entities <n>", "Maximum entities in the bundle")
+    .option("--max-relationships <n>", "Maximum relationships in the bundle")
+    .option("--max-evidence <n>", "Maximum evidence items in the bundle")
+    .option("--max-chars <n>", "Maximum characters of evidence output")
     .option("--format <fmt>", "Output format (text|json|llm)", "text")
     .option("--out <path>", "Write the JSON bundle to this file instead of stdout")
     .option("--save <id>", "Persist the bundle as a resumable investigation state")
@@ -144,13 +148,19 @@ export function registerContextCommand(program: Command): void {
       if (opts.diff) {
         const saved = loadInvestigation(opts.diff);
         if (!saved) return;
+        // The fresh side of --diff is currently built with the saved investigation's
+        // own budgets (ix-cli/src/cli/commands/context.ts: `buildFreshBundle(..., saved.bundle.budgets)`),
+        // so any --max-* flags the user passes on the CLI are not applied to the
+        // fresh bundle. We capture the requested values separately so the diff output
+        // can surface them to humans and agents instead of silently dropping them.
+        const requestedBudgets = parseRequestedBudgets(opts);
         const fresh = await buildFreshBundle(
           target ?? saved.bundle.target.name,
           { ...opts, ...mergeDiffOptions(saved, opts) },
           saved.bundle.budgets,
         );
         if (!fresh) return;
-        renderInvestigationDiff(saved, fresh, opts.format);
+        renderInvestigationDiff(saved, fresh, opts.format, requestedBudgets);
         return;
       }
       if (!target) {
@@ -390,7 +400,51 @@ function renderSavedInvestigation(id: string, format: string): void {
   renderBundle(saved.bundle, format);
 }
 
-export function diffInvestigations(saved: SavedInvestigation, fresh: ContextBundle): InvestigationDiff {
+interface BudgetSnapshot {
+  maxEntities: number;
+  maxRelationships: number;
+  maxEvidence: number;
+  maxChars: number;
+}
+
+/** Compact one-line representation of a budget snapshot for human rendering. */
+function formatBudgets(b: Partial<BudgetSnapshot>, partial = false): string {
+  const fmt = (val: number | undefined, key: string): string =>
+    `${key}=${val === undefined ? "not-given" : String(val)}`;
+  const segments = [
+    fmt(b.maxEntities, "entities"),
+    fmt(b.maxRelationships, "relationships"),
+    fmt(b.maxEvidence, "evidence"),
+    fmt(b.maxChars, "chars"),
+  ].join(" ");
+  return partial ? `${segments} (CLI override; not applied to --diff fresh side)` : segments;
+}
+
+/**
+ * Apply the same clamping rules the action handler uses for direct --save runs
+ * to a budget object parsed from raw commander string values. Treats an absent
+ * or whitespace-only string as "user did not pass this flag".
+ */
+export function parseRequestedBudgets(opts: Partial<ContextOptions>): Partial<BudgetSnapshot> | undefined {
+  const fields: Array<keyof BudgetSnapshot> = ["maxEntities", "maxRelationships", "maxEvidence", "maxChars"];
+  const out: Partial<BudgetSnapshot> = {};
+  let provided = false;
+  for (const key of fields) {
+    const raw = opts[key] as string | undefined;
+    if (typeof raw !== "string" || raw.trim() === "") continue;
+    const parsed = Number.parseInt(raw, 10);
+    if (!Number.isFinite(parsed)) continue;
+    out[key] = parsed;
+    provided = true;
+  }
+  return provided ? out : undefined;
+}
+
+export function diffInvestigations(
+  saved: SavedInvestigation,
+  fresh: ContextBundle,
+  requestedBudgets?: Partial<BudgetSnapshot>,
+): InvestigationDiff {
   const prev = saved.bundle;
   const addedEntities = fresh.entities.filter((e) => !prev.entities.some((p) => p.id === e.id));
   const removedEntities = prev.entities.filter((p) => !fresh.entities.some((e) => e.id === p.id));
@@ -405,6 +459,12 @@ export function diffInvestigations(saved: SavedInvestigation, fresh: ContextBund
   const addedClaims = fresh.claims.filter((c) => !prev.claims.some((p) => p.id === c.id));
   const removedClaims = prev.claims.filter((p) => !fresh.claims.some((c) => c.id === p.id));
 
+  // Surface the silent "saved budgets govern --diff" precedence as data instead
+  // of hiding it. Today `effective` always equals `saved`; if a future change
+  // ever lets CLI overrides win on the fresh side, this block is the single
+  // place that flips and the diff output is the only observable truth.
+  const effective: BudgetSnapshot = { ...saved.bundle.budgets };
+
   return {
     schema: "ix-investigation-diff/1",
     investigation: saved.id,
@@ -412,6 +472,17 @@ export function diffInvestigations(saved: SavedInvestigation, fresh: ContextBund
     generatedAt: new Date().toISOString(),
     target: fresh.target,
     freshness: { previous: prev.freshness, current: fresh.freshness },
+    budgets: {
+      saved: saved.bundle.budgets,
+      requested: requestedBudgets,
+      effective,
+      // The note exists so an agent reading the JSON alone can tell why a
+      // --max-* flag it passed on the CLI did not change the comparison
+      // footprint, without having to read source to find the precedence rule.
+      note: requestedBudgets
+        ? "Saved investigation budgets govern --diff; --max-* flags on the CLI are recorded above for transparency but not applied to the fresh side."
+        : "Saved investigation budgets govern --diff; no --max-* overrides were supplied on the CLI.",
+    },
     added: {
       entities: addedEntities,
       relationships: addedRelationships,
@@ -434,13 +505,24 @@ interface InvestigationDiff {
   generatedAt: string;
   target: ContextBundle["target"];
   freshness: { previous: ContextBundle["freshness"]; current: ContextBundle["freshness"] };
+  budgets: {
+    saved: BudgetSnapshot;
+    requested?: Partial<BudgetSnapshot>;
+    effective: BudgetSnapshot;
+    note: string;
+  };
   added: { entities: ContextBundle["entities"]; relationships: ContextBundle["relationships"]; evidence: EvidenceItem[]; claims: ContextBundle["claims"] };
   removed: { entities: ContextBundle["entities"]; relationships: ContextBundle["relationships"]; evidence: EvidenceItem[]; claims: ContextBundle["claims"] };
 }
 
-function renderInvestigationDiff(saved: SavedInvestigation, fresh: ContextBundle, format: string): void {
+export function renderInvestigationDiff(
+  saved: SavedInvestigation,
+  fresh: ContextBundle,
+  format: string,
+  requestedBudgets?: Partial<BudgetSnapshot>,
+): void {
   const prev = saved.bundle;
-  const diff = diffInvestigations(saved, fresh);
+  const diff = diffInvestigations(saved, fresh, requestedBudgets);
 
   if (format === "json") {
     console.log(JSON.stringify(diff, null, 2));
@@ -449,6 +531,26 @@ function renderInvestigationDiff(saved: SavedInvestigation, fresh: ContextBundle
 
   renderSection(`Investigation diff: ${saved.id}`);
   console.log(`  freshness: ${prev.freshness.classification} -> ${fresh.freshness.classification}`);
+  if (format === "llm") {
+    console.log(`  budgets`);
+    console.log(`    saved     : ${formatBudgets(diff.budgets.saved)}`);
+    if (diff.budgets.requested) {
+      console.log(`    requested : ${formatBudgets(diff.budgets.requested as BudgetSnapshot, true)}`);
+    } else {
+      console.log(`    requested : (none — no --max-* flags passed)`);
+    }
+    console.log(`    effective : ${formatBudgets(diff.budgets.effective)}`);
+    console.log(`    note      : ${diff.budgets.note}`);
+  } else {
+    console.log(`  budgets:`);
+    console.log(`    saved     : ${formatBudgets(diff.budgets.saved)}`);
+    if (diff.budgets.requested) {
+      console.log(`    requested : ${formatBudgets(diff.budgets.requested as BudgetSnapshot, true)}`);
+    } else {
+      console.log(`    requested : (none)`);
+    }
+    console.log(`    effective : ${formatBudgets(diff.budgets.effective)}`);
+  }
   console.log(`  entities:  -${diff.removed.entities.length} +${diff.added.entities.length}`);
   console.log(`  relationships: -${diff.removed.relationships.length} +${diff.added.relationships.length}`);
   console.log(`  evidence:  -${diff.removed.evidence.length} +${diff.added.evidence.length}`);

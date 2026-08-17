@@ -1,7 +1,7 @@
 import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
   ConflictReport,
@@ -17,6 +17,8 @@ import {
   diffInvestigations,
   loadInvestigation,
   mergeDiffOptions,
+  parseRequestedBudgets,
+  renderInvestigationDiff,
   saveInvestigation,
 } from "../commands/context.js";
 
@@ -264,5 +266,113 @@ describe("ix context investigation state", () => {
     }
     expect(existsSync(join(home, "..", "escape.json"))).toBe(false);
     expect(existsSync(join(home, ".version-check.json"))).toBe(false);
+  });
+
+  it("exposes effective budgets on every --diff diff, sourced from the saved investigation", () => {
+    // The reproduction in B-4 showed that --max-* flags on the CLI do not change
+    // the fresh side's budget: buildFreshBundle always receives saved.bundle.budgets.
+    // The transparency fix surfaces that fact as data instead of hiding it, so
+    // agents reading the diff JSON can answer "what budget governed this comparison"
+    // without reading the source.
+    const saved = bundleWith([makeClaim("renders to DOM", 0.9)]);
+    saved.budgets = { maxEntities: 5, maxRelationships: 1, maxEvidence: 2, maxChars: 12000 };
+    saveInvestigation("widget-check", saved);
+    const stored = loadInvestigation("widget-check")!;
+    const fresh = bundleWith([makeClaim("renders to DOM", 0.9)]);
+
+    // Without CLI overrides, requested is absent and effective mirrors saved.
+    const baselineDiff = diffInvestigations(stored, fresh);
+    expect(baselineDiff.budgets.saved).toEqual({ maxEntities: 5, maxRelationships: 1, maxEvidence: 2, maxChars: 12000 });
+    expect(baselineDiff.budgets.requested).toBeUndefined();
+    expect(baselineDiff.budgets.effective).toEqual(baselineDiff.budgets.saved);
+    expect(baselineDiff.budgets.note).toMatch(/no --max-\* overrides/i);
+
+    // With CLI overrides parsed from raw commander strings, requested captures
+    // every flag the user passed (even ones that disagree with saved), and the
+    // note makes the precedence explicit.
+    const requested = parseRequestedBudgets({ maxEntities: "50", maxEvidence: "25", maxRelationships: "100" });
+    expect(requested).toEqual({ maxEntities: 50, maxEvidence: 25, maxRelationships: 100 });
+
+    const overrideDiff = diffInvestigations(stored, fresh, requested);
+    expect(overrideDiff.budgets.requested).toEqual(requested);
+    // Critical invariant: the fresh bundle was still built with saved budgets,
+    // so effective is the saved snapshot, not the requested one.
+    expect(overrideDiff.budgets.effective).toEqual(overrideDiff.budgets.saved);
+    expect(overrideDiff.budgets.note).toMatch(/--max-\* flags on the CLI are recorded/i);
+  });
+
+  it("treats whitespace, empty, or non-numeric --max-* strings as not provided", () => {
+    // parseRequestedBudgets must mirror commander semantics: only flag-shaped
+    // arguments count as "user override", not noise from shell quoting or
+    // accidental empty strings. This is what stops the diff output from
+    // reporting a phantom override. Numeric "0" is a real override (someone
+    // asking for "0 entities" forces an empty bundle and is what they meant),
+    // so it survives the parse — but non-strings, blanks, and NaN-producing
+    // tokens do not.
+    expect(parseRequestedBudgets({})).toBeUndefined();
+    expect(parseRequestedBudgets({ maxEntities: "", maxEvidence: "  " })).toBeUndefined();
+    expect(parseRequestedBudgets({ maxEntities: undefined })).toBeUndefined();
+    expect(parseRequestedBudgets({ maxEntities: "abc" })).toBeUndefined();
+    expect(parseRequestedBudgets({ maxEntities: "0" })).toEqual({ maxEntities: 0 });
+    expect(parseRequestedBudgets({ maxEntities: "10", maxChars: undefined })).toEqual({ maxEntities: 10 });
+    const partial = parseRequestedBudgets({ maxEntities: "10", maxEvidence: "5", maxRelationships: "0", maxChars: "12000" });
+    expect(partial).toEqual({ maxEntities: 10, maxEvidence: 5, maxRelationships: 0, maxChars: 12000 });
+  });
+
+  it("renders the budget block in --diff text and llm output", () => {
+    // Spy on console.log so we can assert exactly what humans and LLMs see.
+    // This is the regression guard for the user-visible transparency: if a
+    // future refactor flattens renderInvestigationDiff back to "entities/-
+    // +", the budget block disappears and the silent ignore comes back.
+    const saved = bundleWith([makeClaim("renders to DOM", 0.9)]);
+    saved.budgets = { maxEntities: 5, maxRelationships: 1, maxEvidence: 2, maxChars: 12000 };
+    saveInvestigation("widget-check", saved);
+    const stored = loadInvestigation("widget-check")!;
+    const fresh = bundleWith([makeClaim("renders to DOM", 0.9)]);
+    const requested = { maxEvidence: 25 };
+
+    const capture = () => {
+      const lines: string[] = [];
+      const spy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+        lines.push(args.map((a) => String(a)).join(" "));
+      });
+      return { lines, restore: () => spy.mockRestore() };
+    };
+
+    const text = capture();
+    try {
+      renderInvestigationDiff(stored, fresh, "text", requested);
+    } finally {
+      text.restore();
+    }
+    expect(text.lines.some((l) => l.includes("budgets:"))).toBe(true);
+    expect(text.lines.some((l) => l.includes("saved     :"))).toBe(true);
+    expect(text.lines.some((l) => l.includes("requested :")) && text.lines.some((l) => l.includes("evidence=25"))).toBe(true);
+    expect(text.lines.some((l) => l.includes("effective :") && l.includes("evidence=2"))).toBe(true);
+
+    const llm = capture();
+    try {
+      renderInvestigationDiff(stored, fresh, "llm", requested);
+    } finally {
+      llm.restore();
+    }
+    expect(llm.lines.some((l) => l.trim() === "budgets")).toBe(true);
+    expect(llm.lines.some((l) => l.includes("saved     :") && l.includes("evidence=2"))).toBe(true);
+    expect(llm.lines.some((l) => l.includes("requested :") && l.includes("evidence=25"))).toBe(true);
+    expect(llm.lines.some((l) => l.includes("effective :") && l.includes("evidence=2"))).toBe(true);
+
+    // json format must already cover this branch in diffInvestigations itself,
+    // but assert here that the path is wired and the renderer doesn't double-print.
+    const json = capture();
+    try {
+      renderInvestigationDiff(stored, fresh, "json", requested);
+    } finally {
+      json.restore();
+    }
+    expect(json.lines).toHaveLength(1);
+    const parsed = JSON.parse(json.lines[0].replace(/^undefined$/, ""));
+    expect(parsed.budgets.saved).toEqual(saved.budgets);
+    expect(parsed.budgets.requested).toEqual(requested);
+    expect(parsed.budgets.effective).toEqual(saved.budgets);
   });
 });
