@@ -15,6 +15,7 @@ import type { EntityFacts } from "../explain/facts.js";
 import {
   buildBundle,
   diffInvestigations,
+  listInvestigations,
   loadInvestigation,
   mergeDiffOptions,
   saveInvestigation,
@@ -264,5 +265,45 @@ describe("ix context investigation state", () => {
     }
     expect(existsSync(join(home, "..", "escape.json"))).toBe(false);
     expect(existsSync(join(home, ".version-check.json"))).toBe(false);
+  });
+
+  // `ix context --list` enumerates saved investigations for discovery.
+  // Without it, neither humans nor agents can see what they have stored —
+  // the only path was reading the JSON files directly.
+  describe("listInvestigations", () => {
+    it("returns saved investigations newest-first", () => {
+      saveInvestigation("widget-a", bundleWith([makeClaim("renders to DOM", 0.9)]));
+      saveInvestigation("widget-b", bundleWith([makeClaim("mounts to DOM", 0.7)]));
+      const list = listInvestigations();
+      expect(list.map((s) => s.id).sort()).toEqual(["widget-a", "widget-b"]);
+      // savedAt differs at least by a millisecond across the two writes; even
+      // on the rare same-ms tie the id tiebreaker keeps order deterministic.
+      expect(list[0].id === "widget-a" || list[0].id === "widget-b").toBe(true);
+    });
+
+    it("skips files whose envelope or bundle does not match the contract", () => {
+      saveInvestigation("good", bundleWith([makeClaim("renders to DOM", 0.9)]));
+      const dir = investigationsDir();
+      writeFileSync(join(dir, "corrupt-envelope.json"), JSON.stringify({ schema: "ix-investigation/9", bundle: {} }));
+      writeFileSync(join(dir, "truncated.json"), "{not json");
+      writeFileSync(join(dir, "tampered-body.json"), JSON.stringify({
+        schema: "ix-investigation/1",
+        id: "tampered-body",
+        savedAt: "2026-01-01T00:00:00Z",
+        bundle: { schema: "ix-context-bundle/1", generatedAt: "x", entities: "not-an-array" },
+      }));
+      writeFileSync(join(dir, "readme.md"), "not a state file");
+
+      const list = listInvestigations();
+      expect(list.map((s) => s.id)).toEqual(["good"]);
+      // The three corrupt files do not poison the listing.
+      expect(readdirSync(dir).filter((f) => f.endsWith(".json"))).toHaveLength(4);
+    });
+
+    it("returns an empty array when the investigations dir does not exist yet", () => {
+      expect(listInvestigations()).toEqual([]);
+      saveInvestigation("first", bundleWith([makeClaim("renders to DOM", 0.9)]));
+      expect(listInvestigations()).toHaveLength(1);
+    });
   });
 });

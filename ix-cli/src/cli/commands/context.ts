@@ -1,5 +1,5 @@
 import type { Command } from "commander";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -41,6 +41,7 @@ interface ContextOptions {
   save?: string;
   resume?: string;
   diff?: string;
+  list?: boolean;
   format: string;
 }
 
@@ -132,13 +133,22 @@ export function registerContextCommand(program: Command): void {
     .option("--save <id>", "Persist the bundle as a resumable investigation state")
     .option("--resume <id>", "Render a saved investigation state without a backend")
     .option("--diff <id>", "Diff a saved investigation against a fresh build of the same target")
+    .option("--list", "List saved investigations (no target, no backend)")
     .addHelpText(
       "after",
-      "\nExamples:\n  ix context IngestionService\n  ix context src/main.ts --format json\n  ix context Widget --max-entities 20 --max-evidence 10\n  ix context Widget --save widget-investigation\n  ix context --resume widget-investigation\n  ix context --diff widget-investigation",
+      "\nExamples:\n  ix context IngestionService\n  ix context src/main.ts --format json\n  ix context Widget --max-entities 20 --max-evidence 10\n  ix context Widget --save widget-investigation\n  ix context --resume widget-investigation\n  ix context --diff widget-investigation\n  ix context --list",
     )
     .action(async (target: string | undefined, opts: ContextOptions) => {
       if (opts.resume) {
         renderSavedInvestigation(opts.resume, opts.format);
+        return;
+      }
+      if (opts.list) {
+        if (opts.save || opts.diff) {
+          renderWarning("--list cannot be combined with --save or --diff.");
+          return;
+        }
+        renderInvestigationList(listInvestigations(), opts.format);
         return;
       }
       if (opts.diff) {
@@ -358,6 +368,141 @@ export function mergeDiffOptions(
     asOfRev: opts.asOfRev ?? (savedRev === undefined ? undefined : String(savedRev)),
     depth: opts.depth ?? saved.bundle.metadata.depth,
   };
+}
+
+/**
+ * Enumerate every saved investigation under IX_HOME/investigations.
+ *
+ * Mirrors the read-side validation `loadInvestigation` performs on a single
+ * file (envelope + bundle.safeParse) so a corrupt or version-skewed file is
+ * skipped silently rather than poison the listing — but a corrupt file is
+ * still surfaced through a single warning so the operator can prune it.
+ *
+ * Determinism: results are sorted newest-first by `savedAt`, falling back to
+ * the sanitized `id` so two files saved in the same millisecond still have a
+ * stable order across runs.
+ */
+export function listInvestigations(): SavedInvestigation[] {
+  const dir = investigationDir();
+  if (!existsSync(dir)) return [];
+  const entries = readdirSync(dir).filter((f) => f.endsWith(".json"));
+  const out: SavedInvestigation[] = [];
+  let skipped = 0;
+  for (const file of entries) {
+    const filePath = join(dir, file);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(filePath, "utf8"));
+    } catch {
+      skipped += 1;
+      continue;
+    }
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      (parsed as { schema?: unknown }).schema !== "ix-investigation/1" ||
+      !(parsed as { bundle?: unknown }).bundle
+    ) {
+      skipped += 1;
+      continue;
+    }
+    // Validate the body's contract matches the same versioned schema the
+    // write side enforces. We trust the original parsed JSON (cast as the
+    // SavedInvestigation type, exactly like loadInvestigation does on the
+    // happy path) instead of safeParse's data, because the on-disk envelope
+    // here was produced by saveInvestigation and the renderer only needs to
+    // forward the bundle through unchanged. That keeps the read-side
+    // validation contract symmetric with `loadInvestigation` without
+    // re-running the schema's structural narrowing (which would lose the
+    // richer record types claims/decisions/assets carry internally).
+    const bundleCheck = contextBundleSchema.safeParse((parsed as SavedInvestigation).bundle);
+    if (!bundleCheck.success) {
+      skipped += 1;
+      continue;
+    }
+    out.push(parsed as SavedInvestigation);
+  }
+  if (skipped > 0) {
+    renderWarning(
+      `${skipped} saved investigation file(s) did not match the contract; skipped. Run \`ix context --resume <id>\` for a per-file report.`,
+    );
+  }
+  return out.sort((a, b) => {
+    if (a.savedAt !== b.savedAt) return a.savedAt < b.savedAt ? 1 : -1;
+    return cmp(a.id, b.id);
+  });
+}
+
+/**
+ * Render the saved investigations produced by `listInvestigations`.
+ *
+ * The wire formats mirror the rest of the CLI: JSON is the full saved
+ * envelope so it round-trips through `--resume <id>`; LLM emits one
+ * metadata record per saved investigation; text prints a tabular
+ * summary with truncation/savedAt/target so a human can choose what
+ * to resume or diff.
+ */
+function renderInvestigationList(items: SavedInvestigation[], format: string): void {
+  if (format === "json") {
+    console.log(JSON.stringify(items, null, 2));
+    return;
+  }
+  if (format === "llm") {
+    if (items.length === 0) {
+      printLlmLines(["investigations total=0"]);
+      return;
+    }
+    printLlmLines([
+      `investigations total=${items.length}`,
+      ...items.map((s) =>
+        [
+          `investigation id=${s.id}`,
+          `saved_at=${s.savedAt}`,
+          `target=${s.bundle.target.name}`,
+          `target_kind=${s.bundle.target.kind}`,
+          `classification=${s.bundle.freshness.classification}`,
+          `stale=${s.bundle.freshness.stale}`,
+          `entities=${s.bundle.entities.length}`,
+          `relationships=${s.bundle.relationships.length}`,
+          `evidence=${s.bundle.evidence.length}`,
+          `truncated_entities=${s.bundle.truncation.entitiesTruncated}`,
+          `truncated_relationships=${s.bundle.truncation.relationshipsTruncated}`,
+          `truncated_evidence=${s.bundle.truncation.evidenceTruncated}`,
+          `truncated_chars=${s.bundle.truncation.charactersTruncated}`,
+        ].join(" "),
+      ),
+    ]);
+    return;
+  }
+
+  if (items.length === 0) {
+    renderNote("No saved investigations. Use `ix context <target> --save <id>` to create one.");
+    return;
+  }
+  renderSection(`Saved investigations (${items.length})`);
+  for (const s of items) {
+    const b = s.bundle;
+    console.log(`  ${s.id}`);
+    console.log(`    target:       ${b.target.name} (${b.target.kind})`);
+    console.log(`    saved_at:     ${s.savedAt}`);
+    console.log(`    freshness:    ${b.freshness.classification}`);
+    console.log(
+      `    counts:       entities=${b.entities.length} relationships=${b.relationships.length} evidence=${b.evidence.length}`,
+    );
+    if (
+      b.truncation.entitiesTruncated ||
+      b.truncation.relationshipsTruncated ||
+      b.truncation.evidenceTruncated ||
+      b.truncation.charactersTruncated
+    ) {
+      console.log(
+        `    truncated:    entities=${b.truncation.entitiesTruncated} relationships=${b.truncation.relationshipsTruncated} evidence=${b.truncation.evidenceTruncated} chars=${b.truncation.charactersTruncated}`,
+      );
+    }
+  }
+  console.log();
+  console.log(`Resume with: ix context --resume <id>`);
+  console.log(`Diff with:   ix context --diff <id>`);
 }
 
 export function loadInvestigation(id: string): SavedInvestigation | undefined {
