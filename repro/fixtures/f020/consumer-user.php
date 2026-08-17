@@ -1,0 +1,1 @@
+<?php namespace Vendor\Package; use Vendor\Package\User; function run2(User $u): void { new User(); }

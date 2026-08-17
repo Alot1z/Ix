@@ -1,0 +1,1 @@
+<?php namespace Vendor\Package; use Vendor\Package\B; function run(B $b): void { new B(); }

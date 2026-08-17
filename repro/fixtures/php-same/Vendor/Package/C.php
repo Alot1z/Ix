@@ -1,0 +1,1 @@
+<?php namespace Vendor\Package; use Vendor\Package\B; class C { function make() { new B(); } }
