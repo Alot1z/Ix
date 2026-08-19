@@ -15,8 +15,14 @@ import type { EntityFacts } from "../explain/facts.js";
 import {
   buildBundle,
   diffInvestigations,
+  listInvestigations,
+  renderInvestigationList,
   loadInvestigation,
   mergeDiffOptions,
+  parseRequestedBudgets,
+  renderBundle,
+  renderInvestigationDiff,
+  renderSavedInvestigation,
   saveInvestigation,
 } from "../commands/context.js";
 
@@ -58,26 +64,69 @@ function envelope(id: string, bundle: unknown) {
 }
 
 /**
- * Capture what renderWarning printed while `fn` ran.
+ * Capture the refusal message `fn` printed, and prove it stayed off stdout.
  *
- * The refusal message is the only thing that says *which* guard rejected a
- * fixture; asserting on the return value alone cannot tell the envelope check
- * from the schema check. renderWarning goes to console.log (ui.ts), so that is
- * what gets spied on.
+ * The message is the only thing that says *which* guard rejected a fixture;
+ * asserting on the return value alone cannot tell the envelope check from the
+ * schema check. It goes to stderr: it used to go to console.log, which put a
+ * chalk-coloured prose line inside the payload of the very `--format json` and
+ * `--format llm` callers the refusal was answering. Anything on stdout here is
+ * that defect returning, so this fails on it rather than reading it.
  */
 function captureWarnings(fn: () => void): string {
   const lines: string[] = [];
-  const spy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+  const stdout: string[] = [];
+  const outSpy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+    stdout.push(args.map(String).join(" "));
+  });
+  const spy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
     lines.push(args.map(String).join(" "));
   });
   try {
     fn();
   } finally {
     spy.mockRestore();
+    outSpy.mockRestore();
   }
+  expect(stdout).toEqual([]);
   // chalk wraps the message as a whole, so the text stays contiguous; strip the
   // colour codes anyway so a CI run with colour forced on matches a local one.
   return lines.join("\n").replace(/\u001b\[[0-9;]*m/g, "");
+}
+
+/**
+ * Run `fn` with stdout and stderr captured separately.
+ *
+ * One helper for the file. There were three, and they disagreed: two joined a
+ * multi-argument `console.log` with a space, the third pushed each argument as
+ * its own line, so identical output produced different arrays depending on
+ * which block a test happened to sit in.
+ */
+function captureStreams(fn: () => void): { out: string[]; err: string[] } {
+  const out: string[] = [];
+  const err: string[] = [];
+  const origLog = console.log;
+  const origErr = console.error;
+  console.log = (...a: unknown[]) => void out.push(a.map(String).join(" "));
+  console.error = (...a: unknown[]) => void err.push(a.map(String).join(" "));
+  try {
+    fn();
+  } finally {
+    console.log = origLog;
+    console.error = origErr;
+  }
+  return { out, err };
+}
+
+/** The same, joined the way a terminal shows it. */
+function captureText(fn: () => void): { out: string; err: string } {
+  const { out, err } = captureStreams(fn);
+  return { out: out.join("\n"), err: err.join("\n") };
+}
+
+/** Just the stdout half, for the renderers that write nothing else. */
+function captureLog(fn: () => void): string[] {
+  return captureStreams(fn).out;
 }
 
 function makeFacts(overrides: Partial<EntityFacts> = {}): EntityFacts {
@@ -388,10 +437,13 @@ describe("ix context investigation state", () => {
     saveInvestigation("widget-check", bundle);
     const stored = loadInvestigation("widget-check")!;
 
-    expect(mergeDiffOptions(stored, {})).toEqual({ asOfRev: "7", depth: "2" });
-    expect(mergeDiffOptions(stored, { asOfRev: "3" })).toEqual({ asOfRev: "3", depth: "2" });
-    expect(mergeDiffOptions(stored, { depth: "4" })).toEqual({ asOfRev: "7", depth: "4" });
-    expect(mergeDiffOptions(stored, { asOfRev: "3", depth: "4" })).toEqual({ asOfRev: "3", depth: "4" });
+    // Numbers, not strings: `--as-of-rev` is validated by its Commander
+    // argParser now, so the round trip out to a string and back through
+    // `parseInt` is gone.
+    expect(mergeDiffOptions(stored, {})).toEqual({ asOfRev: 7, depth: "2" });
+    expect(mergeDiffOptions(stored, { asOfRev: 3 })).toEqual({ asOfRev: 3, depth: "2" });
+    expect(mergeDiffOptions(stored, { depth: "4" })).toEqual({ asOfRev: 7, depth: "4" });
+    expect(mergeDiffOptions(stored, { asOfRev: 3, depth: "4" })).toEqual({ asOfRev: 3, depth: "4" });
   });
 
   it("never collides or escapes for hostile investigation ids", () => {
@@ -418,5 +470,545 @@ describe("ix context investigation state", () => {
     }
     expect(existsSync(join(home, "..", "escape.json"))).toBe(false);
     expect(existsSync(join(home, ".version-check.json"))).toBe(false);
+  });
+
+  it("reports the budget the fresh bundle was actually built with", () => {
+    // `effective` is read off `fresh.budgets`, not restated from
+    // `saved.bundle.budgets`. That distinction is the whole point of the
+    // record: a change that let CLI overrides win would edit the
+    // `buildFreshBundle` argument in the action handler, and a restated
+    // `effective` would go on reporting the saved budget while the fresh side
+    // used another one -- the silent misreport this exists to prevent.
+    //
+    // So the two sides are given different budgets here. The earlier version of
+    // this test pinned `effective` to the *saved* snapshot even though the
+    // fresh bundle in front of it had been built with 50/100/25/12000 -- a
+    // budget neither side of the comparison had used together.
+    const saved = bundleWith([makeClaim("renders to DOM", 0.9)]);
+    saved.budgets = { maxEntities: 5, maxRelationships: 1, maxEvidence: 2, maxChars: 12000 };
+    saveInvestigation("widget-check", saved);
+    const stored = loadInvestigation("widget-check")!;
+    const fresh = bundleWith([makeClaim("renders to DOM", 0.9)]);
+    expect(fresh.budgets).toEqual({ maxEntities: 50, maxRelationships: 100, maxEvidence: 25, maxChars: 12000 });
+
+    const baselineDiff = diffInvestigations(stored, fresh);
+    expect(baselineDiff.budgets.saved).toEqual({ maxEntities: 5, maxRelationships: 1, maxEvidence: 2, maxChars: 12000 });
+    expect(baselineDiff.budgets.requested).toBeUndefined();
+    expect(baselineDiff.budgets.effective).toEqual(fresh.budgets);
+    expect(baselineDiff.budgets.requestedApplied).toBe(false);
+    // Nothing was asked for, so there is nothing to explain.
+    expect(baselineDiff.budgets.note).toBeUndefined();
+
+    // With CLI overrides, `requested` captures every flag the caller passed,
+    // and `requestedApplied` says whether they governed -- derived by comparing
+    // against `effective`, not hardcoded.
+    const requested = parseRequestedBudgets({ maxEntities: 5, maxEvidence: 2, maxRelationships: 1 });
+    expect(requested).toEqual({ maxEntities: 5, maxEvidence: 2, maxRelationships: 1 });
+
+    const overrideDiff = diffInvestigations(stored, fresh, requested);
+    expect(overrideDiff.budgets.requested).toEqual(requested);
+    expect(overrideDiff.budgets.effective).toEqual(fresh.budgets);
+    expect(overrideDiff.budgets.requestedApplied).toBe(false);
+    expect(overrideDiff.budgets.note).toMatch(/were not applied to the fresh side/i);
+
+    // Still false when the numbers happen to agree, which is the case that
+    // makes "requested equals effective" the wrong derivation: `--max-evidence
+    // 25` against a fresh side already built with 25 changes nothing, and
+    // reporting true there told an agent its override had taken.
+    const matching = parseRequestedBudgets({ maxEntities: 50, maxEvidence: 25 });
+    const agreeing = diffInvestigations(stored, fresh, matching);
+    expect(agreeing.budgets.requested).toEqual({ maxEntities: 50, maxEvidence: 25 });
+    expect(agreeing.budgets.effective).toEqual(fresh.budgets);
+    expect(agreeing.budgets.requestedApplied).toBe(false);
+    // …and the note beside it says the same thing, in every format.
+    expect(agreeing.budgets.note).toMatch(/were not applied to the fresh side/i);
+  });
+
+  it("records exactly the --max-* flags that were passed", () => {
+    // Validation lives in `parseBudgetOption`, the flags' Commander argParser,
+    // so anything arriving here is already a positive integer. What is left is
+    // "which flags were given", and an absent one must not become a phantom
+    // override in the report.
+    expect(parseRequestedBudgets({})).toBeUndefined();
+    expect(parseRequestedBudgets({ maxEntities: undefined })).toBeUndefined();
+    expect(parseRequestedBudgets({ maxEntities: 10, maxChars: undefined })).toEqual({ maxEntities: 10 });
+    expect(
+      parseRequestedBudgets({ maxEntities: 10, maxEvidence: 5, maxRelationships: 1, maxChars: 12000 }),
+    ).toEqual({ maxEntities: 10, maxEvidence: 5, maxRelationships: 1, maxChars: 12000 });
+  });
+
+  it("renders the budget block in --diff text and llm output", () => {
+    // Spy on console.log so we can assert exactly what humans and LLMs see.
+    // This is the regression guard for the user-visible transparency: if a
+    // future refactor flattens renderInvestigationDiff back to "entities/-
+    // +", the budget block disappears and the silent ignore comes back.
+    const saved = bundleWith([makeClaim("renders to DOM", 0.9)]);
+    saved.budgets = { maxEntities: 5, maxRelationships: 1, maxEvidence: 2, maxChars: 12000 };
+    saveInvestigation("widget-check", saved);
+    const stored = loadInvestigation("widget-check")!;
+    const fresh = bundleWith([makeClaim("renders to DOM", 0.9)]);
+    const requested = { maxEvidence: 25 };
+
+    const capture = () => {
+      const lines: string[] = [];
+      const spy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+        lines.push(args.map((a) => String(a)).join(" "));
+      });
+      return { lines, restore: () => spy.mockRestore() };
+    };
+
+    const text = capture();
+    try {
+      renderInvestigationDiff(stored, fresh, "text", requested);
+    } finally {
+      text.restore();
+    }
+    expect(text.lines.some((l) => l.includes("budgets:"))).toBe(true);
+    expect(text.lines.some((l) => l.includes("saved     :") && l.includes("evidence=2"))).toBe(true);
+    // One `some`, not two ANDed: `A.some(requested) && A.some(evidence=25)`
+    // passes when `evidence=25` lands on any line at all — the `saved` or
+    // `effective` line satisfied it — so it survived a `requested` line reading
+    // `evidence=not-given`, and on failure said only "expected false to be true".
+    expect(text.lines.some((l) => l.includes("requested :") && l.includes("evidence=25"))).toBe(true);
+    expect(text.lines.some((l) => l.includes("effective :") && l.includes("evidence=25"))).toBe(true);
+
+    const llm = capture();
+    try {
+      renderInvestigationDiff(stored, fresh, "llm", requested);
+    } finally {
+      llm.restore();
+    }
+    // Records, not the prose block with the colons moved. `scope=requested`
+    // carries `applied=` so the precedence rule — saved budgets govern
+    // --diff — is a field an agent can test rather than a sentence to read.
+    expect(llm.lines).toContain("budgets scope=saved entities=5 relationships=1 evidence=2 chars=12000");
+    expect(llm.lines).toContain("budgets scope=requested evidence=25 applied=false");
+    expect(llm.lines).toContain("budgets scope=effective entities=50 relationships=100 evidence=25 chars=12000");
+    // And none of the prose survives into the record stream.
+    expect(llm.lines.some((l) => l.includes(":") && l.startsWith("  "))).toBe(false);
+
+    // json format must already cover this branch in diffInvestigations itself,
+    // but assert here that the path is wired and the renderer doesn't double-print.
+    const json = capture();
+    try {
+      renderInvestigationDiff(stored, fresh, "json", requested);
+    } finally {
+      json.restore();
+    }
+    expect(json.lines).toHaveLength(1);
+    const parsed = JSON.parse(json.lines[0]);
+    expect(parsed.budgets.saved).toEqual(saved.budgets);
+    expect(parsed.budgets.requested).toEqual(requested);
+    expect(parsed.budgets.effective).toEqual(fresh.budgets);
+    // The same fact the llm record carries as `applied=`, so a JSON consumer
+    // does not have to string-match an English sentence for it — and it agrees
+    // with the note and with the text renderer's "not applied" label, which a
+    // value comparison did not.
+    expect(parsed.budgets.requestedApplied).toBe(false);
+    expect(parsed.budgets.note).toMatch(/were not applied to the fresh side/i);
+  });
+
+  // `--diff --format llm` used to fall through to the prose renderer, because
+  // the diff path only branched on `json`. The llm branch emits records built
+  // by `llmLine`, so a value carrying a space is quoted rather than splitting
+  // the record. These tests pin that.
+  describe("--format llm rendering", () => {
+
+    it("emits a header and counts for an empty diff without falling back to prose", () => {
+      const saved = bundleWith([makeClaim("renders to DOM", 0.9)]);
+      saveInvestigation("widget-llm", saved);
+      const stored = loadInvestigation("widget-llm")!;
+      const fresh = bundleWith([makeClaim("renders to DOM", 0.9)]);
+
+      const lines = captureLog(() => renderInvestigationDiff(stored, fresh, "llm"));
+
+      // `saved_at` and `generated_at` are on the record because
+      // `freshness_previous=current` says the snapshot was fresh when it was
+      // taken and not when that was: a baseline from five minutes ago and one
+      // from three months ago read identically without them.
+      const [header] = lines;
+      expect(header).toContain("diff investigation=widget-llm target=Widget");
+      expect(header).toContain(`saved_at=${stored.savedAt}`);
+      expect(header).toMatch(/generated_at=\d{4}-\d{2}-\d{2}T[\d:.]+Z/);
+      expect(header).toContain("freshness_previous=current freshness_current=current");
+      // Zero is the answer to the question --diff was asked, so it is carried
+      // rather than dropped as a default.
+      expect(lines).toContain(
+        "count added_entities=0 removed_entities=0 added_relationships=0 removed_relationships=0" +
+          " added_evidence=0 removed_evidence=0 added_claims=0 removed_claims=0",
+      );
+      // No `renderSection` lines means we did not fall back to prose.
+      expect(lines.some((l) => l.startsWith("==") || l.startsWith("  "))).toBe(false);
+    });
+
+    it("lists added and removed entities, relationships, evidence and claims", () => {
+      const saved = bundleWith([makeClaim("renders to DOM", 0.9)]);
+      saveInvestigation("widget-llm-busy", saved);
+      const stored = loadInvestigation("widget-llm-busy")!;
+
+      const fresh = buildBundle({
+        resolved: { id: "entity-1", name: "Widget", kind: "class", resolutionMode: "exact" },
+        facts: makeFacts(),
+        context: makeContext({
+          claims: [makeClaim("renders to DOM", 0.9), makeClaim("mounts to DOM", 0.7)],
+          nodes: [
+            {
+              id: "entity-2",
+              kind: "method",
+              name: "render",
+              attrs: {},
+              provenance: { sourceUri: "src/widget.ts", extractor: "tree-sitter", sourceType: "source", observedAt: "2026-01-01T00:00:00Z" },
+              createdRev: 1,
+              createdAt: "2026-01-01T00:00:00Z",
+              updatedAt: "2026-01-01T00:00:00Z",
+            },
+            {
+              id: "entity-3",
+              kind: "method",
+              name: "mount",
+              attrs: {},
+              provenance: { sourceUri: "src/widget.ts", extractor: "tree-sitter", sourceType: "source", observedAt: "2026-01-01T00:00:00Z" },
+              createdRev: 2,
+              createdAt: "2026-01-01T00:00:00Z",
+              updatedAt: "2026-01-01T00:00:00Z",
+            },
+          ],
+          // Fresh side replaces the saved `calls` edge with `holds` — so the
+          // diff sees a removed relationship (calls) and an added one (holds),
+          // matching what an agent would observe when a refactor renames a
+          // graph predicate.
+          edges: [
+            { id: "edge-add", src: "entity-1", dst: "entity-3", predicate: "holds", attrs: {}, createdRev: 2 },
+          ],
+        }),
+        provenance: { sourceType: "source", extractor: "tree-sitter", observedAt: "2026-01-01T00:00:00Z" },
+        asOfRev: undefined,
+        depth: undefined,
+        budgets: { maxEntities: 50, maxRelationships: 100, maxEvidence: 25, maxChars: 12000 },
+      });
+
+      const lines = captureLog(() => renderInvestigationDiff(stored, fresh, "llm"));
+
+      // Counts match the deterministic diff structure. The fresh bundle adds
+      // a new claim (mounts to DOM) and replaces the `calls` evidence with a
+      // `holds` one, so it has 2 added evidence records and 1 removed — the
+      // skolem IDs are `claim:<claim_id>` and
+      // `relationship:<src>:<dst>:<predicate>`, so a stale predicate in the
+      // ranked evidence list yields a real added/removed pair.
+      expect(lines).toContain(
+        "count added_entities=1 removed_entities=0 added_relationships=1 removed_relationships=1" +
+          " added_evidence=2 removed_evidence=1 added_claims=1 removed_claims=0",
+      );
+
+      // The change is a field, not a prefix fused to the record kind, so a
+      // consumer routing on `entity` matches both sides of the comparison.
+      // `id=` is what makes the stream joinable: the relationship records below
+      // name their endpoints by entity id, so without it `dst=entity-3`
+      // resolves to nothing the reader has seen.
+      expect(lines).toContain(
+        "entity change=added id=entity-3 kind=method name=mount path=src/widget.ts",
+      );
+      expect(lines).toContain("relationship change=removed src=entity-1 pred=calls dst=entity-2");
+      expect(lines).toContain("relationship change=added src=entity-1 pred=holds dst=entity-3");
+
+      // A claim id carries the statement, so it contains spaces — quoted, per
+      // docs/llm-format.md. Unquoted, `id=claim-mounts to DOM` is three tokens
+      // and a consumer reads the id as `claim-mounts`.
+      // `statement=` is the field that says what changed. In production the id
+      // is the backend's (`c-8f31a2`), so a record carrying only the id told a
+      // reader that a claim changed and not what it says; this fixture's
+      // `claim-<statement>` ids are what hid that.
+      expect(lines).toContain(
+        'claim change=added id="claim-mounts to DOM" entity=entity-1 status=active statement="mounts to DOM"',
+      );
+
+      // An evidence title is a sentence. Same rule, and the reason the value
+      // must never be built with a template literal.
+      expect(lines).toContain(
+        'evidence change=added score=30 kind=relationship title="entity-1 --holds--> entity-3"',
+      );
+      expect(lines).toContain(
+        'evidence change=removed score=30 kind=relationship title="entity-1 --calls--> entity-2"',
+      );
+
+      // One record per line — the wire format invariant.
+      for (const line of lines) expect(line).not.toContain("\n");
+    });
+
+    it("answers a refusal with a record, not a prose warning", () => {
+      // The refusal path wrote `renderWarning`, which is console.log, so the
+      // one command being made llm-clean answered `--diff nope --format llm`
+      // with a chalk-coloured English sentence in the middle of the record
+      // stream. Every sibling command emits `error code=... message="..."`.
+      const out: string[] = [];
+      const err: string[] = [];
+      const origLog = console.log;
+      const origErr = console.error;
+      console.log = (...a: unknown[]) => void out.push(a.map(String).join(" "));
+      console.error = (...a: unknown[]) => void err.push(a.map(String).join(" "));
+      try {
+        expect(loadInvestigation("does-not-exist", "llm")).toBeUndefined();
+      } finally {
+        console.log = origLog;
+        console.error = origErr;
+      }
+      expect(out).toHaveLength(1);
+      expect(out[0]).toMatch(/^error code=no_saved_investigation message="No saved investigation/);
+      // One record on one line, with the path quoted rather than bare.
+      expect(out[0]).not.toContain("\n");
+      expect(err).toEqual([]);
+      expect(process.exitCode).toBe(1);
+      process.exitCode = undefined;
+    });
+
+    it("emits one grammar for `evidence`, whichever ix context surface produced it", () => {
+      // `renderBundle` built `evidence 30 relationship <title>` from a template
+      // literal: positional, unquoted, newlines stripped and nothing else. An
+      // evidence title is a sentence, so every one of those records split into
+      // tokens — while `--diff` emitted the keyed, quoted form for the same
+      // record kind from the same command.
+      const bundle = bundleWith([makeClaim("renders to DOM", 0.9)]);
+      const lines = captureLog(() => renderBundle(bundle, "llm"));
+
+      const evidence = lines.filter((l) => l.startsWith("evidence"));
+      expect(evidence.length).toBeGreaterThan(0);
+      for (const line of evidence) {
+        expect(line).toMatch(/^evidence score=\d+ kind=[a-z]+ title=/);
+      }
+      // The exact record `--diff` would emit for the same item, minus `change=`.
+      expect(lines).toContain(
+        'evidence score=30 kind=relationship title="entity-1 --calls--> entity-2"',
+      );
+      // And the header is a record too, not fifteen bare `key=value` lines
+      // built by interpolation — `target=${name}` breaks on any name with a
+      // space in it.
+      expect(lines[0]).toMatch(/^context target=Widget target_kind=class /);
+    });
+
+    it("gives --resume its own record kind, not --list's", () => {
+      // Both emitted `investigation`, with two fields here and thirteen there,
+      // so a consumer routing on the record kind could not tell which shape to
+      // expect and reading `target` off this one yielded undefined.
+      const saved = bundleWith([makeClaim("renders to DOM", 0.9)]);
+      saveInvestigation("widget-resume", saved);
+      const lines = captureLog(() => renderSavedInvestigation("widget-resume", "llm"));
+
+      expect(lines[0]).toMatch(/^resumed id=widget-resume saved_at=/);
+      // …and it carries the one fact the bundle records do not: when the
+      // snapshot was taken. `classification=current` says it was fresh then,
+      // not when then was.
+      expect(lines[0]).toMatch(/saved_at=\d{4}-\d{2}-\d{2}T/);
+      // The prose note it replaces is gone from the record stream.
+      expect(lines.some((l) => l.includes("Resumed investigation"))).toBe(false);
+      expect(lines[1]).toMatch(/^context target=Widget/);
+    });
+
+    it("does not regress the prose (text) renderer", () => {
+      const saved = bundleWith([makeClaim("renders to DOM", 0.9)]);
+      saveInvestigation("widget-llm-text", saved);
+      const stored = loadInvestigation("widget-llm-text")!;
+      const fresh = bundleWith([makeClaim("renders to DOM", 0.9), makeClaim("mounts to DOM", 0.7)]);
+
+      const lines = captureLog(() => renderInvestigationDiff(stored, fresh, "text"));
+
+      // Prose path still emits its summary header and the `+N`/`-N` totals.
+      expect(lines.some((l) => l.includes("Investigation diff: widget-llm-text"))).toBe(true);
+      expect(lines.some((l) => /claims:\s+-\d+\s+\+\d+/.test(l))).toBe(true);
+      expect(lines.some((l) => /entities:\s+-\d+\s+\+\d+/.test(l))).toBe(true);
+    });
+  });
+
+  // `ix context --list` enumerates saved investigations for discovery.
+  // Without it, neither humans nor agents can see what they have stored —
+  // the only path was reading the JSON files directly.
+  describe("listInvestigations", () => {
+    /** Restamp a saved investigation's `savedAt`, leaving everything else alone. */
+    const stampSavedAt = (id: string, savedAt: string) => {
+      const path = join(investigationsDir(), `${id}.json`);
+      const state = JSON.parse(readFileSync(path, "utf8"));
+      writeFileSync(path, JSON.stringify({ ...state, savedAt }), "utf8");
+    };
+
+    it("returns saved investigations newest-first", () => {
+      // The timestamps are set explicitly because `saveInvestigation` stamps
+      // them from the clock and three writes inside one millisecond is the
+      // ordinary case, not the rare one. The previous version of this test
+      // asserted `saved[0].id === "widget-a" || saved[0].id === "widget-b"` and
+      // called `.sort()` on the ids before comparing them, so it was true for
+      // either order: inverting the comparator left every assertion green and
+      // ordering — the function's whole stated purpose — had no coverage.
+      saveInvestigation("widget-a", bundleWith([makeClaim("renders to DOM", 0.9)]));
+      saveInvestigation("widget-b", bundleWith([makeClaim("mounts to DOM", 0.7)]));
+      saveInvestigation("widget-c", bundleWith([makeClaim("unmounts cleanly", 0.5)]));
+      stampSavedAt("widget-a", "2026-01-02T00:00:00.000Z");
+      stampSavedAt("widget-b", "2026-01-03T00:00:00.000Z");
+      stampSavedAt("widget-c", "2026-01-01T00:00:00.000Z");
+
+      const list = listInvestigations();
+      expect(list.saved.map((s) => s.id)).toEqual(["widget-b", "widget-a", "widget-c"]);
+      expect(list.skipped).toBe(0);
+    });
+
+    it("breaks a same-millisecond tie on the id, stably", () => {
+      // The reason the comparator has a second clause at all: two saves in the
+      // same millisecond must still come back in the same order every run.
+      for (const id of ["widget-c", "widget-a", "widget-b"]) {
+        saveInvestigation(id, bundleWith([makeClaim("renders to DOM", 0.9)]));
+        stampSavedAt(id, "2026-01-01T00:00:00.000Z");
+      }
+      expect(listInvestigations().saved.map((s) => s.id)).toEqual([
+        "widget-a",
+        "widget-b",
+        "widget-c",
+      ]);
+    });
+
+    it("lists an id that --resume can actually take back", () => {
+      // `sanitizeId` is injective and deliberately not idempotent — it encodes
+      // `~` as `~7E` so a raw `~` cannot be mistaken for an escape — so the id
+      // stored on disk is the wrong thing to print next to "Resume with:".
+      // `widget/auth` was saved as `widget~2Fauth` and listed as that, and
+      // resuming it looked for `widget~7E2Fauth`, which does not exist.
+      saveInvestigation("widget/auth", bundleWith([makeClaim("renders to DOM", 0.9)]));
+      // Stored encoded, one file, no separator in the name.
+      expect(readdirSync(investigationsDir())).toEqual(["widget~2Fauth.json"]);
+
+      // Decoded once, at the read boundary, so every format agrees. Decoding at
+      // each print site is how `--format llm` came to say `widget/auth` while
+      // `--format json` and the text header said `widget~2Fauth`.
+      const [only] = listInvestigations().saved;
+      expect(only.id).toBe("widget/auth");
+      const { out } = captureText(() => renderInvestigationList([only], 0, "json"));
+      expect(JSON.parse(out).investigations[0].id).toBe("widget/auth");
+      // The whole point: the id the listing offers has to load.
+      expect(loadInvestigation(only.id)?.bundle.target.name).toBe("Widget");
+    });
+
+    it("lists an id that --resume can take back even when it cannot be decoded", () => {
+      // `sanitizeId` writes two hex digits below U+0100 and three or four above
+      // it, so `~7528` is either one CJK code unit or `~752` followed by a
+      // literal `8` and nothing in the string says which. Guessing produced a
+      // mangled id that loaded nothing; the round-trip check refuses to guess
+      // and shows the stored name, and `loadInvestigation` accepts that form.
+      saveInvestigation("用户", bundleWith([makeClaim("renders to DOM", 0.9)]));
+      const [only] = listInvestigations().saved;
+      expect(only.id).toBe("~7528~6237");
+      expect(loadInvestigation(only.id)?.bundle.target.name).toBe("Widget");
+      // …and the id the user actually typed still reaches the same file.
+      expect(loadInvestigation("用户")?.bundle.target.name).toBe("Widget");
+    });
+
+    it("keeps an id that is literally spelled like an encoding on its own file", () => {
+      // The on-disk fallback is second, not first, so `widget~2Fauth` typed as
+      // an id finds the file it was saved to rather than the one `widget/auth`
+      // was.
+      saveInvestigation("widget/auth", bundleWith([makeClaim("renders to DOM", 0.9)]));
+      saveInvestigation("widget~2Fauth", bundleWith([makeClaim("mounts to DOM", 0.9)]));
+      expect(readdirSync(investigationsDir()).sort()).toEqual(
+        ["widget~2Fauth.json", "widget~7E2Fauth.json"],
+      );
+      const claims = (id: string) =>
+        loadInvestigation(id)!.bundle.claims.map((c) => c.statement);
+      expect(claims("widget/auth")).toContain("renders to DOM");
+      expect(claims("widget~2Fauth")).toContain("mounts to DOM");
+    });
+
+    it("skips files whose envelope or bundle does not match the contract", () => {
+      saveInvestigation("good", bundleWith([makeClaim("renders to DOM", 0.9)]));
+      const dir = investigationsDir();
+      writeFileSync(join(dir, "corrupt-envelope.json"), JSON.stringify({ schema: "ix-investigation/9", bundle: {} }));
+      writeFileSync(join(dir, "truncated.json"), "{not json");
+      writeFileSync(join(dir, "tampered-body.json"), JSON.stringify({
+        schema: "ix-investigation/1",
+        id: "tampered-body",
+        savedAt: "2026-01-01T00:00:00Z",
+        bundle: { schema: "ix-context-bundle/1", generatedAt: "x", entities: "not-an-array" },
+      }));
+      writeFileSync(join(dir, "readme.md"), "not a state file");
+
+      const list = listInvestigations();
+      expect(list.saved.map((s) => s.id)).toEqual(["good"]);
+      // Counted and handed back, not printed: the enumerator runs before the
+      // renderer knows whether the caller asked for JSON.
+      expect(list.skipped).toBe(3);
+      // The three corrupt files do not poison the listing.
+      expect(readdirSync(dir).filter((f) => f.endsWith(".json"))).toHaveLength(4);
+    });
+
+    it("returns an empty listing when the investigations dir does not exist yet", () => {
+      expect(listInvestigations()).toEqual({ saved: [], skipped: 0 });
+      saveInvestigation("first", bundleWith([makeClaim("renders to DOM", 0.9)]));
+      expect(listInvestigations().saved).toHaveLength(1);
+    });
+
+    it("keeps the skip report off stdout in every machine format", () => {
+      // json must stay parseable and llm must stay records, so the human
+      // warning goes to stderr and the machine formats carry a count instead.
+      saveInvestigation("good", bundleWith([makeClaim("renders to DOM", 0.9)]));
+      const { saved } = listInvestigations();
+
+      const json = captureText(() => renderInvestigationList(saved, 3, "json"));
+      expect(() => JSON.parse(json.out)).not.toThrow();
+      const parsed = JSON.parse(json.out);
+      expect(parsed.investigations).toHaveLength(1);
+      // An array had nowhere to put this, so a machine caller could not tell
+      // three files had been rejected while the human saw a warning saying so.
+      expect(parsed.skipped).toBe(3);
+      expect(json.err).toContain("3 saved investigation file(s)");
+
+      const llm = captureText(() => renderInvestigationList(saved, 3, "llm"));
+      expect(llm.out.split("\n")[0]).toBe("investigations total=1 skipped=3");
+      // The count is the record's business; nothing is written beside it.
+      expect(llm.err).toBe("");
+
+      // And with nothing skipped the field is simply absent.
+      const clean = captureText(() => renderInvestigationList(saved, 0, "llm"));
+      expect(clean.out.split("\n")[0]).toBe("investigations total=1");
+      expect(clean.err).toBe("");
+      // `skipped` is still there in json, as a zero rather than as nothing:
+      // "none were rejected" is an answer, and its absence is not.
+      const cleanJson = captureText(() => renderInvestigationList(saved, 0, "json"));
+      expect(JSON.parse(cleanJson.out).skipped).toBe(0);
+    });
+
+    it("returns a summary per investigation, not the bundles themselves", () => {
+      // `--list` is the discovery step. Twenty saved investigations is twenty
+      // complete bundles — up to 50 entities, 100 relationships and 12000
+      // characters of evidence each — and a caller that wants one of them asks
+      // for it by id with `--resume <id> --format json`.
+      saveInvestigation("widget", bundleWith([makeClaim("renders to DOM", 0.9)]));
+      const { saved } = listInvestigations();
+      expect(saved[0].bundle.evidence.length).toBeGreaterThan(0);
+
+      const { out } = captureText(() => renderInvestigationList(saved, 0, "json"));
+      const [item] = JSON.parse(out).investigations;
+      expect(Object.keys(item).sort()).toEqual(
+        ["counts", "freshness", "id", "savedAt", "target", "truncation"].sort(),
+      );
+      expect(item.counts.evidence).toBe(saved[0].bundle.evidence.length);
+      expect(out).not.toContain("renders to DOM");
+    });
+
+    it("prints nothing itself, whatever it finds", () => {
+      // The defect this replaces: the warning was a `renderWarning` inside the
+      // enumerator, and every renderer in ui.ts writes to stdout. One corrupt
+      // file therefore prepended a chalk-coloured prose line to the payload,
+      // and `ix context --list --format json | jq` failed on it.
+      saveInvestigation("good", bundleWith([makeClaim("renders to DOM", 0.9)]));
+      writeFileSync(join(investigationsDir(), "truncated.json"), "{not json");
+
+      const lines: string[] = [];
+      const origLog = console.log;
+      const origErr = console.error;
+      console.log = (...a: unknown[]) => void lines.push(a.join(" "));
+      console.error = (...a: unknown[]) => void lines.push(a.join(" "));
+      try {
+        listInvestigations();
+      } finally {
+        console.log = origLog;
+        console.error = origErr;
+      }
+      expect(lines).toEqual([]);
+    });
   });
 });
