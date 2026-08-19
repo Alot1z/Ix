@@ -83,6 +83,22 @@ contains method=12 field=4
 item name=parseFile kind=method
 ```
 
+`ix context --diff <id>`:
+
+```
+diff investigation=widget target=Widget freshness_previous=current freshness_current=stale
+count added_entities=1 removed_entities=0 added_relationships=1 removed_relationships=1 added_evidence=2 removed_evidence=1 added_claims=1 removed_claims=0
+entity change=added kind=method name=mount
+relationship change=removed src=entity-1 pred=calls dst=entity-2
+evidence change=added score=30 kind=relationship title="entity-1 --holds--> entity-3"
+claim change=added id="claim-mounts to DOM" status=active
+```
+
+The counts keep their zeros: "nothing was added" is the answer `--diff` was
+asked for, not a default worth dropping. Added and removed share one record
+kind and separate on `change=`, so a consumer routing on `entity` sees both
+sides of the comparison.
+
 Error line:
 
 ```

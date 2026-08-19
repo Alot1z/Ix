@@ -356,10 +356,14 @@ describe("ix context investigation state", () => {
     } finally {
       llm.restore();
     }
-    expect(llm.lines.some((l) => l.trim() === "budgets")).toBe(true);
-    expect(llm.lines.some((l) => l.includes("saved     :") && l.includes("evidence=2"))).toBe(true);
-    expect(llm.lines.some((l) => l.includes("requested :") && l.includes("evidence=25"))).toBe(true);
-    expect(llm.lines.some((l) => l.includes("effective :") && l.includes("evidence=2"))).toBe(true);
+    // Records, not the prose block with the colons moved. `scope=requested`
+    // carries `applied=false` so the precedence rule — saved budgets govern
+    // --diff — is a field an agent can test rather than a sentence to read.
+    expect(llm.lines).toContain("budgets scope=saved entities=5 relationships=1 evidence=2 chars=12000");
+    expect(llm.lines).toContain("budgets scope=requested evidence=25 applied=false");
+    expect(llm.lines).toContain("budgets scope=effective entities=5 relationships=1 evidence=2 chars=12000");
+    // And none of the prose survives into the record stream.
+    expect(llm.lines.some((l) => l.includes(":") && l.startsWith("  "))).toBe(false);
 
     // json format must already cover this branch in diffInvestigations itself,
     // but assert here that the path is wired and the renderer doesn't double-print.
@@ -370,9 +374,147 @@ describe("ix context investigation state", () => {
       json.restore();
     }
     expect(json.lines).toHaveLength(1);
-    const parsed = JSON.parse(json.lines[0].replace(/^undefined$/, ""));
+    const parsed = JSON.parse(json.lines[0]);
     expect(parsed.budgets.saved).toEqual(saved.budgets);
     expect(parsed.budgets.requested).toEqual(requested);
     expect(parsed.budgets.effective).toEqual(saved.budgets);
+  });
+
+  // `--diff --format llm` used to fall through to the prose renderer, because
+  // the diff path only branched on `json`. The llm branch emits records built
+  // by `llmLine`, so a value carrying a space is quoted rather than splitting
+  // the record. These tests pin that.
+  describe("--format llm rendering", () => {
+    function captureLog(fn: () => void): string[] {
+      const lines: string[] = [];
+      const orig = console.log;
+      console.log = (...args: unknown[]) => {
+        for (const arg of args) lines.push(String(arg));
+      };
+      try {
+        fn();
+      } finally {
+        console.log = orig;
+      }
+      return lines;
+    }
+
+    it("emits a header and counts for an empty diff without falling back to prose", () => {
+      const saved = bundleWith([makeClaim("renders to DOM", 0.9)]);
+      saveInvestigation("widget-llm", saved);
+      const stored = loadInvestigation("widget-llm")!;
+      const fresh = bundleWith([makeClaim("renders to DOM", 0.9)]);
+
+      const lines = captureLog(() => renderInvestigationDiff(stored, fresh, "llm"));
+
+      expect(lines[0]).toBe(
+        "diff investigation=widget-llm target=Widget freshness_previous=current freshness_current=current",
+      );
+      // Zero is the answer to the question --diff was asked, so it is carried
+      // rather than dropped as a default.
+      expect(lines).toContain(
+        "count added_entities=0 removed_entities=0 added_relationships=0 removed_relationships=0" +
+          " added_evidence=0 removed_evidence=0 added_claims=0 removed_claims=0",
+      );
+      // No `renderSection` lines means we did not fall back to prose.
+      expect(lines.some((l) => l.startsWith("==") || l.startsWith("  "))).toBe(false);
+    });
+
+    it("lists added and removed entities, relationships, evidence and claims", () => {
+      const saved = bundleWith([makeClaim("renders to DOM", 0.9)]);
+      saveInvestigation("widget-llm-busy", saved);
+      const stored = loadInvestigation("widget-llm-busy")!;
+
+      const fresh = buildBundle({
+        resolved: { id: "entity-1", name: "Widget", kind: "class", resolutionMode: "exact" },
+        facts: makeFacts(),
+        context: makeContext({
+          claims: [makeClaim("renders to DOM", 0.9), makeClaim("mounts to DOM", 0.7)],
+          nodes: [
+            {
+              id: "entity-2",
+              kind: "method",
+              name: "render",
+              attrs: {},
+              provenance: { sourceUri: "src/widget.ts", extractor: "tree-sitter", sourceType: "source", observedAt: "2026-01-01T00:00:00Z" },
+              createdRev: 1,
+              createdAt: "2026-01-01T00:00:00Z",
+              updatedAt: "2026-01-01T00:00:00Z",
+            },
+            {
+              id: "entity-3",
+              kind: "method",
+              name: "mount",
+              attrs: {},
+              provenance: { sourceUri: "src/widget.ts", extractor: "tree-sitter", sourceType: "source", observedAt: "2026-01-01T00:00:00Z" },
+              createdRev: 2,
+              createdAt: "2026-01-01T00:00:00Z",
+              updatedAt: "2026-01-01T00:00:00Z",
+            },
+          ],
+          // Fresh side replaces the saved `calls` edge with `holds` — so the
+          // diff sees a removed relationship (calls) and an added one (holds),
+          // matching what an agent would observe when a refactor renames a
+          // graph predicate.
+          edges: [
+            { id: "edge-add", src: "entity-1", dst: "entity-3", predicate: "holds", attrs: {}, createdRev: 2 },
+          ],
+        }),
+        provenance: { sourceType: "source", extractor: "tree-sitter", observedAt: "2026-01-01T00:00:00Z" },
+        asOfRev: undefined,
+        depth: undefined,
+        budgets: { maxEntities: 50, maxRelationships: 100, maxEvidence: 25, maxChars: 12000 },
+      });
+
+      const lines = captureLog(() => renderInvestigationDiff(stored, fresh, "llm"));
+
+      // Counts match the deterministic diff structure. The fresh bundle adds
+      // a new claim (mounts to DOM) and replaces the `calls` evidence with a
+      // `holds` one, so it has 2 added evidence records and 1 removed — the
+      // skolem IDs are `claim:<claim_id>` and
+      // `relationship:<src>:<dst>:<predicate>`, so a stale predicate in the
+      // ranked evidence list yields a real added/removed pair.
+      expect(lines).toContain(
+        "count added_entities=1 removed_entities=0 added_relationships=1 removed_relationships=1" +
+          " added_evidence=2 removed_evidence=1 added_claims=1 removed_claims=0",
+      );
+
+      // The change is a field, not a prefix fused to the record kind, so a
+      // consumer routing on `entity` matches both sides of the comparison.
+      expect(lines).toContain("entity change=added kind=method name=mount");
+      expect(lines).toContain("relationship change=removed src=entity-1 pred=calls dst=entity-2");
+      expect(lines).toContain("relationship change=added src=entity-1 pred=holds dst=entity-3");
+
+      // A claim id carries the statement, so it contains spaces — quoted, per
+      // docs/llm-format.md. Unquoted, `id=claim-mounts to DOM` is three tokens
+      // and a consumer reads the id as `claim-mounts`.
+      expect(lines).toContain('claim change=added id="claim-mounts to DOM" status=active');
+
+      // An evidence title is a sentence. Same rule, and the reason the value
+      // must never be built with a template literal.
+      expect(lines).toContain(
+        'evidence change=added score=30 kind=relationship title="entity-1 --holds--> entity-3"',
+      );
+      expect(lines).toContain(
+        'evidence change=removed score=30 kind=relationship title="entity-1 --calls--> entity-2"',
+      );
+
+      // One record per line — the wire format invariant.
+      for (const line of lines) expect(line).not.toContain("\n");
+    });
+
+    it("does not regress the prose (text) renderer", () => {
+      const saved = bundleWith([makeClaim("renders to DOM", 0.9)]);
+      saveInvestigation("widget-llm-text", saved);
+      const stored = loadInvestigation("widget-llm-text")!;
+      const fresh = bundleWith([makeClaim("renders to DOM", 0.9), makeClaim("mounts to DOM", 0.7)]);
+
+      const lines = captureLog(() => renderInvestigationDiff(stored, fresh, "text"));
+
+      // Prose path still emits its summary header and the `+N`/`-N` totals.
+      expect(lines.some((l) => l.includes("Investigation diff: widget-llm-text"))).toBe(true);
+      expect(lines.some((l) => /claims:\s+-\d+\s+\+\d+/.test(l))).toBe(true);
+      expect(lines.some((l) => /entities:\s+-\d+\s+\+\d+/.test(l))).toBe(true);
+    });
   });
 });

@@ -15,7 +15,7 @@ import type {
 } from "../../client/types.js";
 import { getEndpoint } from "../config.js";
 import { collectFacts, type EntityFacts } from "../explain/facts.js";
-import { printLlmLines } from "../llm.js";
+import { llmLine, printLlmLines } from "../llm.js";
 import { parsePickOption } from "../options.js";
 import { resolveFileOrEntity } from "../resolve.js";
 import { createStaleProbe } from "../stale.js";
@@ -407,6 +407,21 @@ interface BudgetSnapshot {
   maxChars: number;
 }
 
+/**
+ * A budget snapshot as llm record fields.
+ *
+ * Absent values are simply absent — `llmField` drops nullish, so a partial
+ * override needs no `not-given` sentinel the way the prose form does.
+ */
+function budgetFields(b: Partial<BudgetSnapshot>): Record<string, number | undefined> {
+  return {
+    entities: b.maxEntities,
+    relationships: b.maxRelationships,
+    evidence: b.maxEvidence,
+    chars: b.maxChars,
+  };
+}
+
 /** Compact one-line representation of a budget snapshot for human rendering. */
 function formatBudgets(b: Partial<BudgetSnapshot>, partial = false): string {
   const fmt = (val: number | undefined, key: string): string =>
@@ -421,9 +436,15 @@ function formatBudgets(b: Partial<BudgetSnapshot>, partial = false): string {
 }
 
 /**
- * Apply the same clamping rules the action handler uses for direct --save runs
- * to a budget object parsed from raw commander string values. Treats an absent
- * or whitespace-only string as "user did not pass this flag".
+ * Read the raw `--max-*` strings commander collected into numbers.
+ *
+ * Deliberately *not* clamped, unlike the action handler's `clampInt` calls for
+ * a direct run: these values are reported, never applied — saved budgets
+ * govern `--diff` — so clamping them would misreport what the caller actually
+ * asked for. If they are ever made to win on the fresh side, they must be
+ * clamped at that point, and the ranges live in the handler.
+ *
+ * An absent or whitespace-only string means the flag was not passed.
  */
 export function parseRequestedBudgets(opts: Partial<ContextOptions>): Partial<BudgetSnapshot> | undefined {
   const fields: Array<keyof BudgetSnapshot> = ["maxEntities", "maxRelationships", "maxEvidence", "maxChars"];
@@ -528,29 +549,76 @@ export function renderInvestigationDiff(
     console.log(JSON.stringify(diff, null, 2));
     return;
   }
+  if (format === "llm") {
+    // `ix context --diff --format llm` used to fall through to the prose
+    // renderer below, because this path only branched on `json`. That made the
+    // most common agent path the worst one: escaping the prose is what `llm`
+    // exists for.
+    //
+    // Every line goes through `llmLine`, never a template literal. The values
+    // here are the ones most likely to contain a space in the whole CLI — an
+    // evidence title is a sentence, and a claim id carries the statement — and
+    // `key=value` with an unquoted space is not a record a consumer can split.
+    // `llmQuote` also encodes newlines, so a title cannot break the one
+    // record per line invariant.
+    printLlmLines([
+      llmLine("diff", {
+        investigation: saved.id,
+        target: fresh.target.name,
+        freshness_previous: prev.freshness.classification,
+        freshness_current: fresh.freshness.classification,
+      }),
+      // Which budgets governed the comparison. `scope=requested` appears
+      // only when --max-* flags were passed, and carries `applied=false`
+      // rather than a sentence explaining itself: the precedence rule is
+      // that saved budgets govern --diff, and a field an agent can test
+      // beats a note it has to read.
+      llmLine("budgets", { scope: "saved", ...budgetFields(diff.budgets.saved) }),
+      ...(diff.budgets.requested
+        ? [llmLine("budgets", { scope: "requested", ...budgetFields(diff.budgets.requested), applied: false })]
+        : []),
+      llmLine("budgets", { scope: "effective", ...budgetFields(diff.budgets.effective) }),
+      // One record rather than eight, and the zeros are kept: "nothing was
+      // added" is the answer to the question `--diff` was asked, so dropping
+      // it as a default would remove the signal.
+      llmLine("count", {
+        added_entities: diff.added.entities.length,
+        removed_entities: diff.removed.entities.length,
+        added_relationships: diff.added.relationships.length,
+        removed_relationships: diff.removed.relationships.length,
+        added_evidence: diff.added.evidence.length,
+        removed_evidence: diff.removed.evidence.length,
+        added_claims: diff.added.claims.length,
+        removed_claims: diff.removed.claims.length,
+      }),
+      // `change=` rather than a `+`/`-` prefix on the record kind: a consumer
+      // routing on the kind should still match `entity` on both sides of the
+      // comparison, and a fused marker means it matches neither.
+      ...diff.added.entities.map((e) => llmLine("entity", { change: "added", kind: e.kind, name: e.name })),
+      ...diff.removed.entities.map((e) => llmLine("entity", { change: "removed", kind: e.kind, name: e.name })),
+      ...diff.added.relationships.map((r) => llmLine("relationship", { change: "added", src: r.src, pred: r.predicate, dst: r.dst })),
+      ...diff.removed.relationships.map((r) => llmLine("relationship", { change: "removed", src: r.src, pred: r.predicate, dst: r.dst })),
+      ...diff.added.evidence.map((e) => llmLine("evidence", { change: "added", score: e.score, kind: e.kind, title: e.title })),
+      ...diff.removed.evidence.map((e) => llmLine("evidence", { change: "removed", score: e.score, kind: e.kind, title: e.title })),
+      ...diff.added.claims.map((c) => llmLine("claim", { change: "added", id: c.id, status: c.status })),
+      ...diff.removed.claims.map((c) => llmLine("claim", { change: "removed", id: c.id, status: c.status })),
+    ]);
+    return;
+  }
 
   renderSection(`Investigation diff: ${saved.id}`);
   console.log(`  freshness: ${prev.freshness.classification} -> ${fresh.freshness.classification}`);
-  if (format === "llm") {
-    console.log(`  budgets`);
-    console.log(`    saved     : ${formatBudgets(diff.budgets.saved)}`);
-    if (diff.budgets.requested) {
-      console.log(`    requested : ${formatBudgets(diff.budgets.requested as BudgetSnapshot, true)}`);
-    } else {
-      console.log(`    requested : (none — no --max-* flags passed)`);
-    }
-    console.log(`    effective : ${formatBudgets(diff.budgets.effective)}`);
-    console.log(`    note      : ${diff.budgets.note}`);
+  // Prose only: `--format llm` returned above with records of its own. The
+  // llm branch here used to be this same block with the colons moved, which
+  // is the one thing the format is defined not to be.
+  console.log(`  budgets:`);
+  console.log(`    saved     : ${formatBudgets(diff.budgets.saved)}`);
+  if (diff.budgets.requested) {
+    console.log(`    requested : ${formatBudgets(diff.budgets.requested, true)}`);
   } else {
-    console.log(`  budgets:`);
-    console.log(`    saved     : ${formatBudgets(diff.budgets.saved)}`);
-    if (diff.budgets.requested) {
-      console.log(`    requested : ${formatBudgets(diff.budgets.requested as BudgetSnapshot, true)}`);
-    } else {
-      console.log(`    requested : (none)`);
-    }
-    console.log(`    effective : ${formatBudgets(diff.budgets.effective)}`);
+    console.log(`    requested : (none)`);
   }
+  console.log(`    effective : ${formatBudgets(diff.budgets.effective)}`);
   console.log(`  entities:  -${diff.removed.entities.length} +${diff.added.entities.length}`);
   console.log(`  relationships: -${diff.removed.relationships.length} +${diff.added.relationships.length}`);
   console.log(`  evidence:  -${diff.removed.evidence.length} +${diff.added.evidence.length}`);
