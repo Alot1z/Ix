@@ -2,6 +2,7 @@ import type { Command } from "commander";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import chalk from "chalk";
 
 import { contextBundleSchema } from "../context-bundle-schema.js";
 
@@ -137,6 +138,11 @@ export function registerContextCommand(program: Command): void {
       "\nExamples:\n  ix context IngestionService\n  ix context src/main.ts --format json\n  ix context Widget --max-entities 20 --max-evidence 10\n  ix context Widget --save widget-investigation\n  ix context --resume widget-investigation\n  ix context --diff widget-investigation",
     )
     .action(async (target: string | undefined, opts: ContextOptions) => {
+      const conflict = detectContextModeConflict(opts);
+      if (conflict) {
+        reportContextModeConflict(conflict);
+        return;
+      }
       if (opts.resume) {
         renderSavedInvestigation(opts.resume, opts.format);
         return;
@@ -268,6 +274,63 @@ async function buildFreshBundle(
 
 
 /** Saved investigation state lives under ~/.ix/investigations. */
+/**
+ * Subset of `ContextOptions` consumed by `detectContextModeConflict`. Kept as a
+ * structural type so the detector can be unit-tested without driving Commander.
+ */
+export interface ContextModeOptions {
+  resume?: string;
+  diff?: string;
+  save?: string;
+  out?: string;
+  format?: string;
+}
+
+/**
+ * Detect mutually-incompatible mode/output flags on `ix context` and return a
+ * human-readable message naming the conflict, or `undefined` if no conflict.
+ *
+ * The action handler used to silently drop `--save` and `--out` whenever
+ * `--resume` or `--diff` was passed (those branches `return` before the
+ * `--save`/`--out` branches ever run). It also accepted `--save <id>` alongside
+ * `--out <file>`, which describes two different write targets and so has no
+ * well-defined combined behaviour. Catching these combinations up front and
+ * surfacing them as a hard error mirrors the explicit-conflict style in
+ * subsystems.ts and prevents the user's typed flag from being a no-op.
+ */
+export function detectContextModeConflict(
+  opts: ContextModeOptions,
+): string | undefined {
+  if (opts.resume && opts.diff) {
+    return "--resume and --diff cannot be combined; --resume renders a saved investigation, --diff renders a comparison against one.";
+  }
+  if (opts.resume && opts.save) {
+    return "--resume cannot be combined with --save; --resume only renders a saved investigation, while --save writes a new one. Run --save on a fresh build instead.";
+  }
+  if (opts.resume && opts.out) {
+    return "--resume cannot be combined with --out; --resume renders to stdout."
+      + (opts.format && opts.format !== "json"
+        ? " Use --format json with --out if you need to persist the rendered output."
+        : "");
+  }
+  if (opts.diff && opts.save) {
+    return "--diff cannot be combined with --save; --diff renders a comparison against a saved investigation. To persist the fresh side as a new investigation, run the fresh build without --diff and use --save there.";
+  }
+  if (opts.diff && opts.out) {
+    return "--diff cannot be combined with --out; --diff renders the comparison to stdout.";
+  }
+  if (opts.save && opts.out) {
+    return "--save and --out cannot be combined; --save writes to IX_HOME/investigations/<id>.json, while --out writes to a caller-chosen path. Pick one.";
+  }
+  return undefined;
+}
+
+/** Render a detected mode conflict and mark the process exit code. */
+export function reportContextModeConflict(message: string): void {
+  console.error(chalk.red("Error:"), message);
+  process.exitCode = 1;
+}
+
 function investigationDir(): string {
   // IX_HOME is the Ix home *directory*, not the investigations directory —
   // backend-status.ts, docker.ts and upgrade.ts all read it as `IX_HOME ||

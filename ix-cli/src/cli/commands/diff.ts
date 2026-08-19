@@ -6,6 +6,53 @@ import { promisify } from "node:util";
 import type { Command } from "commander";
 import chalk from "chalk";
 import { IxClient } from "../../client/api.js";
+
+/**
+ * Subset of `DiffOptions` consumed by `detectDiffModeConflict`. Kept as a
+ * structural type so the detector can be unit-tested without driving Commander.
+ */
+export interface DiffModeOptions {
+  summary?: boolean;
+  content?: boolean;
+  full?: boolean;
+  limit?: string;
+}
+
+/**
+ * Detect mutually-incompatible output flags on `ix diff` and return a
+ * human-readable message naming the conflict, or `undefined` if no conflict.
+ *
+ * The action handler early-returns on `--summary` before the `--content` branch
+ * is reached, so passing both flags silently dropped `--content` (and the user
+ * got a summary when they asked for the full textual diff). Catching the
+ * combination up front and surfacing it as a hard error mirrors the
+ * explicit-conflict style in subsystems.ts. `--full --limit <n>` is also
+ * flagged: `--full` is documented as "no limit" so the silent precedence over
+ * `--limit` was the same kind of UX gap.
+ */
+export function detectDiffModeConflict(
+  opts: DiffModeOptions,
+): string | undefined {
+  if (opts.summary && opts.content) {
+    return "--summary and --content cannot be combined; --summary renders counts only, --content renders the full textual diff. Pick one.";
+  }
+  if (opts.full && opts.limit !== undefined) {
+    return "--full and --limit cannot be combined; --full is documented to return all changes without a limit. Drop --limit, or drop --full to keep the existing limit.";
+  }
+  if (
+    opts.summary &&
+    (opts.full || opts.limit !== undefined)
+  ) {
+    return "--summary ignores --limit and --full; --summary is server-side counts only. Drop --summary to control change volume, or drop --limit/--full.";
+  }
+  return undefined;
+}
+
+/** Render a detected mode conflict and mark the process exit code. */
+export function reportDiffModeConflict(message: string): void {
+  console.error(chalk.red("Error:"), message);
+  process.exitCode = 1;
+}
 import { getEndpoint } from "../config.js";
 import { resolveFileOrEntity, resolveEntityFull, printResolved, looksFileLike, type ResolvedEntity } from "../resolve.js";
 import { formatDiff, relativePath } from "../format.js";
@@ -431,6 +478,11 @@ export function registerDiffCommand(program: Command): void {
       entity?: string; summary?: boolean; content?: boolean; limit?: string; full?: boolean; format: string;
       kind?: string; path?: string; pick?: number;
     }) => {
+      const conflict = detectDiffModeConflict(opts);
+      if (conflict) {
+        reportDiffModeConflict(conflict);
+        return;
+      }
       const client = new IxClient(getEndpoint());
       const from = parseInt(fromRev, 10);
       const to = parseInt(toRev, 10);
