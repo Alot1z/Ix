@@ -3,7 +3,11 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, w
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
-import { contextBundleSchema } from "../context-bundle-schema.js";
+import {
+  BUNDLE_SCHEMA,
+  contextBundleSchema,
+  savedInvestigationSchema,
+} from "../context-bundle-schema.js";
 
 import { IxClient } from "../../client/api.js";
 import type {
@@ -15,17 +19,11 @@ import type {
 } from "../../client/types.js";
 import { getEndpoint } from "../config.js";
 import { collectFacts, type EntityFacts } from "../explain/facts.js";
-import { printLlmLines } from "../llm.js";
+import { llmLine, printLlmLines } from "../llm.js";
 import { parsePickOption } from "../options.js";
 import { resolveFileOrEntity } from "../resolve.js";
 import { createStaleProbe } from "../stale.js";
 import { renderNote, renderSection, renderWarning } from "../ui.js";
-
-/**
- * Schema version for the deterministic bundle shape. Bump only on a breaking
- * shape change, never per run.
- */
-const BUNDLE_SCHEMA = "ix-context-bundle/1";
 
 interface ContextOptions {
   kind?: string;
@@ -144,11 +142,16 @@ export function registerContextCommand(program: Command): void {
         return;
       }
       if (opts.list) {
-        if (opts.save || opts.diff) {
-          renderWarning("--list cannot be combined with --save or --diff.");
+        if (opts.save || opts.diff || opts.resume) {
+          // A refusal exits non-zero, the way `refuseInvestigation` does two
+          // functions down and the way the sibling commands do: a warning with
+          // a success status tells a script the listing it never got was fine.
+          renderWarning("--list cannot be combined with --save, --diff or --resume.");
+          process.exitCode = 1;
           return;
         }
-        renderInvestigationList(listInvestigations(), opts.format);
+        const listed = listInvestigations();
+        renderInvestigationList(listed.saved, listed.skipped, opts.format);
         return;
       }
       if (opts.diff) {
@@ -373,103 +376,102 @@ export function mergeDiffOptions(
 /**
  * Enumerate every saved investigation under IX_HOME/investigations.
  *
- * Mirrors the read-side validation `loadInvestigation` performs on a single
- * file (envelope + bundle.safeParse) so a corrupt or version-skewed file is
- * skipped silently rather than poison the listing — but a corrupt file is
- * still surfaced through a single warning so the operator can prune it.
+ * Validated with `savedInvestigationSchema` — the same contract the write side
+ * and `loadInvestigation` enforce — rather than a hand-rolled envelope check
+ * beside it. A file that fails it is skipped and counted; the count is
+ * returned, not printed, because this runs before the renderer knows which
+ * format was asked for.
  *
- * Determinism: results are sorted newest-first by `savedAt`, falling back to
- * the sanitized `id` so two files saved in the same millisecond still have a
- * stable order across runs.
+ * Determinism: newest first by `savedAt`, falling back to the id so two files
+ * saved in the same millisecond still order stably across runs.
  */
-export function listInvestigations(): SavedInvestigation[] {
+export function listInvestigations(): { saved: SavedInvestigation[]; skipped: number } {
   const dir = investigationDir();
-  if (!existsSync(dir)) return [];
+  if (!existsSync(dir)) return { saved: [], skipped: 0 };
   const entries = readdirSync(dir).filter((f) => f.endsWith(".json"));
   const out: SavedInvestigation[] = [];
   let skipped = 0;
   for (const file of entries) {
-    const filePath = join(dir, file);
-    let parsed: unknown;
+    let raw: unknown;
+    // Scoped to the read and the parse, as in `loadInvestigation`: they are the
+    // only calls here that throw.
     try {
-      parsed = JSON.parse(readFileSync(filePath, "utf8"));
+      raw = JSON.parse(readFileSync(join(dir, file), "utf8"));
     } catch {
       skipped += 1;
       continue;
     }
-    if (
-      !parsed ||
-      typeof parsed !== "object" ||
-      (parsed as { schema?: unknown }).schema !== "ix-investigation/1" ||
-      !(parsed as { bundle?: unknown }).bundle
-    ) {
+    const parsed = savedInvestigationSchema.safeParse(raw);
+    if (!parsed.success) {
       skipped += 1;
       continue;
     }
-    // Validate the body's contract matches the same versioned schema the
-    // write side enforces. We trust the original parsed JSON (cast as the
-    // SavedInvestigation type, exactly like loadInvestigation does on the
-    // happy path) instead of safeParse's data, because the on-disk envelope
-    // here was produced by saveInvestigation and the renderer only needs to
-    // forward the bundle through unchanged. That keeps the read-side
-    // validation contract symmetric with `loadInvestigation` without
-    // re-running the schema's structural narrowing (which would lose the
-    // richer record types claims/decisions/assets carry internally).
-    const bundleCheck = contextBundleSchema.safeParse((parsed as SavedInvestigation).bundle);
-    if (!bundleCheck.success) {
-      skipped += 1;
-      continue;
-    }
-    out.push(parsed as SavedInvestigation);
+    // The validated value, not the raw parse — the same assertion
+    // `loadInvestigation` makes, and for the same reason: it re-narrows the
+    // open report arrays the schema leaves as records, and every field the
+    // renderer dereferences has been checked by this point.
+    out.push(parsed.data as unknown as SavedInvestigation);
   }
-  if (skipped > 0) {
-    renderWarning(
-      `${skipped} saved investigation file(s) did not match the contract; skipped. Run \`ix context --resume <id>\` for a per-file report.`,
-    );
-  }
-  return out.sort((a, b) => {
+  out.sort((a, b) => {
     if (a.savedAt !== b.savedAt) return a.savedAt < b.savedAt ? 1 : -1;
     return cmp(a.id, b.id);
   });
+  return { saved: out, skipped };
 }
 
 /**
  * Render the saved investigations produced by `listInvestigations`.
  *
- * The wire formats mirror the rest of the CLI: JSON is the full saved
- * envelope so it round-trips through `--resume <id>`; LLM emits one
- * metadata record per saved investigation; text prints a tabular
- * summary with truncation/savedAt/target so a human can choose what
- * to resume or diff.
+ * JSON stays the array of saved envelopes; llm emits a summary record and one
+ * record per investigation; text prints the tabular summary.
+ *
+ * `skipped` is reported in each format's own terms, and never on stdout except
+ * as a field. It used to be a `renderWarning` inside the enumerator — which is
+ * `console.log` — so a single corrupt file prepended a chalk-coloured prose
+ * line to the payload and `ix context --list --format json | jq` failed on it.
+ * The human warning goes to stderr; the machine formats carry a count.
  */
-function renderInvestigationList(items: SavedInvestigation[], format: string): void {
+export function renderInvestigationList(
+  items: SavedInvestigation[],
+  skipped: number,
+  format: string,
+): void {
+  if (skipped > 0 && format !== "llm") {
+    // `console.error`, not `renderWarning`: every renderer in ui.ts writes to
+    // stdout, which is exactly how this line used to end up inside the JSON a
+    // caller was piping. Plain text rather than chalk — nothing else in this
+    // file writes to stderr, and a colour code is not worth an import that
+    // only this line needs.
+    console.error(
+      `  Warning  ${skipped} saved investigation file(s) did not match the contract; skipped.` +
+        " Run `ix context --resume <id>` for a per-file report.",
+    );
+  }
   if (format === "json") {
     console.log(JSON.stringify(items, null, 2));
     return;
   }
   if (format === "llm") {
-    if (items.length === 0) {
-      printLlmLines(["investigations total=0"]);
-      return;
-    }
     printLlmLines([
-      `investigations total=${items.length}`,
+      // `skipped` is a field rather than a warning: it is the one thing about
+      // the listing an agent cannot see from the records themselves.
+      llmLine("investigations", { total: items.length, skipped: skipped || undefined }),
       ...items.map((s) =>
-        [
-          `investigation id=${s.id}`,
-          `saved_at=${s.savedAt}`,
-          `target=${s.bundle.target.name}`,
-          `target_kind=${s.bundle.target.kind}`,
-          `classification=${s.bundle.freshness.classification}`,
-          `stale=${s.bundle.freshness.stale}`,
-          `entities=${s.bundle.entities.length}`,
-          `relationships=${s.bundle.relationships.length}`,
-          `evidence=${s.bundle.evidence.length}`,
-          `truncated_entities=${s.bundle.truncation.entitiesTruncated}`,
-          `truncated_relationships=${s.bundle.truncation.relationshipsTruncated}`,
-          `truncated_evidence=${s.bundle.truncation.evidenceTruncated}`,
-          `truncated_chars=${s.bundle.truncation.charactersTruncated}`,
-        ].join(" "),
+        llmLine("investigation", {
+          id: s.id,
+          saved_at: s.savedAt,
+          target: s.bundle.target.name,
+          target_kind: s.bundle.target.kind,
+          classification: s.bundle.freshness.classification,
+          stale: s.bundle.freshness.stale,
+          entities: s.bundle.entities.length,
+          relationships: s.bundle.relationships.length,
+          evidence: s.bundle.evidence.length,
+          truncated_entities: s.bundle.truncation.entitiesTruncated,
+          truncated_relationships: s.bundle.truncation.relationshipsTruncated,
+          truncated_evidence: s.bundle.truncation.evidenceTruncated,
+          truncated_chars: s.bundle.truncation.charactersTruncated,
+        }),
       ),
     ]);
     return;
@@ -505,23 +507,68 @@ function renderInvestigationList(items: SavedInvestigation[], format: string): v
   console.log(`Diff with:   ix context --diff <id>`);
 }
 
+/**
+ * Refuse a saved investigation: warn, and set a non-zero status so a scripted
+ * `--resume`/`--diff` can tell a refusal from a successful render. The sibling
+ * commands (config, init, map) already signal refusals this way.
+ */
+function refuseInvestigation(message: string): undefined {
+  renderWarning(message);
+  process.exitCode = 1;
+  return undefined;
+}
+
 export function loadInvestigation(id: string): SavedInvestigation | undefined {
   const path = investigationPath(id);
   if (!existsSync(path)) {
-    renderWarning(`No saved investigation "${id}" at ${path}`);
-    return undefined;
+    return refuseInvestigation(`No saved investigation "${id}" at ${path}`);
   }
+  let raw: unknown;
+  // Scoped to the read and the parse: those are the only calls here that throw,
+  // and widening it would report a validation or rendering failure below as
+  // "not valid JSON" — naming the wrong cause on a file that parses fine.
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as SavedInvestigation;
-    if (parsed.schema !== "ix-investigation/1" || !parsed.bundle) {
-      renderWarning(`Saved investigation "${id}" has an unknown schema; refusing to resume.`);
-      return undefined;
-    }
-    return parsed;
+    raw = JSON.parse(readFileSync(path, "utf8"));
   } catch {
-    renderWarning(`Saved investigation "${id}" is not valid JSON; refusing to resume.`);
-    return undefined;
+    return refuseInvestigation(`Saved investigation "${id}" is not valid JSON; refusing to resume.`);
   }
+
+  // Validate the whole envelope coming back off disk against the same versioned
+  // contract the write side enforces (saveInvestigation and --out). The two
+  // halves were asymmetric: writes were schema-checked, reads trusted a bare
+  // `as` cast guarded only by a truthiness check on `bundle`. That gap is
+  // reachable — `--diff` re-resolves `bundle.target.name`, `metadata.depth` and
+  // `metadata.asOfRev` and sends them to the backend, and `--resume` renders the
+  // bundle — so a file whose `schema` field was right and whose body was
+  // anything at all used to be honoured.
+  const parsed = savedInvestigationSchema.safeParse(raw);
+  if (!parsed.success) {
+    const issues = parsed.error.issues;
+    // Distinguish the two version-skew cases from a generic shape mismatch, so
+    // the warning names which contract was not met.
+    if (issues.some((issue) => issue.path[0] === "schema")) {
+      return refuseInvestigation(`Saved investigation "${id}" has an unknown schema; refusing to resume.`);
+    }
+    if (issues.some((issue) => issue.path[0] === "bundle" && issue.path[1] === "schema")) {
+      return refuseInvestigation(
+        `Saved investigation "${id}" holds a bundle from a different contract than ${BUNDLE_SCHEMA}; refusing to resume.`,
+      );
+    }
+    return refuseInvestigation(
+      `Saved investigation "${id}" does not match the ${BUNDLE_SCHEMA} schema (${issues.length} issue(s)); refusing to resume.`,
+    );
+  }
+  // Return the validated value, not the raw parse: saveInvestigation persists
+  // `parsed.data` for the same reason, so unknown keys smuggled into a
+  // hand-edited file are dropped here rather than echoed back out by
+  // `--resume --format json` or copied into the emitted diff.
+  //
+  // The assertion re-narrows the three report arrays the schema deliberately
+  // leaves as open records (decisions/conflicts/intents, whose shapes belong to
+  // the backend) plus the literals zod widens to `string`. Every field this file
+  // dereferences has been checked by this point — unlike the `as` cast on raw
+  // JSON.parse output that this replaces, which checked nothing.
+  return parsed.data as unknown as SavedInvestigation;
 }
 
 function renderSavedInvestigation(id: string, format: string): void {

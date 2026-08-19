@@ -1,7 +1,7 @@
-import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
   ConflictReport,
@@ -16,16 +16,23 @@ import {
   buildBundle,
   diffInvestigations,
   listInvestigations,
+  renderInvestigationList,
   loadInvestigation,
   mergeDiffOptions,
   saveInvestigation,
 } from "../commands/context.js";
 
 let home: string;
+let priorExitCode: number | string | undefined;
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "ix-investigation-test-"));
   process.env.IX_HOME = home;
+  // loadInvestigation sets process.exitCode on a refusal. That is the host
+  // process's exit code, so leaving it set would fail the whole vitest run even
+  // with every test green.
+  priorExitCode = process.exitCode;
+  process.exitCode = undefined;
   // IX_HOME is the Ix home directory; investigations live in a subdirectory of
   // it, which saveInvestigation creates. Nothing is pre-created here — the tests
   // below assert on where the code actually writes, not on a directory the test
@@ -37,8 +44,43 @@ const investigationsDir = () => join(home, "investigations");
 
 afterEach(() => {
   delete process.env.IX_HOME;
+  process.exitCode = priorExitCode;
   rmSync(home, { recursive: true, force: true });
 });
+
+/** Write a raw state file exactly where loadInvestigation looks for it. */
+function writeState(id: string, state: unknown): void {
+  mkdirSync(investigationsDir(), { recursive: true });
+  writeFileSync(join(investigationsDir(), `${id}.json`), JSON.stringify(state), "utf8");
+}
+
+/** A well-formed envelope around `bundle`, so only the bundle is under test. */
+function envelope(id: string, bundle: unknown) {
+  return { schema: "ix-investigation/1", id, savedAt: "2026-01-01T00:00:00Z", bundle };
+}
+
+/**
+ * Capture what renderWarning printed while `fn` ran.
+ *
+ * The refusal message is the only thing that says *which* guard rejected a
+ * fixture; asserting on the return value alone cannot tell the envelope check
+ * from the schema check. renderWarning goes to console.log (ui.ts), so that is
+ * what gets spied on.
+ */
+function captureWarnings(fn: () => void): string {
+  const lines: string[] = [];
+  const spy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+    lines.push(args.map(String).join(" "));
+  });
+  try {
+    fn();
+  } finally {
+    spy.mockRestore();
+  }
+  // chalk wraps the message as a whole, so the text stays contiguous; strip the
+  // colour codes anyway so a CI run with colour forced on matches a local one.
+  return lines.join("\n").replace(/\u001b\[[0-9;]*m/g, "");
+}
 
 function makeFacts(overrides: Partial<EntityFacts> = {}): EntityFacts {
   return {
@@ -155,6 +197,119 @@ describe("ix context investigation state", () => {
     writeFileSync(join(investigationsDir(), "broken.json"), "not json", "utf8");
     expect(existsSync(join(investigationsDir(), "broken.json"))).toBe(true);
     expect(loadInvestigation("broken")).toBeUndefined();
+  });
+
+  it("refuses to resume a tampered bundle, and says the bundle was what failed", () => {
+    // The write path is schema-checked, so a non-conforming bundle can only
+    // reach disk by being put there — a hand-edited file, a truncated write, or
+    // a state file from a different version. The envelope is deliberately
+    // *correct* here, so only bundle validation can be what rejects it.
+    writeState("tampered", envelope("tampered", { ...bundleWith([]), entities: "not-an-array" }));
+
+    const warning = captureWarnings(() => {
+      expect(loadInvestigation("tampered")).toBeUndefined();
+    });
+
+    // Which guard fired is only observable in the message. Asserting on the
+    // envelope fields of the fixture object instead would compare a literal to
+    // itself and could never fail, leaving the envelope check and the schema
+    // check indistinguishable.
+    expect(warning).toContain("does not match the ix-context-bundle/1 schema");
+    expect(warning).not.toContain("unknown schema");
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("refuses a bundle written against a different contract version", () => {
+    // The whole point of a versioned contract: `schema` is pinned to a literal,
+    // so a v99 body cannot be rendered by --resume or re-sent by --diff as if
+    // it were a v1 one. A `z.string()` here would accept this.
+    writeState("skewed", envelope("skewed", { ...bundleWith([]), schema: "ix-context-bundle/99" }));
+
+    const warning = captureWarnings(() => {
+      expect(loadInvestigation("skewed")).toBeUndefined();
+    });
+
+    expect(warning).toContain("different contract than ix-context-bundle/1");
+  });
+
+  it("refuses an evidence item with no title, which the llm renderer dereferences", () => {
+    // renderBundle does `item.title.replaceAll(...)` for --format llm. Validation
+    // that accepts an untyped evidence record just moves the failure downstream
+    // from a named refusal to an uncaught TypeError.
+    const evidence = [{ id: "e1", kind: "provenance", source: "s", score: 1, reason: "r", refs: [] }];
+    writeState("titleless", envelope("titleless", { ...bundleWith([]), evidence }));
+
+    expect(loadInvestigation("titleless")).toBeUndefined();
+  });
+
+  it("refuses empty budgets, which would fabricate an all-removed diff", () => {
+    // --diff forwards saved budgets into buildFreshBundle, where
+    // `Math.min(n, undefined)` is NaN and `slice(0, NaN)` is []. The fresh side
+    // comes back empty and every saved item is reported as removed — a delta
+    // that never happened, with no error anywhere.
+    writeState("budgetless", envelope("budgetless", { ...bundleWith([]), budgets: {} }));
+
+    expect(loadInvestigation("budgetless")).toBeUndefined();
+  });
+
+  it("refuses metadata whose diff inputs are not the types --diff re-sends", () => {
+    // mergeDiffOptions passes metadata.depth and metadata.asOfRev straight into
+    // the next backend request. They are the only saved values besides
+    // target.name that leave the machine, so they are typed, not trusted.
+    const metadata = { rankingRule: "deterministic-tier", depth: { nested: true }, asOfRev: "not-a-number" };
+    writeState("bad-metadata", envelope("bad-metadata", { ...bundleWith([]), metadata }));
+
+    expect(loadInvestigation("bad-metadata")).toBeUndefined();
+  });
+
+  // One field per fixture. A single fixture breaking both `id` and `savedAt`
+  // passes as soon as *either* rule fires, so it cannot show that both are
+  // enforced — dropping the savedAt check entirely left such a test green.
+  it("refuses an envelope whose id is not a string", () => {
+    // id is rendered to the terminal and copied into the emitted
+    // ix-investigation-diff/1 JSON as `investigation`, so an unvalidated
+    // envelope prints `Resumed investigation "[object Object]"`.
+    writeState("bad-id", { schema: "ix-investigation/1", id: {}, savedAt: "2026-01-01T00:00:00Z", bundle: bundleWith([]) });
+
+    expect(loadInvestigation("bad-id")).toBeUndefined();
+  });
+
+  it("refuses an envelope whose savedAt is not a string", () => {
+    // savedAt is rendered as `saved <value>` and copied into the emitted diff.
+    // The id here is deliberately valid so the id rule cannot be what fires.
+    writeState("bad-savedat", { schema: "ix-investigation/1", id: "bad-savedat", savedAt: null, bundle: bundleWith([]) });
+
+    expect(loadInvestigation("bad-savedat")).toBeUndefined();
+  });
+
+  it("refuses an id carrying terminal control characters", () => {
+    // sanitizeId escapes these on the way in, so a stored id can never contain
+    // them; renderNote and renderSection write the id straight to the terminal.
+    writeState("ansi", { ...envelope("bad\u001b[31mid", bundleWith([])) });
+
+    expect(loadInvestigation("ansi")).toBeUndefined();
+  });
+
+  it("returns the validated bundle, not the raw file contents", () => {
+    // Control for the refusals above — a validator that rejected everything
+    // would fail here — and the sanitization guarantee: saveInvestigation
+    // persists zod's parsed output, so the read side must too. Returning the raw
+    // JSON.parse result instead would echo smuggled keys back out through
+    // `--resume --format json` and into the emitted diff.
+    const bundle = bundleWith([makeClaim("renders to DOM", 0.9)]);
+    saveInvestigation("well-formed", bundle);
+    const stored = JSON.parse(readFileSync(join(investigationsDir(), "well-formed.json"), "utf8"));
+    stored.bundle.target.EXTRA = "smuggled";
+    writeState("well-formed", stored);
+
+    const loaded = loadInvestigation("well-formed");
+
+    expect(loaded).toBeDefined();
+    expect(loaded?.bundle.target.name).toBe("Widget");
+    expect(loaded?.bundle.evidence).toEqual(bundle.evidence);
+    expect(loaded?.bundle.target).not.toHaveProperty("EXTRA");
+    // A successful load must not leave a failing status behind.
+    expect(process.exitCode).toBeUndefined();
   });
 
   it("refuses to save a bundle that does not match the versioned contract", () => {
@@ -275,10 +430,11 @@ describe("ix context investigation state", () => {
       saveInvestigation("widget-a", bundleWith([makeClaim("renders to DOM", 0.9)]));
       saveInvestigation("widget-b", bundleWith([makeClaim("mounts to DOM", 0.7)]));
       const list = listInvestigations();
-      expect(list.map((s) => s.id).sort()).toEqual(["widget-a", "widget-b"]);
+      expect(list.saved.map((s) => s.id).sort()).toEqual(["widget-a", "widget-b"]);
+      expect(list.skipped).toBe(0);
       // savedAt differs at least by a millisecond across the two writes; even
       // on the rare same-ms tie the id tiebreaker keeps order deterministic.
-      expect(list[0].id === "widget-a" || list[0].id === "widget-b").toBe(true);
+      expect(list.saved[0].id === "widget-a" || list.saved[0].id === "widget-b").toBe(true);
     });
 
     it("skips files whose envelope or bundle does not match the contract", () => {
@@ -295,15 +451,78 @@ describe("ix context investigation state", () => {
       writeFileSync(join(dir, "readme.md"), "not a state file");
 
       const list = listInvestigations();
-      expect(list.map((s) => s.id)).toEqual(["good"]);
+      expect(list.saved.map((s) => s.id)).toEqual(["good"]);
+      // Counted and handed back, not printed: the enumerator runs before the
+      // renderer knows whether the caller asked for JSON.
+      expect(list.skipped).toBe(3);
       // The three corrupt files do not poison the listing.
       expect(readdirSync(dir).filter((f) => f.endsWith(".json"))).toHaveLength(4);
     });
 
-    it("returns an empty array when the investigations dir does not exist yet", () => {
-      expect(listInvestigations()).toEqual([]);
+    it("returns an empty listing when the investigations dir does not exist yet", () => {
+      expect(listInvestigations()).toEqual({ saved: [], skipped: 0 });
       saveInvestigation("first", bundleWith([makeClaim("renders to DOM", 0.9)]));
-      expect(listInvestigations()).toHaveLength(1);
+      expect(listInvestigations().saved).toHaveLength(1);
+    });
+
+    it("keeps the skip report off stdout in every machine format", () => {
+      // json must stay parseable and llm must stay records, so the human
+      // warning goes to stderr and the machine formats carry a count instead.
+      saveInvestigation("good", bundleWith([makeClaim("renders to DOM", 0.9)]));
+      const { saved } = listInvestigations();
+
+      const capture = (fn: () => void) => {
+        const out: string[] = [];
+        const err: string[] = [];
+        const origLog = console.log;
+        const origErr = console.error;
+        console.log = (...a: unknown[]) => void out.push(a.join(" "));
+        console.error = (...a: unknown[]) => void err.push(a.join(" "));
+        try {
+          fn();
+        } finally {
+          console.log = origLog;
+          console.error = origErr;
+        }
+        return { out: out.join("\n"), err: err.join("\n") };
+      };
+
+      const json = capture(() => renderInvestigationList(saved, 3, "json"));
+      expect(() => JSON.parse(json.out)).not.toThrow();
+      expect(JSON.parse(json.out)).toHaveLength(1);
+      expect(json.err).toContain("3 saved investigation file(s)");
+
+      const llm = capture(() => renderInvestigationList(saved, 3, "llm"));
+      expect(llm.out.split("\n")[0]).toBe("investigations total=1 skipped=3");
+      // The count is the record's business; nothing is written beside it.
+      expect(llm.err).toBe("");
+
+      // And with nothing skipped the field is simply absent.
+      const clean = capture(() => renderInvestigationList(saved, 0, "llm"));
+      expect(clean.out.split("\n")[0]).toBe("investigations total=1");
+      expect(clean.err).toBe("");
+    });
+
+    it("prints nothing itself, whatever it finds", () => {
+      // The defect this replaces: the warning was a `renderWarning` inside the
+      // enumerator, and every renderer in ui.ts writes to stdout. One corrupt
+      // file therefore prepended a chalk-coloured prose line to the payload,
+      // and `ix context --list --format json | jq` failed on it.
+      saveInvestigation("good", bundleWith([makeClaim("renders to DOM", 0.9)]));
+      writeFileSync(join(investigationsDir(), "truncated.json"), "{not json");
+
+      const lines: string[] = [];
+      const origLog = console.log;
+      const origErr = console.error;
+      console.log = (...a: unknown[]) => void lines.push(a.join(" "));
+      console.error = (...a: unknown[]) => void lines.push(a.join(" "));
+      try {
+        listInvestigations();
+      } finally {
+        console.log = origLog;
+        console.error = origErr;
+      }
+      expect(lines).toEqual([]);
     });
   });
 });
