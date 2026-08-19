@@ -19,11 +19,11 @@ import type {
 } from "../../client/types.js";
 import { getEndpoint } from "../config.js";
 import { collectFacts, type EntityFacts } from "../explain/facts.js";
-import { llmError, llmLine, printLlmLines, reportModeConflict } from "../llm.js";
-import { parseBudgetOption, parsePickOption } from "../options.js";
+import { llmLine, printLlmLines } from "../llm.js";
+import { parseBudgetOption, parsePickOption, parseRevisionOption } from "../options.js";
 import { resolveFileOrEntity } from "../resolve.js";
 import { createStaleProbe } from "../stale.js";
-import { renderNote, renderSection, renderWarning } from "../ui.js";
+import { renderNote, renderSection, renderWarning, renderWarningErr, reportFailure } from "../ui.js";
 
 /** The four `--max-*` knobs that bound a bundle. */
 interface BudgetSnapshot {
@@ -48,12 +48,13 @@ interface BudgetSnapshot {
  * the number that is applied.
  */
 const BUDGETS = [
-  { key: "maxEntities", label: "entities", help: "Maximum entities in the bundle", min: 1, max: 500, fallback: 50 },
-  { key: "maxRelationships", label: "relationships", help: "Maximum relationships in the bundle", min: 1, max: 1000, fallback: 100 },
-  { key: "maxEvidence", label: "evidence", help: "Maximum evidence items in the bundle", min: 1, max: 200, fallback: 25 },
-  { key: "maxChars", label: "chars", help: "Maximum characters of evidence output", min: 1000, max: 1_000_000, fallback: 12_000 },
+  { key: "maxEntities", flag: "--max-entities", label: "entities", help: "Maximum entities in the bundle", min: 1, max: 500, fallback: 50 },
+  { key: "maxRelationships", flag: "--max-relationships", label: "relationships", help: "Maximum relationships in the bundle", min: 1, max: 1000, fallback: 100 },
+  { key: "maxEvidence", flag: "--max-evidence", label: "evidence", help: "Maximum evidence items in the bundle", min: 1, max: 200, fallback: 25 },
+  { key: "maxChars", flag: "--max-chars", label: "chars", help: "Maximum characters of evidence output", min: 1000, max: 1_000_000, fallback: 12_000 },
 ] as const satisfies ReadonlyArray<{
   key: keyof BudgetSnapshot;
+  flag: string;
   label: string;
   help: string;
   min: number;
@@ -72,8 +73,27 @@ const BUDGETS = [
  * that enforces them.
  */
 function budgetHelp(key: keyof BudgetSnapshot): string {
-  const b = BUDGETS.find((entry) => entry.key === key)!;
+  const b = budgetField(key);
   return `${b.help} (default: ${b.fallback}, clamped to ${b.min}-${b.max})`;
+}
+
+/** The table row for one budget. */
+function budgetField(key: keyof BudgetSnapshot): (typeof BUDGETS)[number] {
+  return BUDGETS.find((entry) => entry.key === key)!;
+}
+
+/**
+ * The Commander `argParser` for one budget flag.
+ *
+ * The example in the rejection message comes from the flag's own default, not
+ * from a constant: a single hardcoded "50" told someone who mistyped
+ * `--max-chars` to try 50, which parses and is then silently clamped up to 1000
+ * by `clampBudgets` -- while the help text one line away says the range is
+ * 1000-1000000.
+ */
+function budgetParser(key: keyof BudgetSnapshot): (value: string) => number {
+  const example = String(budgetField(key).fallback);
+  return (value: string) => parseBudgetOption(value, example);
 }
 
 /** Apply the table's range and default to whatever the caller supplied. */
@@ -91,7 +111,7 @@ interface ContextOptions extends Partial<BudgetSnapshot> {
   path?: string;
   pick?: number;
   depth?: string;
-  asOfRev?: string;
+  asOfRev?: number;
   out?: string;
   save?: string;
   resume?: string;
@@ -178,16 +198,16 @@ export function registerContextCommand(program: Command): void {
     .option("--path <path>", "Prefer symbols from files matching this path substring")
     .option("--pick <n>", "Pick Nth candidate from ambiguous results (1-based)", parsePickOption)
     .option("--depth <depth>", "Context-graph expansion depth")
-    .option("--as-of-rev <n>", "Historical context as of a graph revision")
+    .option("--as-of-rev <n>", "Historical context as of a graph revision", parseRevisionOption)
     // No Commander default on the --max-* flags, so `parseRequestedBudgets`
     // can tell an absent flag from one set to the default value. The defaults
     // and ranges are the BUDGETS table's, applied by `clampBudgets` and shown
     // in the help text by `budgetHelp` -- they differ per flag, so there is no
     // single pair to name here.
-    .option("--max-entities <n>", budgetHelp("maxEntities"), parseBudgetOption)
-    .option("--max-relationships <n>", budgetHelp("maxRelationships"), parseBudgetOption)
-    .option("--max-evidence <n>", budgetHelp("maxEvidence"), parseBudgetOption)
-    .option("--max-chars <n>", budgetHelp("maxChars"), parseBudgetOption)
+    .option("--max-entities <n>", budgetHelp("maxEntities"), budgetParser("maxEntities"))
+    .option("--max-relationships <n>", budgetHelp("maxRelationships"), budgetParser("maxRelationships"))
+    .option("--max-evidence <n>", budgetHelp("maxEvidence"), budgetParser("maxEvidence"))
+    .option("--max-chars <n>", budgetHelp("maxChars"), budgetParser("maxChars"))
     .option("--format <fmt>", "Output format (text|json|llm)", "text")
     .option("--out <path>", "Write the JSON bundle to this file instead of stdout")
     .option("--save <id>", "Persist the bundle as a resumable investigation state")
@@ -201,7 +221,7 @@ export function registerContextCommand(program: Command): void {
     .action(async (target: string | undefined, opts: ContextOptions) => {
       const conflict = detectContextModeConflict(opts, target);
       if (conflict) {
-        reportModeConflict(conflict, opts.format);
+        reportFailure("mode_conflict", conflict, opts.format);
         return;
       }
       if (opts.resume) {
@@ -235,7 +255,14 @@ export function registerContextCommand(program: Command): void {
         return;
       }
       if (!target) {
-        renderWarning("ix context requires a target unless --resume <id> or --diff <id> is given.");
+        // An error with a non-zero status, not a stdout warning with a zero one:
+        // a script asked for a bundle and got none, and a `--format llm` caller
+        // got a prose line in the middle of a record stream saying so.
+        reportFailure(
+          "missing_target",
+          "ix context requires a target unless --resume <id>, --diff <id> or --list is given.",
+          opts.format,
+        );
         return;
       }
 
@@ -248,8 +275,8 @@ export function registerContextCommand(program: Command): void {
       });
       if (!resolved) return;
 
-      const asOfRev = opts.asOfRev ? parseInt(opts.asOfRev, 10) : undefined;
       const budgets = clampBudgets(opts);
+      const asOfRev = opts.asOfRev;
 
       const [facts, context, provenance] = await Promise.all([
         collectFacts(client, resolved.id, resolved.name, resolved.kind),
@@ -277,7 +304,9 @@ export function registerContextCommand(program: Command): void {
       }
 
       if (opts.out && opts.format !== "json") {
-        renderWarning("--out writes JSON; ignoring --format and forcing json.");
+        // stderr: --out still writes the file and still prints a note, so this
+        // advisory would otherwise sit in the stdout an `llm` caller is reading.
+        renderWarningErr("--out writes JSON; ignoring --format and forcing json.");
       }
       const out = opts.out;
       if (out) {
@@ -288,7 +317,11 @@ export function registerContextCommand(program: Command): void {
         // in a caller-owned file (CodeQL js/network-data-written-to-file).
         const parsed = contextBundleSchema.safeParse(bundle);
         if (!parsed.success) {
-          renderWarning(`--out "${out}" refused: the bundle does not match the ${BUNDLE_SCHEMA} schema (${parsed.error.issues.length} issue(s)).`);
+          reportFailure(
+            "out_refused",
+            `--out "${out}" refused: the bundle does not match the ${BUNDLE_SCHEMA} schema (${parsed.error.issues.length} issue(s)).`,
+            opts.format,
+          );
           return;
         }
         // Atomic write: serialize to a private temp file in the SAME directory,
@@ -307,7 +340,11 @@ export function registerContextCommand(program: Command): void {
           if (err.code === "EISDIR" || err.code === "EPERM") {
             try {
               if (fs.statSync(targetPath).isDirectory()) {
-                renderWarning(`--out "${out}" is a directory; refusing to write the bundle there.`);
+                reportFailure(
+                  "out_refused",
+                  `--out "${out}" is a directory; refusing to write the bundle there.`,
+                  opts.format,
+                );
                 return;
               }
             } catch { /* target may not exist; fall through to rethrow */ }
@@ -322,7 +359,7 @@ export function registerContextCommand(program: Command): void {
 
 async function buildFreshBundle(
   target: string,
-  opts: { kind?: string; path?: string; pick?: number; depth?: string; asOfRev?: string },
+  opts: { kind?: string; path?: string; pick?: number; depth?: string; asOfRev?: number },
   budgets: BudgetSnapshot,
 ): Promise<ContextBundle | undefined> {
   const client = new IxClient(getEndpoint());
@@ -333,7 +370,7 @@ async function buildFreshBundle(
   });
   if (!resolved) return undefined;
 
-  const asOfRev = opts.asOfRev ? parseInt(opts.asOfRev, 10) : undefined;
+  const asOfRev = opts.asOfRev;
   const [facts, context, provenance] = await Promise.all([
     collectFacts(client, resolved.id, resolved.name, resolved.kind),
     client.query(resolved.name, { asOfRev, depth: opts.depth }),
@@ -346,19 +383,41 @@ async function buildFreshBundle(
 
 
 /**
- * The `ContextOptions` fields `detectContextModeConflict` consumes.
+ * What `detectContextModeConflict` reads: all of `ContextOptions`.
  *
- * `Pick`, not a hand-copied shape: the detector exists to stop a typed flag
- * being a no-op, so its idea of the flags must come from the same declaration
- * the action handler uses. Written out field-by-field it drifted immediately --
- * `--list` was added to `ContextOptions` on a sibling branch and the detector
- * could not see it, with nothing from the typechecker to say so. `Partial` so
- * the pure function can still be called with one flag at a time in a test,
- * without inventing a `format`.
+ * Derived from the action handler's own declaration, never hand-copied. The
+ * detector exists to stop a typed flag being a no-op, so a shape it maintains
+ * separately is the one thing it cannot afford: written out field-by-field it
+ * drifted immediately, when `--list` was added to `ContextOptions` on a sibling
+ * branch and the detector could not see it with nothing from the typechecker to
+ * say so. `Partial` so the pure function can be called with one flag at a time
+ * in a test, without inventing a `format`.
  */
-export type ContextModeOptions = Partial<
-  Pick<ContextOptions, "resume" | "diff" | "save" | "out" | "list" | "format">
->;
+export type ContextModeOptions = Partial<ContextOptions>;
+
+/**
+ * Flags that shape a bundle this run builds, and are therefore meaningless to a
+ * mode that builds none.
+ *
+ * `--list` enumerates saved state and `--resume` renders it verbatim; neither
+ * resolves a target or applies a budget, so every one of these was accepted and
+ * dropped in silence — `ix context --list --max-entities 10 --kind class` took
+ * five typed flags and exited 0. `--diff` is not here: it re-resolves the target
+ * with `--kind`/`--path`/`--pick`, forwards `--depth`/`--as-of-rev` through
+ * `mergeDiffOptions`, and reports the `--max-*` values rather than dropping
+ * them.
+ *
+ * Listed as `[field, flag]` because the message has to name what the user
+ * typed, and Commander's camelCase attribute is not that.
+ */
+const BUILD_FLAGS: ReadonlyArray<[keyof ContextOptions, string]> = [
+  ["kind", "--kind"],
+  ["path", "--path"],
+  ["pick", "--pick"],
+  ["depth", "--depth"],
+  ["asOfRev", "--as-of-rev"],
+  ...BUDGETS.map((b) => [b.key, b.flag] as [keyof ContextOptions, string]),
+];
 
 /**
  * Detect mutually-incompatible mode/output flags on `ix context` and return a
@@ -380,7 +439,8 @@ export type ContextModeOptions = Partial<
  * lose that race.
  *
  * `target` is a parameter because a positional is as ignorable as a flag:
- * `ix context Widget --list` dropped the target with nothing said.
+ * `ix context Widget --list` and `ix context Widget --resume x` both dropped it
+ * with nothing said.
  */
 export function detectContextModeConflict(
   opts: ContextModeOptions,
@@ -388,6 +448,23 @@ export function detectContextModeConflict(
 ): string | undefined {
   if (opts.list && target) {
     return `--list takes no target; it enumerates every saved investigation. Drop "${target}", or drop --list to build a fresh bundle for it.`;
+  }
+  if (opts.resume && target) {
+    return `--resume takes no target; it renders the investigation you name, whatever that was built for. Drop "${target}", or use --diff <id> to compare a saved investigation against a fresh build of it.`;
+  }
+  // Flags that shape a bundle, given to a mode that builds none. Reported as
+  // one message naming every offender, because dropping one at a time and
+  // re-running to find the next is the experience this detector exists to
+  // avoid, and the flags are all wrong for the same reason.
+  for (const [mode, why] of [
+    ["list", "--list enumerates saved investigations and builds no bundle"],
+    ["resume", "--resume renders a saved investigation exactly as it was built"],
+  ] as const) {
+    if (!opts[mode]) continue;
+    const ignored = BUILD_FLAGS.filter(([field]) => opts[field] !== undefined).map(([, flag]) => flag);
+    if (ignored.length > 0) {
+      return `${ignored.join(", ")} cannot be combined with --${mode}; ${why}, so ${ignored.length > 1 ? "those flags change" : "that flag changes"} nothing. Drop ${ignored.length > 1 ? "them" : "it"}, or run ix context <target> to build a bundle with ${ignored.length > 1 ? "them" : "it"}.`;
+    }
   }
   if (opts.list && opts.resume) {
     return "--list and --resume cannot be combined; --list enumerates saved investigations, --resume renders one. Run --list first, then --resume the id you want.";
@@ -469,27 +546,40 @@ export function sanitizeId(id: string): string {
 }
 
 /**
- * Recover the id the user typed from the id stored on disk.
+ * The id to show the user, given the id stored on disk.
  *
- * `sanitizeId` is injective and deliberately *not* idempotent — it encodes `~`
- * as `~7E` precisely so a raw `~` cannot be confused with an escape — so the
- * stored form is the wrong thing to hand back to the user. `ix context --list`
- * printed it anyway, next to "Resume with: ix context --resume <id>", and
- * `--resume` sanitizes what it is given: an id saved as `widget/auth` was
- * listed as `widget~2Fauth`, and resuming that looked for `widget~7E2Fauth`,
- * which does not exist. `saveInvestigation`'s own note echoes the id the user
- * typed, so the two affordances contradicted each other.
+ * `sanitizeId` is deliberately *not* idempotent — it encodes `~` as `~7E` so a
+ * raw `~` cannot be mistaken for an escape — so the stored form is the wrong
+ * thing to hand back. `ix context --list` printed it next to "Resume with:
+ * ix context --resume <id>", and `--resume` sanitizes what it is given: an id
+ * saved as `widget/auth` was listed as `widget~2Fauth`, and resuming that
+ * looked for `widget~7E2Fauth`, which does not exist.
  *
- * `sanitizeId(unsanitizeId(stored)) === stored` for every id this CLI wrote,
- * which is what makes the listed id usable. A hand-written file whose id is
- * outside `sanitizeId`'s range has no input that reaches it and is not a case
- * this recovers.
+ * The escape is not fixed-width, and that is why this decodes and then
+ * re-encodes rather than trusting the decode. `toString(16)` gives two hex
+ * digits below U+0100 and three or four above it, so `~7528` is either one CJK
+ * code unit or `~752` followed by a literal `8`, and nothing in the string says
+ * which. Two hex digits is the case every Latin-1 id takes; anything else fails
+ * the re-encode and the stored id is returned untouched, which is honest rather
+ * than a guess. `loadInvestigation` accepts that form too, so a listed id loads
+ * either way — the display is the nicety, the load is the contract.
  */
-export function unsanitizeId(stored: string): string {
-  return stored.replace(/~([0-9A-Fa-f]{2})/g, (_m, hex: string) =>
+export function displayId(stored: string): string {
+  const decoded = stored.replace(/~([0-9A-Fa-f]{2})/g, (_m, hex: string) =>
     String.fromCharCode(parseInt(hex, 16)),
   );
+  return sanitizeId(decoded) === stored ? decoded : stored;
 }
+
+/**
+ * The shape `sanitizeId` produces: what a file in the investigations directory
+ * can be named, and therefore what `loadInvestigation` may accept verbatim.
+ *
+ * The leading character excludes `.` so no input names a dotfile, and the set
+ * excludes every path separator, so nothing here can address a second directory
+ * segment or a parent.
+ */
+const STORED_ID = /^[A-Za-z0-9_~-][A-Za-z0-9._~-]*$/;
 
 export function saveInvestigation(id: string, bundle: ContextBundle): void {
   const dir = investigationDir();
@@ -537,11 +627,13 @@ interface SavedInvestigation {
  */
 export function mergeDiffOptions(
   saved: SavedInvestigation,
-  opts: { asOfRev?: string; depth?: string },
-): { asOfRev?: string; depth?: string } {
-  const savedRev = saved.bundle.metadata.asOfRev;
+  opts: { asOfRev?: number; depth?: string },
+): { asOfRev?: number; depth?: string } {
+  // Numbers on both sides now: `--as-of-rev` is validated by its Commander
+  // argParser, so the round trip through a string that this used to do -- and
+  // the `parseInt` on the far side of it -- is gone.
   return {
-    asOfRev: opts.asOfRev ?? (savedRev === undefined ? undefined : String(savedRev)),
+    asOfRev: opts.asOfRev ?? saved.bundle.metadata.asOfRev,
     depth: opts.depth ?? saved.bundle.metadata.depth,
   };
 }
@@ -582,8 +674,11 @@ export function listInvestigations(): { saved: SavedInvestigation[]; skipped: nu
     // The validated value, not the raw parse — the same assertion
     // `loadInvestigation` makes, and for the same reason: it re-narrows the
     // open report arrays the schema leaves as records, and every field the
-    // renderer dereferences has been checked by this point.
-    out.push(parsed.data as unknown as SavedInvestigation);
+    // renderer dereferences has been checked by this point. The id is decoded
+    // here too, so every reader of an enumerated investigation sees the id it
+    // can type back — see `displayId`.
+    const state = parsed.data as unknown as SavedInvestigation;
+    out.push({ ...state, id: displayId(state.id) });
   }
   out.sort((a, b) => {
     if (a.savedAt !== b.savedAt) return a.savedAt < b.savedAt ? 1 : -1;
@@ -594,7 +689,7 @@ export function listInvestigations(): { saved: SavedInvestigation[]; skipped: nu
 
 /** One saved investigation as `--list` describes it: what it is, not what is in it. */
 interface InvestigationSummary {
-  /** The id to type back, not the id on disk — see `unsanitizeId`. */
+  /** The id to type back, not the id on disk — decoded by `displayId` on read. */
   id: string;
   savedAt: string;
   target: { name: string; kind: string };
@@ -607,7 +702,7 @@ interface InvestigationSummary {
 function summariseInvestigation(s: SavedInvestigation): InvestigationSummary {
   const b = s.bundle;
   return {
-    id: unsanitizeId(s.id),
+    id: s.id,
     savedAt: s.savedAt,
     target: { name: b.target.name, kind: b.target.kind },
     freshness: b.freshness,
@@ -650,9 +745,8 @@ export function renderInvestigationList(
     // caller was piping. Plain text rather than chalk — nothing else in this
     // file writes to stderr, and a colour code is not worth an import that
     // only this line needs.
-    console.error(
-      `  Warning  ${skipped} saved investigation file(s) did not match the contract; skipped.` +
-        " Run `ix context --resume <id>` for a per-file report.",
+    renderWarningErr(
+      `${skipped} saved investigation file(s) in ${investigationDir()} did not match the contract; skipped.`,
     );
   }
   if (format === "json") {
@@ -728,14 +822,24 @@ function refuseInvestigation(code: string, message: string, format?: string): un
   // of the record stream — and with a prose line inside the JSON payload for a
   // `--format json` caller piping to `jq`. The human keeps the same wording, on
   // stderr, where prose belongs whatever the format.
-  if (format === "llm") console.log(llmError(code, message));
-  else console.error(`  Warning  ${message}`);
-  process.exitCode = 1;
+  reportFailure(code, message, format);
   return undefined;
 }
 
 export function loadInvestigation(id: string, format?: string): SavedInvestigation | undefined {
-  const path = investigationPath(id);
+  let path = investigationPath(id);
+  if (!existsSync(path) && STORED_ID.test(id)) {
+    // Also accept the on-disk form. `sanitizeId` is not idempotent, so an id
+    // that is already encoded gets encoded again and misses its own file:
+    // `widget/auth` is stored as `widget~2Fauth`, and asking for
+    // `widget~2Fauth` looked for `widget~7E2Fauth`. `displayId` recovers the
+    // typed form for every Latin-1 id, but the escape width is ambiguous above
+    // that, so for the rest the encoded name is the only thing a listing can
+    // print — and it has to work. Second, not first, so an id that is genuinely
+    // spelled `widget~2Fauth` still finds its own file before this.
+    const encoded = join(investigationDir(), `${id}.json`);
+    if (existsSync(encoded)) path = encoded;
+  }
   if (!existsSync(path)) {
     return refuseInvestigation("no_saved_investigation", `No saved investigation "${id}" at ${path}`, format);
   }
@@ -788,10 +892,17 @@ export function loadInvestigation(id: string, format?: string): SavedInvestigati
   // the backend) plus the literals zod widens to `string`. Every field this file
   // dereferences has been checked by this point — unlike the `as` cast on raw
   // JSON.parse output that this replaces, which checked nothing.
-  return parsed.data as unknown as SavedInvestigation;
+  //
+  // The id is decoded here, at the one boundary every reader comes through,
+  // rather than at each place one is printed. Decoding per call site is how
+  // `--format llm` came to report `widget/auth` while `--format json` and the
+  // text header reported `widget~2Fauth` for the same investigation, and a
+  // JSON-chaining caller fed the second back to `--resume` and was refused.
+  const state = parsed.data as unknown as SavedInvestigation;
+  return { ...state, id: displayId(state.id) };
 }
 
-function renderSavedInvestigation(id: string, format: string): void {
+export function renderSavedInvestigation(id: string, format: string): void {
   const saved = loadInvestigation(id, format);
   if (!saved) return;
   if (format === "json") {
@@ -804,11 +915,11 @@ function renderSavedInvestigation(id: string, format: string): void {
     // it carries the one fact the bundle records do not: when this snapshot
     // was taken. `classification=current` says it was fresh when it was
     // saved, not when that was.
-    printLlmLines([llmLine("investigation", { id: unsanitizeId(saved.id), saved_at: saved.savedAt })]);
+    printLlmLines([llmLine("resumed", { id: saved.id, saved_at: saved.savedAt })]);
     renderBundle(saved.bundle, format);
     return;
   }
-  renderNote(`Resumed investigation "${unsanitizeId(saved.id)}" saved ${saved.savedAt}`);
+  renderNote(`Resumed investigation "${saved.id}" saved ${saved.savedAt}`);
   renderBundle(saved.bundle, format);
 }
 
@@ -885,10 +996,20 @@ export function diffInvestigations(
   // while the fresh side used another one -- the silent misreport this record
   // exists to prevent. `ContextBundle.budgets` records the truth on both sides.
   const effective: BudgetSnapshot = { ...fresh.budgets };
-  // Whether the caller's --max-* flags governed the fresh side. Derived by
-  // comparison rather than hardcoded false, for the same reason.
-  const requestedApplied = requestedBudgets !== undefined
-    && BUDGETS.every((f) => requestedBudgets[f.key] === undefined || requestedBudgets[f.key] === effective[f.key]);
+  // Whether the caller's --max-* flags governed the fresh side.
+  //
+  // Not `requested equals effective`. Equal numbers are not evidence of
+  // causation: `--max-evidence 25` against a saved budget of 25 produces
+  // identical values while the flag changed nothing, and reporting `true` there
+  // told an agent its override had taken -- so it raised the number, got the
+  // saved budget again and now `false`. Three formats of one command disagreed,
+  // because the note printed beside it said the opposite.
+  //
+  // What decides this is which budget the action handler hands
+  // `buildFreshBundle`, and that is `saved.bundle.budgets` unconditionally, one
+  // call site named in the comment there. So this is false, and the day that
+  // call changes it is the day this needs to change with it.
+  const requestedApplied = false;
 
   return {
     schema: "ix-investigation-diff/1",
@@ -1024,7 +1145,7 @@ export function renderInvestigationDiff(
     // record per line invariant.
     printLlmLines([
       llmLine("diff", {
-        investigation: unsanitizeId(saved.id),
+        investigation: saved.id,
         target: fresh.target.name,
         // How old the saved side is. `freshness_previous=current` says the
         // snapshot was fresh when it was taken, not when that was — and a

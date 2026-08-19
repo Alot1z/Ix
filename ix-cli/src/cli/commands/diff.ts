@@ -10,7 +10,8 @@ import { IxClient } from "../../client/api.js";
 import { getEndpoint } from "../config.js";
 import { resolveFileOrEntity, resolveEntityFull, printResolved, looksFileLike, type ResolvedEntity } from "../resolve.js";
 import { formatDiff, relativePath } from "../format.js";
-import { llmLine, llmError, reportModeConflict } from "../llm.js";
+import { llmLine, llmError } from "../llm.js";
+import { reportFailure } from "../ui.js";
 import { parsePickOption } from "../options.js";
 
 /**
@@ -482,7 +483,7 @@ export function registerDiffCommand(program: Command): void {
     }) => {
       const conflict = detectDiffModeConflict(opts);
       if (conflict) {
-        reportModeConflict(conflict, opts.format);
+        reportFailure("mode_conflict", conflict, opts.format);
         return;
       }
       const client = new IxClient(getEndpoint());

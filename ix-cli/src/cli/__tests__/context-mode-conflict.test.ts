@@ -82,10 +82,13 @@ describe("detectContextModeConflict", () => {
       const msg = detectContextModeConflict({ resume: "x", out: "/tmp/x.json", format })!;
       expect(msg).toMatch(/--resume cannot be combined with --out/);
       expect(msg).not.toMatch(/--format json with --out/);
-      // And the way out it does name has to work.
-      expect(msg).toMatch(/>/);
-      expect(detectContextModeConflict({ resume: "x", format: "json" })).toBeUndefined();
+      // And the way out it names has to be a way out. `toMatch(/>/)` was
+      // satisfied by the `<id>` placeholder already in the message, so it
+      // passed for any wording at all, including one naming nothing.
+      expect(msg).toContain("ix context --resume <id> --format json > <path>");
     }
+    // The redirect it recommends is not itself refused here.
+    expect(detectContextModeConflict({ resume: "x", format: "json" })).toBeUndefined();
   });
 
   it("flags --diff + --save (C-1)", () => {
@@ -127,6 +130,17 @@ describe("detectContextModeConflict", () => {
     expect(detectContextModeConflict({ list: true, out: "/tmp/list.json" })).toMatch(
       /--list cannot be combined with --out/,
     );
+  });
+
+  it("flags a positional target alongside --resume, the sibling nobody guarded", () => {
+    // `--resume` reads the id from its own flag and never looks at the
+    // positional, so `ix context Widget --resume widget-investigation` rendered
+    // the saved investigation and dropped `Widget` with exit 0 -- the same
+    // defect as the --list one, one line below the guard added for it. --diff
+    // does use the positional, so it stays legal there.
+    expect(detectContextModeConflict({ resume: "x" }, "Widget")).toMatch(/--resume takes no target/);
+    expect(detectContextModeConflict({ diff: "x" }, "Widget")).toBeUndefined();
+    expect(detectContextModeConflict({ resume: "x" })).toBeUndefined();
   });
 
   it("flags a positional target alongside --list", () => {
@@ -202,11 +216,18 @@ describe("detectDiffModeConflict", () => {
 describe("mode-flag coverage does not drift from the command", () => {
   /** Flags that select what the command does, or where its output goes. */
   const CONTEXT_MODE_FLAGS = ["out", "save", "resume", "diff", "list"] as const;
-  /** Flags that shape the bundle a mode produces; any pair of these is legal. */
+  /**
+   * Flags that shape a bundle. Legal with each other and with the modes that
+   * build one; refused by `--list` and `--resume`, which build none — that gap
+   * was five typed flags accepted and dropped with exit 0, and this list saying
+   * "legal everywhere" is what certified it.
+   */
   const CONTEXT_BUILD_FLAGS = [
     "kind", "path", "pick", "depth", "asOfRev",
-    "maxEntities", "maxRelationships", "maxEvidence", "maxChars", "format",
+    "maxEntities", "maxRelationships", "maxEvidence", "maxChars",
   ];
+  /** Meaningful to every mode, so in neither group. */
+  const CONTEXT_UNIVERSAL_FLAGS = ["format"];
 
   function registeredAttributes(register: (p: Command) => void, name: string): string[] {
     const program = new Command();
@@ -218,8 +239,32 @@ describe("mode-flag coverage does not drift from the command", () => {
 
   it("classifies every option ix context registers", () => {
     expect(registeredAttributes(registerContextCommand, "context")).toEqual(
-      [...CONTEXT_MODE_FLAGS, ...CONTEXT_BUILD_FLAGS].sort(),
+      [...CONTEXT_MODE_FLAGS, ...CONTEXT_BUILD_FLAGS, ...CONTEXT_UNIVERSAL_FLAGS].sort(),
     );
+  });
+
+  it("refuses every build flag given to a mode that builds nothing", () => {
+    for (const mode of ["list", "resume"] as const) {
+      for (const flag of CONTEXT_BUILD_FLAGS) {
+        const opts = { [mode]: mode === "list" ? true : "x", [flag]: 1 } as Record<string, unknown>;
+        expect(
+          detectContextModeConflict(opts),
+          `--${flag} is silently ignored by --${mode}`,
+        ).toBeTruthy();
+      }
+      // …and the mode alone, or with --format, is the ordinary path.
+      expect(detectContextModeConflict({ [mode]: mode === "list" ? true : "x", format: "llm" })).toBeUndefined();
+    }
+    // --diff consumes all of them, so none of this applies to it.
+    for (const flag of CONTEXT_BUILD_FLAGS) {
+      expect(detectContextModeConflict({ diff: "x", [flag]: 1 })).toBeUndefined();
+    }
+  });
+
+  it("names every ignored flag at once, not one per re-run", () => {
+    const msg = detectContextModeConflict({ list: true, maxEntities: 10, kind: "class" })!;
+    expect(msg).toContain("--kind");
+    expect(msg).toContain("--max-entities");
   });
 
   it("refuses every pair of mode flags", () => {
@@ -309,6 +354,9 @@ describe("ix context action surfaces mode conflicts on stderr and exits 1", () =
     { args: ["context", "--list", "--save", "y"], expect: /--list cannot be combined with --save/ },
     { args: ["context", "--list", "--out", "/tmp/x.json"], expect: /--list cannot be combined with --out/ },
     { args: ["context", "Widget", "--list"], expect: /--list takes no target/ },
+    { args: ["context", "Widget", "--resume", "x"], expect: /--resume takes no target/ },
+    { args: ["context", "--list", "--max-entities", "10"], expect: /--max-entities cannot be combined with --list/ },
+    { args: ["context", "--resume", "x", "--kind", "class"], expect: /--kind cannot be combined with --resume/ },
   ])("ix $args → stderr matches $expect and exit code is 1", ({ args, expect: re }) => {
     const r = runProgram(registerContextCommand, args);
     expect(r.exitCode).toBe(1);

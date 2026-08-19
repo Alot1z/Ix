@@ -22,6 +22,7 @@ import {
   parseRequestedBudgets,
   renderBundle,
   renderInvestigationDiff,
+  renderSavedInvestigation,
   saveInvestigation,
 } from "../commands/context.js";
 
@@ -91,6 +92,41 @@ function captureWarnings(fn: () => void): string {
   // chalk wraps the message as a whole, so the text stays contiguous; strip the
   // colour codes anyway so a CI run with colour forced on matches a local one.
   return lines.join("\n").replace(/\u001b\[[0-9;]*m/g, "");
+}
+
+/**
+ * Run `fn` with stdout and stderr captured separately.
+ *
+ * One helper for the file. There were three, and they disagreed: two joined a
+ * multi-argument `console.log` with a space, the third pushed each argument as
+ * its own line, so identical output produced different arrays depending on
+ * which block a test happened to sit in.
+ */
+function captureStreams(fn: () => void): { out: string[]; err: string[] } {
+  const out: string[] = [];
+  const err: string[] = [];
+  const origLog = console.log;
+  const origErr = console.error;
+  console.log = (...a: unknown[]) => void out.push(a.map(String).join(" "));
+  console.error = (...a: unknown[]) => void err.push(a.map(String).join(" "));
+  try {
+    fn();
+  } finally {
+    console.log = origLog;
+    console.error = origErr;
+  }
+  return { out, err };
+}
+
+/** The same, joined the way a terminal shows it. */
+function captureText(fn: () => void): { out: string; err: string } {
+  const { out, err } = captureStreams(fn);
+  return { out: out.join("\n"), err: err.join("\n") };
+}
+
+/** Just the stdout half, for the renderers that write nothing else. */
+function captureLog(fn: () => void): string[] {
+  return captureStreams(fn).out;
 }
 
 function makeFacts(overrides: Partial<EntityFacts> = {}): EntityFacts {
@@ -401,10 +437,13 @@ describe("ix context investigation state", () => {
     saveInvestigation("widget-check", bundle);
     const stored = loadInvestigation("widget-check")!;
 
-    expect(mergeDiffOptions(stored, {})).toEqual({ asOfRev: "7", depth: "2" });
-    expect(mergeDiffOptions(stored, { asOfRev: "3" })).toEqual({ asOfRev: "3", depth: "2" });
-    expect(mergeDiffOptions(stored, { depth: "4" })).toEqual({ asOfRev: "7", depth: "4" });
-    expect(mergeDiffOptions(stored, { asOfRev: "3", depth: "4" })).toEqual({ asOfRev: "3", depth: "4" });
+    // Numbers, not strings: `--as-of-rev` is validated by its Commander
+    // argParser now, so the round trip out to a string and back through
+    // `parseInt` is gone.
+    expect(mergeDiffOptions(stored, {})).toEqual({ asOfRev: 7, depth: "2" });
+    expect(mergeDiffOptions(stored, { asOfRev: 3 })).toEqual({ asOfRev: 3, depth: "2" });
+    expect(mergeDiffOptions(stored, { depth: "4" })).toEqual({ asOfRev: 7, depth: "4" });
+    expect(mergeDiffOptions(stored, { asOfRev: 3, depth: "4" })).toEqual({ asOfRev: 3, depth: "4" });
   });
 
   it("never collides or escapes for hostile investigation ids", () => {
@@ -472,9 +511,17 @@ describe("ix context investigation state", () => {
     expect(overrideDiff.budgets.requestedApplied).toBe(false);
     expect(overrideDiff.budgets.note).toMatch(/were not applied to the fresh side/i);
 
-    // …and it reads true when they do match what the bundle was built with.
+    // Still false when the numbers happen to agree, which is the case that
+    // makes "requested equals effective" the wrong derivation: `--max-evidence
+    // 25` against a fresh side already built with 25 changes nothing, and
+    // reporting true there told an agent its override had taken.
     const matching = parseRequestedBudgets({ maxEntities: 50, maxEvidence: 25 });
-    expect(diffInvestigations(stored, fresh, matching).budgets.requestedApplied).toBe(true);
+    const agreeing = diffInvestigations(stored, fresh, matching);
+    expect(agreeing.budgets.requested).toEqual({ maxEntities: 50, maxEvidence: 25 });
+    expect(agreeing.budgets.effective).toEqual(fresh.budgets);
+    expect(agreeing.budgets.requestedApplied).toBe(false);
+    // …and the note beside it says the same thing, in every format.
+    expect(agreeing.budgets.note).toMatch(/were not applied to the fresh side/i);
   });
 
   it("records exactly the --max-* flags that were passed", () => {
@@ -535,7 +582,7 @@ describe("ix context investigation state", () => {
     // carries `applied=` so the precedence rule — saved budgets govern
     // --diff — is a field an agent can test rather than a sentence to read.
     expect(llm.lines).toContain("budgets scope=saved entities=5 relationships=1 evidence=2 chars=12000");
-    expect(llm.lines).toContain("budgets scope=requested evidence=25 applied=true");
+    expect(llm.lines).toContain("budgets scope=requested evidence=25 applied=false");
     expect(llm.lines).toContain("budgets scope=effective entities=50 relationships=100 evidence=25 chars=12000");
     // And none of the prose survives into the record stream.
     expect(llm.lines.some((l) => l.includes(":") && l.startsWith("  "))).toBe(false);
@@ -554,8 +601,11 @@ describe("ix context investigation state", () => {
     expect(parsed.budgets.requested).toEqual(requested);
     expect(parsed.budgets.effective).toEqual(fresh.budgets);
     // The same fact the llm record carries as `applied=`, so a JSON consumer
-    // does not have to string-match an English sentence for it.
-    expect(parsed.budgets.requestedApplied).toBe(true);
+    // does not have to string-match an English sentence for it — and it agrees
+    // with the note and with the text renderer's "not applied" label, which a
+    // value comparison did not.
+    expect(parsed.budgets.requestedApplied).toBe(false);
+    expect(parsed.budgets.note).toMatch(/were not applied to the fresh side/i);
   });
 
   // `--diff --format llm` used to fall through to the prose renderer, because
@@ -563,19 +613,6 @@ describe("ix context investigation state", () => {
   // by `llmLine`, so a value carrying a space is quoted rather than splitting
   // the record. These tests pin that.
   describe("--format llm rendering", () => {
-    function captureLog(fn: () => void): string[] {
-      const lines: string[] = [];
-      const orig = console.log;
-      console.log = (...args: unknown[]) => {
-        for (const arg of args) lines.push(String(arg));
-      };
-      try {
-        fn();
-      } finally {
-        console.log = orig;
-      }
-      return lines;
-    }
 
     it("emits a header and counts for an empty diff without falling back to prose", () => {
       const saved = bundleWith([makeClaim("renders to DOM", 0.9)]);
@@ -748,6 +785,24 @@ describe("ix context investigation state", () => {
       expect(lines[0]).toMatch(/^context target=Widget target_kind=class /);
     });
 
+    it("gives --resume its own record kind, not --list's", () => {
+      // Both emitted `investigation`, with two fields here and thirteen there,
+      // so a consumer routing on the record kind could not tell which shape to
+      // expect and reading `target` off this one yielded undefined.
+      const saved = bundleWith([makeClaim("renders to DOM", 0.9)]);
+      saveInvestigation("widget-resume", saved);
+      const lines = captureLog(() => renderSavedInvestigation("widget-resume", "llm"));
+
+      expect(lines[0]).toMatch(/^resumed id=widget-resume saved_at=/);
+      // …and it carries the one fact the bundle records do not: when the
+      // snapshot was taken. `classification=current` says it was fresh then,
+      // not when then was.
+      expect(lines[0]).toMatch(/saved_at=\d{4}-\d{2}-\d{2}T/);
+      // The prose note it replaces is gone from the record stream.
+      expect(lines.some((l) => l.includes("Resumed investigation"))).toBe(false);
+      expect(lines[1]).toMatch(/^context target=Widget/);
+    });
+
     it("does not regress the prose (text) renderer", () => {
       const saved = bundleWith([makeClaim("renders to DOM", 0.9)]);
       saveInvestigation("widget-llm-text", saved);
@@ -767,31 +822,6 @@ describe("ix context investigation state", () => {
   // Without it, neither humans nor agents can see what they have stored —
   // the only path was reading the JSON files directly.
   describe("listInvestigations", () => {
-    /**
-     * Run `fn` with stdout and stderr captured separately.
-     *
-     * One helper for the whole block, and multi-arg calls joined with a space
-     * the way a terminal shows them: the two ad-hoc capturers this replaces
-     * disagreed on that (one joined, one pushed each argument as its own line),
-     * so identical output produced different arrays depending on which test you
-     * happened to be reading.
-     */
-    const captureStreams = (fn: () => void) => {
-      const out: string[] = [];
-      const err: string[] = [];
-      const origLog = console.log;
-      const origErr = console.error;
-      console.log = (...a: unknown[]) => void out.push(a.join(" "));
-      console.error = (...a: unknown[]) => void err.push(a.join(" "));
-      try {
-        fn();
-      } finally {
-        console.log = origLog;
-        console.error = origErr;
-      }
-      return { out: out.join("\n"), err: err.join("\n") };
-    };
-
     /** Restamp a saved investigation's `savedAt`, leaving everything else alone. */
     const stampSavedAt = (id: string, savedAt: string) => {
       const path = join(investigationsDir(), `${id}.json`);
@@ -840,14 +870,47 @@ describe("ix context investigation state", () => {
       // `widget/auth` was saved as `widget~2Fauth` and listed as that, and
       // resuming it looked for `widget~7E2Fauth`, which does not exist.
       saveInvestigation("widget/auth", bundleWith([makeClaim("renders to DOM", 0.9)]));
-      const [only] = listInvestigations().saved;
-      expect(only.id).toBe("widget~2Fauth"); // on disk, as stored
+      // Stored encoded, one file, no separator in the name.
+      expect(readdirSync(investigationsDir())).toEqual(["widget~2Fauth.json"]);
 
-      const { out } = captureStreams(() => renderInvestigationList([only], 0, "json"));
-      const listed = JSON.parse(out).investigations[0].id;
-      expect(listed).toBe("widget/auth");
+      // Decoded once, at the read boundary, so every format agrees. Decoding at
+      // each print site is how `--format llm` came to say `widget/auth` while
+      // `--format json` and the text header said `widget~2Fauth`.
+      const [only] = listInvestigations().saved;
+      expect(only.id).toBe("widget/auth");
+      const { out } = captureText(() => renderInvestigationList([only], 0, "json"));
+      expect(JSON.parse(out).investigations[0].id).toBe("widget/auth");
       // The whole point: the id the listing offers has to load.
-      expect(loadInvestigation(listed)?.bundle.target.name).toBe("Widget");
+      expect(loadInvestigation(only.id)?.bundle.target.name).toBe("Widget");
+    });
+
+    it("lists an id that --resume can take back even when it cannot be decoded", () => {
+      // `sanitizeId` writes two hex digits below U+0100 and three or four above
+      // it, so `~7528` is either one CJK code unit or `~752` followed by a
+      // literal `8` and nothing in the string says which. Guessing produced a
+      // mangled id that loaded nothing; the round-trip check refuses to guess
+      // and shows the stored name, and `loadInvestigation` accepts that form.
+      saveInvestigation("用户", bundleWith([makeClaim("renders to DOM", 0.9)]));
+      const [only] = listInvestigations().saved;
+      expect(only.id).toBe("~7528~6237");
+      expect(loadInvestigation(only.id)?.bundle.target.name).toBe("Widget");
+      // …and the id the user actually typed still reaches the same file.
+      expect(loadInvestigation("用户")?.bundle.target.name).toBe("Widget");
+    });
+
+    it("keeps an id that is literally spelled like an encoding on its own file", () => {
+      // The on-disk fallback is second, not first, so `widget~2Fauth` typed as
+      // an id finds the file it was saved to rather than the one `widget/auth`
+      // was.
+      saveInvestigation("widget/auth", bundleWith([makeClaim("renders to DOM", 0.9)]));
+      saveInvestigation("widget~2Fauth", bundleWith([makeClaim("mounts to DOM", 0.9)]));
+      expect(readdirSync(investigationsDir()).sort()).toEqual(
+        ["widget~2Fauth.json", "widget~7E2Fauth.json"],
+      );
+      const claims = (id: string) =>
+        loadInvestigation(id)!.bundle.claims.map((c) => c.statement);
+      expect(claims("widget/auth")).toContain("renders to DOM");
+      expect(claims("widget~2Fauth")).toContain("mounts to DOM");
     });
 
     it("skips files whose envelope or bundle does not match the contract", () => {
@@ -884,7 +947,7 @@ describe("ix context investigation state", () => {
       saveInvestigation("good", bundleWith([makeClaim("renders to DOM", 0.9)]));
       const { saved } = listInvestigations();
 
-      const json = captureStreams(() => renderInvestigationList(saved, 3, "json"));
+      const json = captureText(() => renderInvestigationList(saved, 3, "json"));
       expect(() => JSON.parse(json.out)).not.toThrow();
       const parsed = JSON.parse(json.out);
       expect(parsed.investigations).toHaveLength(1);
@@ -893,18 +956,18 @@ describe("ix context investigation state", () => {
       expect(parsed.skipped).toBe(3);
       expect(json.err).toContain("3 saved investigation file(s)");
 
-      const llm = captureStreams(() => renderInvestigationList(saved, 3, "llm"));
+      const llm = captureText(() => renderInvestigationList(saved, 3, "llm"));
       expect(llm.out.split("\n")[0]).toBe("investigations total=1 skipped=3");
       // The count is the record's business; nothing is written beside it.
       expect(llm.err).toBe("");
 
       // And with nothing skipped the field is simply absent.
-      const clean = captureStreams(() => renderInvestigationList(saved, 0, "llm"));
+      const clean = captureText(() => renderInvestigationList(saved, 0, "llm"));
       expect(clean.out.split("\n")[0]).toBe("investigations total=1");
       expect(clean.err).toBe("");
       // `skipped` is still there in json, as a zero rather than as nothing:
       // "none were rejected" is an answer, and its absence is not.
-      const cleanJson = captureStreams(() => renderInvestigationList(saved, 0, "json"));
+      const cleanJson = captureText(() => renderInvestigationList(saved, 0, "json"));
       expect(JSON.parse(cleanJson.out).skipped).toBe(0);
     });
 
@@ -917,7 +980,7 @@ describe("ix context investigation state", () => {
       const { saved } = listInvestigations();
       expect(saved[0].bundle.evidence.length).toBeGreaterThan(0);
 
-      const { out } = captureStreams(() => renderInvestigationList(saved, 0, "json"));
+      const { out } = captureText(() => renderInvestigationList(saved, 0, "json"));
       const [item] = JSON.parse(out).investigations;
       expect(Object.keys(item).sort()).toEqual(
         ["counts", "freshness", "id", "savedAt", "target", "truncation"].sort(),

@@ -7,6 +7,8 @@
 
 import chalk from "chalk";
 
+import { llmError } from "./llm.js";
+
 // ── Brand palette ─────────────────────────────────────────────────────────────
 //
 //   Primary / kind accent   chalk.cyan
@@ -70,6 +72,22 @@ export function renderWarning(text: string): void {
   console.log(`  ${chalk.yellow("Warning")}  ${chalk.yellow(text)}`);
 }
 
+/**
+ * The same warning, on stderr.
+ *
+ * Every renderer here writes to stdout, which is where a command's payload
+ * goes: a warning printed alongside a `--format json` bundle lands inside what
+ * the caller pipes to `jq`, and inside the record stream for `--format llm`.
+ * When a command has a machine format, its prose belongs on the other stream.
+ *
+ * Same padding and same colour as `renderWarning`, deliberately — this had been
+ * hand-rolled twice as `console.error("  Warning  " + text)`, which put the
+ * convention in three places and dropped the colour humans were getting.
+ */
+export function renderWarningErr(text: string): void {
+  console.error(`  ${chalk.yellow("Warning")}  ${chalk.yellow(text)}`);
+}
+
 /** Success confirmation. */
 export function renderSuccess(text: string): void {
   console.log(`  ${chalk.green(text)}`);
@@ -85,4 +103,31 @@ export function renderError(text: string): void {
 /** Print the "Resolved: kind name" header shown at the top of most command text output. */
 export function renderResolvedHeader(kind: string, name: string): void {
   console.log(`${chalk.bold("Resolved:")} ${chalk.cyan(kind)} ${chalk.bold(name)}`);
+}
+
+/**
+ * Report a command failure in the format the caller asked for, and mark the run
+ * failed.
+ *
+ * Both halves matter. `--format llm` gets the `error code=... message="..."`
+ * record on stdout that `callers.ts`, `contains.ts`, `depends.ts`, `diff.ts` and
+ * `history.ts` already emit and that docs/llm-format.md specifies: an agent is
+ * told to pass the flag unconditionally, so an error it cannot parse is an
+ * error it cannot act on. Every other format gets the human line on stderr, so
+ * a `--format json` caller piping to `jq` never finds prose in the payload.
+ *
+ * One function because it was otherwise written twice, byte for byte including
+ * its docblock, in `context.ts` and `diff.ts`, while five more refusals in the
+ * same handler wrote `renderWarning` — which is `console.log` — and left the
+ * exit code at 0, so a script could not tell a refusal from an empty success.
+ * `subsystems.ts` carries six more copies of the stderr half.
+ *
+ * Here rather than in `llm.ts`: this is an output-routing decision, and putting
+ * it there forced `chalk` into the module documented as the token-minimal wire
+ * format renderer, for the sake of one human-facing line.
+ */
+export function reportFailure(code: string, message: string, format?: string): void {
+  if (format === "llm") console.log(llmError(code, message));
+  else console.error(chalk.red("Error:"), message);
+  process.exitCode = 1;
 }

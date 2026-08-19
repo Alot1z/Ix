@@ -36,7 +36,25 @@ export function parsePickOption(value: string): number {
  * requested budget back to the caller, and a silently repaired number
  * (`--max-entities 1e3` becoming 1) is a misreport of the one thing that record
  * exists to carry.
+ *
+ * `example` is the flag's own default, supplied by the caller. A shared literal
+ * would be wrong for at least one flag: `--max-chars` starts at 12000 and
+ * clamps up from anything below 1000, so suggesting 50 there names a value the
+ * command silently replaces.
  */
-export function parseBudgetOption(value: string): number {
-  return parsePositiveInt(value, "50");
+export function parseBudgetOption(value: string, example: string): number {
+  return parsePositiveInt(value, example);
+}
+
+/**
+ * Parse a revision flag: a positive integer graph revision.
+ *
+ * `parseInt(opts.asOfRev, 10)` reached `client.query({ asOfRev })` and
+ * `buildBundle` unchecked, so `--as-of-rev abc` sent NaN to the backend,
+ * `--as-of-rev 3.9` silently became 3, and `--as-of-rev 10abc` became 10 — the
+ * same not-a-validator failure the budget flags had, on the flag two lines
+ * above them.
+ */
+export function parseRevisionOption(value: string): number {
+  return parsePositiveInt(value, "12");
 }

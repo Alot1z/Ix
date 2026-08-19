@@ -135,16 +135,37 @@ is not enough: the id is the backend's, and the statement is what changed.
 
 ```
 investigations total=2 skipped=1
-investigation id=widget saved_at=2026-01-03T09:12:44.108Z target=Widget target_kind=class classification=current entities=12 relationships=20 evidence=8
-investigation id=auth-path saved_at=2026-01-02T17:03:11.882Z target=verify_token target_kind=function classification=stale stale=true entities=31 relationships=64 evidence=25 truncated_evidence=4
+investigation id=widget saved_at=2026-01-03T09:12:44.108Z target=Widget target_kind=class classification=current stale=false entities=12 relationships=20 evidence=8 truncated_entities=0 truncated_relationships=0 truncated_evidence=0 truncated_chars=0
+investigation id=auth-path saved_at=2026-01-02T17:03:11.882Z target=verify_token target_kind=function classification=stale stale=true entities=31 relationships=64 evidence=25 truncated_entities=0 truncated_relationships=0 truncated_evidence=4 truncated_chars=0
 ```
 
 `skipped` counts saved files that did not match the contract and is present
 only when it is non-zero — it is the one thing about a listing that cannot be
-seen from the records themselves. `id` is the id `--resume` and `--diff` take,
-not the file name on disk; the two differ whenever an id contains a character
-outside `[A-Za-z0-9._-]`. The counts describe each bundle; the bundles
-themselves are not in the listing, and `ix context --resume <id>` fetches one.
+seen from the records themselves. Note that `stale=` and the four `truncated_*`
+fields are *not* dropped when zero or false: `llmField` omits only nullish and
+empty-string values, and these say "measured, and it was none", which a missing
+field does not.
+
+`id` is the id `--resume` and `--diff` take, not necessarily the file name on
+disk; the two differ whenever an id contains a character outside
+`[A-Za-z0-9._-]`. Both forms load, because the encoding is not always
+reversible — above U+00FF the escape width is ambiguous, and the listing shows
+the stored name rather than guess.
+
+The counts describe each bundle; the bundles themselves are not in the listing,
+and `ix context --resume <id>` fetches one:
+
+```
+resumed id=widget saved_at=2026-01-03T09:12:44.108Z
+context target=Widget target_kind=class stale=false classification=current entities=2 relationships=1 claims=1 decisions=0 conflicts=0 intents=0 evidence=7 truncated_entities=0 truncated_relationships=0 truncated_evidence=0 truncated_chars=0
+evidence score=0 kind=target title="Widget (class)"
+```
+
+`resumed`, not `investigation`: the record kinds are distinct because the
+shapes are, and a consumer routing on the kind should not have to guess which
+of two field sets it is holding. `saved_at` is on it because the `context`
+record that follows says whether the snapshot was fresh when it was taken, not
+when that was.
 
 Error line:
 

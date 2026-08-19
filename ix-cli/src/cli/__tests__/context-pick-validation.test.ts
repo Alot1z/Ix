@@ -125,3 +125,53 @@ describe("ix context --max-* validation", () => {
     }
   });
 });
+
+/**
+ * `--as-of-rev` sat two lines from the budget flags with a bare
+ * `parseInt(opts.asOfRev, 10)` behind it, and its value goes to the backend:
+ * `--as-of-rev abc` sent NaN, `3.9` silently became 3, `10abc` became 10.
+ */
+describe("ix context --as-of-rev validation", () => {
+  beforeEach(() => {
+    resolveFileOrEntity.mockReset().mockResolvedValue(undefined);
+  });
+
+  it.each(["abc", "3.9", "10abc", "-1", "0"])("rejects %j rather than sending it", async (value) => {
+    const result = await runContext(["--as-of-rev", value]);
+    expect(result.error?.exitCode).toBe(1);
+    expect(result.stderr).toContain("must be a positive integer");
+    expect(resolveFileOrEntity).not.toHaveBeenCalled();
+  });
+
+  it("accepts a revision", async () => {
+    expect((await runContext(["--as-of-rev", "12"])).error).toBeUndefined();
+  });
+});
+
+describe("ix context refusals reach the caller that asked for records", () => {
+  beforeEach(() => {
+    resolveFileOrEntity.mockReset().mockResolvedValue(undefined);
+  });
+
+  it("answers a missing target with a record and a non-zero status", async () => {
+    // It was a `renderWarning` — console.log — with the exit code left at 0, so
+    // an `llm` consumer got a prose line in its record stream and a script
+    // could not tell "no target given" from a successful empty bundle.
+    const out: string[] = [];
+    const origLog = console.log;
+    const priorExit = process.exitCode;
+    console.log = (...a: unknown[]) => void out.push(a.map(String).join(" "));
+    try {
+      process.exitCode = undefined;
+      const program = new Command().name("ix").exitOverride();
+      registerContextCommand(program);
+      await program.parseAsync(["context", "--format", "llm"], { from: "user" });
+      expect(out).toHaveLength(1);
+      expect(out[0]).toMatch(/^error code=missing_target message="/);
+      expect(process.exitCode).toBe(1);
+    } finally {
+      console.log = origLog;
+      process.exitCode = priorExit;
+    }
+  });
+});
