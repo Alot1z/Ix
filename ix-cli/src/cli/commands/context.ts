@@ -19,7 +19,7 @@ import type {
 } from "../../client/types.js";
 import { getEndpoint } from "../config.js";
 import { collectFacts, type EntityFacts } from "../explain/facts.js";
-import { llmLine, printLlmLines } from "../llm.js";
+import { llmLine, printLlmLines, reportModeConflict } from "../llm.js";
 import { parsePickOption } from "../options.js";
 import { resolveFileOrEntity } from "../resolve.js";
 import { createStaleProbe } from "../stale.js";
@@ -137,6 +137,11 @@ export function registerContextCommand(program: Command): void {
       "\nExamples:\n  ix context IngestionService\n  ix context src/main.ts --format json\n  ix context Widget --max-entities 20 --max-evidence 10\n  ix context Widget --save widget-investigation\n  ix context --resume widget-investigation\n  ix context --diff widget-investigation\n  ix context --list",
     )
     .action(async (target: string | undefined, opts: ContextOptions) => {
+      const conflict = detectContextModeConflict(opts);
+      if (conflict) {
+        reportModeConflict(conflict, opts.format);
+        return;
+      }
       if (opts.resume) {
         renderSavedInvestigation(opts.resume, opts.format);
         return;
@@ -279,6 +284,64 @@ async function buildFreshBundle(
 }
 }
 
+
+/**
+ * The `ContextOptions` fields `detectContextModeConflict` consumes.
+ *
+ * `Pick`, not a hand-copied shape: the detector exists to stop a typed flag
+ * being a no-op, so its idea of the flags must come from the same declaration
+ * the action handler uses. Written out field-by-field it drifted immediately --
+ * `--list` was added to `ContextOptions` on a sibling branch and the detector
+ * could not see it, with nothing from the typechecker to say so. `Partial` so
+ * the pure function can still be called with one flag at a time in a test,
+ * without inventing a `format`.
+ */
+export type ContextModeOptions = Partial<
+  Pick<ContextOptions, "resume" | "diff" | "save" | "out" | "format">
+>;
+
+/**
+ * Detect mutually-incompatible mode/output flags on `ix context` and return a
+ * human-readable message naming the conflict, or `undefined` if no conflict.
+ *
+ * The action handler used to silently drop `--save` and `--out` whenever
+ * `--resume` or `--diff` was passed (those branches `return` before the
+ * `--save`/`--out` branches ever run). It also accepted `--save <id>` alongside
+ * `--out <file>`, which describes two different write targets and so has no
+ * well-defined combined behaviour. Catching these combinations up front and
+ * surfacing them as a hard error mirrors the explicit-conflict style in
+ * subsystems.ts and prevents the user's typed flag from being a no-op.
+ */
+export function detectContextModeConflict(
+  opts: ContextModeOptions,
+): string | undefined {
+  if (opts.resume && opts.diff) {
+    return "--resume and --diff cannot be combined; --resume renders a saved investigation, --diff renders a comparison against one.";
+  }
+  if (opts.resume && opts.save) {
+    return "--resume cannot be combined with --save; --resume only renders a saved investigation, while --save writes a new one. Run --save on a fresh build instead.";
+  }
+  if (opts.resume && opts.out) {
+    // No "use --format json with --out" hint here. That hint was unactionable:
+    // this branch fires on `--resume` plus `--out` whatever the format, so a
+    // user who followed it landed straight back on the same error, this time
+    // with no advice at all. The two things that do work are a redirect and
+    // the saved file itself, so name those.
+    return "--resume cannot be combined with --out; --resume renders to stdout."
+      + " Redirect it (`ix context --resume <id> --format json > <path>`), or read"
+      + " IX_HOME/investigations/<id>.json, which is already the saved JSON.";
+  }
+  if (opts.diff && opts.save) {
+    return "--diff cannot be combined with --save; --diff renders a comparison against a saved investigation. To persist the fresh side as a new investigation, run the fresh build without --diff and use --save there.";
+  }
+  if (opts.diff && opts.out) {
+    return "--diff cannot be combined with --out; --diff renders the comparison to stdout.";
+  }
+  if (opts.save && opts.out) {
+    return "--save and --out cannot be combined; --save writes to IX_HOME/investigations/<id>.json, while --out writes to a caller-chosen path. Pick one.";
+  }
+  return undefined;
+}
 
 /** Saved investigation state lives under ~/.ix/investigations. */
 function investigationDir(): string {
