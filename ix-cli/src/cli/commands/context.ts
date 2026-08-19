@@ -19,22 +19,79 @@ import type {
 } from "../../client/types.js";
 import { getEndpoint } from "../config.js";
 import { collectFacts, type EntityFacts } from "../explain/facts.js";
-import { llmLine, printLlmLines, reportModeConflict } from "../llm.js";
-import { parsePickOption } from "../options.js";
+import { llmError, llmLine, printLlmLines, reportModeConflict } from "../llm.js";
+import { parseBudgetOption, parsePickOption } from "../options.js";
 import { resolveFileOrEntity } from "../resolve.js";
 import { createStaleProbe } from "../stale.js";
 import { renderNote, renderSection, renderWarning } from "../ui.js";
 
-interface ContextOptions {
+/** The four `--max-*` knobs that bound a bundle. */
+interface BudgetSnapshot {
+  maxEntities: number;
+  maxRelationships: number;
+  maxEvidence: number;
+  maxChars: number;
+}
+
+/**
+ * The four budgets, described once: flag key, output label, clamp range, and
+ * the default applied when the flag is absent.
+ *
+ * These four facts used to live in five hand-maintained places -- the option
+ * registration, the `clampInt` calls, the record fields, the prose formatter
+ * and the requested-budget reader -- so a fifth budget meant five edits and
+ * missing one was silent. They had already drifted: a comment on the
+ * registration described `clampInt(opts.max*, 1, 500, 50)` as if it were the
+ * rule for all four, which is right for entities and wrong for the rest
+ * (`--max-chars` is 1000-1000000 defaulting to 12000). Everything below reads
+ * this table, and `--help` interpolates it, so the number a user is told is
+ * the number that is applied.
+ */
+const BUDGETS = [
+  { key: "maxEntities", label: "entities", help: "Maximum entities in the bundle", min: 1, max: 500, fallback: 50 },
+  { key: "maxRelationships", label: "relationships", help: "Maximum relationships in the bundle", min: 1, max: 1000, fallback: 100 },
+  { key: "maxEvidence", label: "evidence", help: "Maximum evidence items in the bundle", min: 1, max: 200, fallback: 25 },
+  { key: "maxChars", label: "chars", help: "Maximum characters of evidence output", min: 1000, max: 1_000_000, fallback: 12_000 },
+] as const satisfies ReadonlyArray<{
+  key: keyof BudgetSnapshot;
+  label: string;
+  help: string;
+  min: number;
+  max: number;
+  fallback: number;
+}>;
+
+/**
+ * `--help` text for one budget flag.
+ *
+ * The Commander defaults were removed so an absent flag is distinguishable
+ * from one set to the default value -- `--diff` reports which budgets the
+ * caller actually asked for. Removing them also removed `(default: "50")` from
+ * `ix context --help`, leaving four flags whose default and range a user could
+ * not discover from the CLI at all, so the text says both, read off the table
+ * that enforces them.
+ */
+function budgetHelp(key: keyof BudgetSnapshot): string {
+  const b = BUDGETS.find((entry) => entry.key === key)!;
+  return `${b.help} (default: ${b.fallback}, clamped to ${b.min}-${b.max})`;
+}
+
+/** Apply the table's range and default to whatever the caller supplied. */
+function clampBudgets(opts: Partial<BudgetSnapshot>): BudgetSnapshot {
+  const out = {} as BudgetSnapshot;
+  for (const b of BUDGETS) {
+    const raw = opts[b.key];
+    out[b.key] = raw === undefined ? b.fallback : Math.min(b.max, Math.max(b.min, raw));
+  }
+  return out;
+}
+
+interface ContextOptions extends Partial<BudgetSnapshot> {
   kind?: string;
   path?: string;
   pick?: number;
   depth?: string;
   asOfRev?: string;
-  maxEntities?: string;
-  maxRelationships?: string;
-  maxEvidence?: string;
-  maxChars?: string;
   out?: string;
   save?: string;
   resume?: string;
@@ -88,7 +145,7 @@ interface ContextBundle {
   };
   freshness: { stale: boolean; classification: "current" | "stale" | "unverified" };
   evidence: EvidenceItem[];
-  budgets: { maxEntities: number; maxRelationships: number; maxEvidence: number; maxChars: number };
+  budgets: BudgetSnapshot;
   truncation: {
     entitiesTruncated: number;
     relationshipsTruncated: number;
@@ -122,14 +179,15 @@ export function registerContextCommand(program: Command): void {
     .option("--pick <n>", "Pick Nth candidate from ambiguous results (1-based)", parsePickOption)
     .option("--depth <depth>", "Context-graph expansion depth")
     .option("--as-of-rev <n>", "Historical context as of a graph revision")
-    // The --max-* flags default to undefined rather than "50"/"100"/etc. so
-    // parseRequestedBudgets can tell whether the user actually supplied an
-    // override on the command line. The numeric defaults are still applied at
-    // build time via clampInt(opts.max*, 1, 500, 50).
-    .option("--max-entities <n>", "Maximum entities in the bundle")
-    .option("--max-relationships <n>", "Maximum relationships in the bundle")
-    .option("--max-evidence <n>", "Maximum evidence items in the bundle")
-    .option("--max-chars <n>", "Maximum characters of evidence output")
+    // No Commander default on the --max-* flags, so `parseRequestedBudgets`
+    // can tell an absent flag from one set to the default value. The defaults
+    // and ranges are the BUDGETS table's, applied by `clampBudgets` and shown
+    // in the help text by `budgetHelp` -- they differ per flag, so there is no
+    // single pair to name here.
+    .option("--max-entities <n>", budgetHelp("maxEntities"), parseBudgetOption)
+    .option("--max-relationships <n>", budgetHelp("maxRelationships"), parseBudgetOption)
+    .option("--max-evidence <n>", budgetHelp("maxEvidence"), parseBudgetOption)
+    .option("--max-chars <n>", budgetHelp("maxChars"), parseBudgetOption)
     .option("--format <fmt>", "Output format (text|json|llm)", "text")
     .option("--out <path>", "Write the JSON bundle to this file instead of stdout")
     .option("--save <id>", "Persist the bundle as a resumable investigation state")
@@ -159,13 +217,13 @@ export function registerContextCommand(program: Command): void {
         return;
       }
       if (opts.diff) {
-        const saved = loadInvestigation(opts.diff);
+        const saved = loadInvestigation(opts.diff, opts.format);
         if (!saved) return;
-        // The fresh side of --diff is currently built with the saved investigation's
-        // own budgets (ix-cli/src/cli/commands/context.ts: `buildFreshBundle(..., saved.bundle.budgets)`),
-        // so any --max-* flags the user passes on the CLI are not applied to the
-        // fresh bundle. We capture the requested values separately so the diff output
-        // can surface them to humans and agents instead of silently dropping them.
+        // The fresh side of --diff is built with the saved investigation's own
+        // budgets, the argument to `buildFreshBundle` below, so any --max-*
+        // flags the caller passed are not applied to it. Captured here so the
+        // diff output can report what was asked for instead of dropping it
+        // silently; what actually governed is read back off the built bundle.
         const requestedBudgets = parseRequestedBudgets(opts);
         const fresh = await buildFreshBundle(
           target ?? saved.bundle.target.name,
@@ -191,10 +249,7 @@ export function registerContextCommand(program: Command): void {
       if (!resolved) return;
 
       const asOfRev = opts.asOfRev ? parseInt(opts.asOfRev, 10) : undefined;
-      const maxEntities = clampInt(opts.maxEntities, 1, 500, 50);
-      const maxRelationships = clampInt(opts.maxRelationships, 1, 1000, 100);
-      const maxEvidence = clampInt(opts.maxEvidence, 1, 200, 25);
-      const maxChars = clampInt(opts.maxChars, 1000, 1_000_000, 12_000);
+      const budgets = clampBudgets(opts);
 
       const [facts, context, provenance] = await Promise.all([
         collectFacts(client, resolved.id, resolved.name, resolved.kind),
@@ -212,7 +267,7 @@ export function registerContextCommand(program: Command): void {
         provenance,
         asOfRev,
         depth: opts.depth,
-        budgets: { maxEntities, maxRelationships, maxEvidence, maxChars },
+        budgets,
       });
 
       if (opts.save) {
@@ -268,7 +323,7 @@ export function registerContextCommand(program: Command): void {
 async function buildFreshBundle(
   target: string,
   opts: { kind?: string; path?: string; pick?: number; depth?: string; asOfRev?: string },
-  budgets: { maxEntities: number; maxRelationships: number; maxEvidence: number; maxChars: number },
+  budgets: BudgetSnapshot,
 ): Promise<ContextBundle | undefined> {
   const client = new IxClient(getEndpoint());
   const resolved = await resolveFileOrEntity(client, target, {
@@ -664,16 +719,25 @@ export function renderInvestigationList(
  * `--resume`/`--diff` can tell a refusal from a successful render. The sibling
  * commands (config, init, map) already signal refusals this way.
  */
-function refuseInvestigation(message: string): undefined {
-  renderWarning(message);
+function refuseInvestigation(code: string, message: string, format?: string): undefined {
+  // `--format llm` gets the record every sibling command emits for a failure
+  // (`callers.ts`, `contains.ts`, `depends.ts`, `diff.ts`, `history.ts` all do
+  // this, and docs/llm-format.md specifies the shape). This path used to write
+  // `renderWarning`, which is `console.log`, so the one command being made
+  // llm-clean answered a refusal with a chalk-coloured prose line in the middle
+  // of the record stream — and with a prose line inside the JSON payload for a
+  // `--format json` caller piping to `jq`. The human keeps the same wording, on
+  // stderr, where prose belongs whatever the format.
+  if (format === "llm") console.log(llmError(code, message));
+  else console.error(`  Warning  ${message}`);
   process.exitCode = 1;
   return undefined;
 }
 
-export function loadInvestigation(id: string): SavedInvestigation | undefined {
+export function loadInvestigation(id: string, format?: string): SavedInvestigation | undefined {
   const path = investigationPath(id);
   if (!existsSync(path)) {
-    return refuseInvestigation(`No saved investigation "${id}" at ${path}`);
+    return refuseInvestigation("no_saved_investigation", `No saved investigation "${id}" at ${path}`, format);
   }
   let raw: unknown;
   // Scoped to the read and the parse: those are the only calls here that throw,
@@ -682,7 +746,7 @@ export function loadInvestigation(id: string): SavedInvestigation | undefined {
   try {
     raw = JSON.parse(readFileSync(path, "utf8"));
   } catch {
-    return refuseInvestigation(`Saved investigation "${id}" is not valid JSON; refusing to resume.`);
+    return refuseInvestigation("invalid_saved_investigation", `Saved investigation "${id}" is not valid JSON; refusing to resume.`, format);
   }
 
   // Validate the whole envelope coming back off disk against the same versioned
@@ -699,15 +763,19 @@ export function loadInvestigation(id: string): SavedInvestigation | undefined {
     // Distinguish the two version-skew cases from a generic shape mismatch, so
     // the warning names which contract was not met.
     if (issues.some((issue) => issue.path[0] === "schema")) {
-      return refuseInvestigation(`Saved investigation "${id}" has an unknown schema; refusing to resume.`);
+      return refuseInvestigation("invalid_saved_investigation", `Saved investigation "${id}" has an unknown schema; refusing to resume.`, format);
     }
     if (issues.some((issue) => issue.path[0] === "bundle" && issue.path[1] === "schema")) {
       return refuseInvestigation(
+        "invalid_saved_investigation",
         `Saved investigation "${id}" holds a bundle from a different contract than ${BUNDLE_SCHEMA}; refusing to resume.`,
+        format,
       );
     }
     return refuseInvestigation(
+      "invalid_saved_investigation",
       `Saved investigation "${id}" does not match the ${BUNDLE_SCHEMA} schema (${issues.length} issue(s)); refusing to resume.`,
+      format,
     );
   }
   // Return the validated value, not the raw parse: saveInvestigation persists
@@ -724,21 +792,24 @@ export function loadInvestigation(id: string): SavedInvestigation | undefined {
 }
 
 function renderSavedInvestigation(id: string, format: string): void {
-  const saved = loadInvestigation(id);
+  const saved = loadInvestigation(id, format);
   if (!saved) return;
   if (format === "json") {
     console.log(JSON.stringify(saved, null, 2));
     return;
   }
-  renderNote(`Resumed investigation "${saved.id}" saved ${saved.savedAt}`);
+  if (format === "llm") {
+    // A record, not the prose note below. `renderNote` would put a
+    // chalk-coloured English sentence at the head of a record stream, and
+    // it carries the one fact the bundle records do not: when this snapshot
+    // was taken. `classification=current` says it was fresh when it was
+    // saved, not when that was.
+    printLlmLines([llmLine("investigation", { id: unsanitizeId(saved.id), saved_at: saved.savedAt })]);
+    renderBundle(saved.bundle, format);
+    return;
+  }
+  renderNote(`Resumed investigation "${unsanitizeId(saved.id)}" saved ${saved.savedAt}`);
   renderBundle(saved.bundle, format);
-}
-
-interface BudgetSnapshot {
-  maxEntities: number;
-  maxRelationships: number;
-  maxEvidence: number;
-  maxChars: number;
 }
 
 /**
@@ -748,48 +819,40 @@ interface BudgetSnapshot {
  * override needs no `not-given` sentinel the way the prose form does.
  */
 function budgetFields(b: Partial<BudgetSnapshot>): Record<string, number | undefined> {
-  return {
-    entities: b.maxEntities,
-    relationships: b.maxRelationships,
-    evidence: b.maxEvidence,
-    chars: b.maxChars,
-  };
+  return Object.fromEntries(BUDGETS.map((f) => [f.label, b[f.key]]));
 }
 
 /** Compact one-line representation of a budget snapshot for human rendering. */
 function formatBudgets(b: Partial<BudgetSnapshot>, partial = false): string {
-  const fmt = (val: number | undefined, key: string): string =>
-    `${key}=${val === undefined ? "not-given" : String(val)}`;
-  const segments = [
-    fmt(b.maxEntities, "entities"),
-    fmt(b.maxRelationships, "relationships"),
-    fmt(b.maxEvidence, "evidence"),
-    fmt(b.maxChars, "chars"),
-  ].join(" ");
+  const segments = BUDGETS.map((f) => {
+    const val = b[f.key];
+    return `${f.label}=${val === undefined ? "not-given" : String(val)}`;
+  }).join(" ");
   return partial ? `${segments} (CLI override; not applied to --diff fresh side)` : segments;
 }
 
 /**
- * Read the raw `--max-*` strings commander collected into numbers.
+ * Which `--max-*` flags the caller actually passed, or `undefined` for none.
  *
- * Deliberately *not* clamped, unlike the action handler's `clampInt` calls for
- * a direct run: these values are reported, never applied — saved budgets
- * govern `--diff` — so clamping them would misreport what the caller actually
- * asked for. If they are ever made to win on the fresh side, they must be
- * clamped at that point, and the ranges live in the handler.
+ * Validation happens once, at parse time: `parseBudgetOption` is the flags'
+ * Commander `argParser`, so a value that reaches here is already a positive
+ * integer. Reading the raw strings back out with `Number.parseInt` was not a
+ * check — it took `"10abc"` as 10, `"1e3"` as 1 and `"-5"` as -5, and this
+ * record's whole purpose is reporting what the caller asked for, so a silently
+ * repaired number is the one error it cannot afford.
  *
- * An absent or whitespace-only string means the flag was not passed.
+ * Deliberately *not* clamped, unlike `clampBudgets` on a direct run: these
+ * values are reported, never applied — saved budgets govern `--diff` — so
+ * clamping them would report a budget the caller did not ask for either. If
+ * they are ever made to win on the fresh side, they must be clamped there.
  */
-export function parseRequestedBudgets(opts: Partial<ContextOptions>): Partial<BudgetSnapshot> | undefined {
-  const fields: Array<keyof BudgetSnapshot> = ["maxEntities", "maxRelationships", "maxEvidence", "maxChars"];
+export function parseRequestedBudgets(opts: Partial<BudgetSnapshot>): Partial<BudgetSnapshot> | undefined {
   const out: Partial<BudgetSnapshot> = {};
   let provided = false;
-  for (const key of fields) {
-    const raw = opts[key] as string | undefined;
-    if (typeof raw !== "string" || raw.trim() === "") continue;
-    const parsed = Number.parseInt(raw, 10);
-    if (!Number.isFinite(parsed)) continue;
-    out[key] = parsed;
+  for (const f of BUDGETS) {
+    const value = opts[f.key];
+    if (value === undefined) continue;
+    out[f.key] = value;
     provided = true;
   }
   return provided ? out : undefined;
@@ -814,11 +877,18 @@ export function diffInvestigations(
   const addedClaims = fresh.claims.filter((c) => !prev.claims.some((p) => p.id === c.id));
   const removedClaims = prev.claims.filter((p) => !fresh.claims.some((c) => c.id === p.id));
 
-  // Surface the silent "saved budgets govern --diff" precedence as data instead
-  // of hiding it. Today `effective` always equals `saved`; if a future change
-  // ever lets CLI overrides win on the fresh side, this block is the single
-  // place that flips and the diff output is the only observable truth.
-  const effective: BudgetSnapshot = { ...saved.bundle.budgets };
+  // Read off the bundle that was actually built, not restated from the
+  // argument that built it. `{ ...saved.bundle.budgets }` would assert how the
+  // fresh side was constructed rather than report it: today the two agree, but
+  // letting CLI overrides win would mean editing the `buildFreshBundle` call in
+  // the action handler, and `effective` would go on reporting the saved budget
+  // while the fresh side used another one -- the silent misreport this record
+  // exists to prevent. `ContextBundle.budgets` records the truth on both sides.
+  const effective: BudgetSnapshot = { ...fresh.budgets };
+  // Whether the caller's --max-* flags governed the fresh side. Derived by
+  // comparison rather than hardcoded false, for the same reason.
+  const requestedApplied = requestedBudgets !== undefined
+    && BUDGETS.every((f) => requestedBudgets[f.key] === undefined || requestedBudgets[f.key] === effective[f.key]);
 
   return {
     schema: "ix-investigation-diff/1",
@@ -831,12 +901,18 @@ export function diffInvestigations(
       saved: saved.bundle.budgets,
       requested: requestedBudgets,
       effective,
-      // The note exists so an agent reading the JSON alone can tell why a
-      // --max-* flag it passed on the CLI did not change the comparison
-      // footprint, without having to read source to find the precedence rule.
-      note: requestedBudgets
-        ? "Saved investigation budgets govern --diff; --max-* flags on the CLI are recorded above for transparency but not applied to the fresh side."
-        : "Saved investigation budgets govern --diff; no --max-* overrides were supplied on the CLI.",
+      // The same fact the llm record carries as `applied=`. It was prose only
+      // here, so a JSON consumer had to string-match a sentence whose wording
+      // changed with the case, while the llm consumer got a boolean it could
+      // test. One contract, both formats.
+      requestedApplied,
+      // Prose for the human reading the JSON, and only when there is something
+      // to explain: without --max-* flags the sentence said nothing.
+      ...(requestedBudgets
+        ? {
+            note: "Saved investigation budgets govern --diff; the --max-* flags recorded here were not applied to the fresh side.",
+          }
+        : {}),
     },
     added: {
       entities: addedEntities,
@@ -864,10 +940,61 @@ interface InvestigationDiff {
     saved: BudgetSnapshot;
     requested?: Partial<BudgetSnapshot>;
     effective: BudgetSnapshot;
-    note: string;
+    /** Did `requested` govern the fresh side? The testable form of `note`. */
+    requestedApplied: boolean;
+    /** Present only when `requested` is: without it there is nothing to explain. */
+    note?: string;
   };
   added: { entities: ContextBundle["entities"]; relationships: ContextBundle["relationships"]; evidence: EvidenceItem[]; claims: ContextBundle["claims"] };
   removed: { entities: ContextBundle["entities"]; relationships: ContextBundle["relationships"]; evidence: EvidenceItem[]; claims: ContextBundle["claims"] };
+}
+
+/** Which side of a comparison a record is on, or neither for a plain bundle. */
+type RecordChange = "added" | "removed" | undefined;
+
+/**
+ * The `entity`, `evidence` and `claim` records, built in one place.
+ *
+ * `ix context <target> --format llm` and `ix context --diff <id> --format llm`
+ * are the same command and emitted two different grammars for the same record
+ * kind: the bundle renderer built `evidence 30 relationship <title>` from a
+ * template literal, positional and unquoted, so a title with a space in it —
+ * which is every title — split into tokens no consumer could reassemble. These
+ * builders are the keyed form, and `llmQuote` handles the spaces and newlines.
+ *
+ * `change` is dropped when absent (`llmField` drops nullish), so the plain
+ * bundle emits the same record without it.
+ */
+function entityRecord(change: RecordChange) {
+  return (e: ContextBundle["entities"][number]): string =>
+    llmLine("entity", {
+      change,
+      // Relationship records name their endpoints by entity id, so this is
+      // what lets a reader resolve `src=`/`dst=` to something it has seen.
+      id: e.id,
+      kind: e.kind,
+      name: e.name,
+      path: e.path,
+      // Only when true: `stale=false` on every entity is noise, and `llmField`
+      // renders a boolean rather than dropping it.
+      stale: e.stale || undefined,
+    });
+}
+
+function evidenceRecord(change: RecordChange) {
+  return (e: EvidenceItem): string =>
+    llmLine("evidence", { change, score: e.score, kind: e.kind, title: e.title });
+}
+
+function claimRecord(change: RecordChange) {
+  return (c: ContextBundle["claims"][number]): string =>
+    llmLine("claim", {
+      change,
+      id: c.id,
+      entity: c.entityId,
+      status: c.status,
+      statement: c.statement,
+    });
 }
 
 export function renderInvestigationDiff(
@@ -897,19 +1024,32 @@ export function renderInvestigationDiff(
     // record per line invariant.
     printLlmLines([
       llmLine("diff", {
-        investigation: saved.id,
+        investigation: unsanitizeId(saved.id),
         target: fresh.target.name,
+        // How old the saved side is. `freshness_previous=current` says the
+        // snapshot was fresh when it was taken, not when that was — and a
+        // snapshot from five minutes ago and one from three months ago are the
+        // same word. Both timestamps are on the JSON diff; only the prose
+        // renderer showed them, so the llm stream was the one surface that
+        // could not tell how stale the comparison's own baseline is.
+        saved_at: diff.savedAt,
+        generated_at: diff.generatedAt,
         freshness_previous: prev.freshness.classification,
         freshness_current: fresh.freshness.classification,
       }),
       // Which budgets governed the comparison. `scope=requested` appears
-      // only when --max-* flags were passed, and carries `applied=false`
-      // rather than a sentence explaining itself: the precedence rule is
-      // that saved budgets govern --diff, and a field an agent can test
-      // beats a note it has to read.
+      // only when --max-* flags were passed, and carries `applied=` rather
+      // than a sentence explaining itself: the precedence rule is that saved
+      // budgets govern --diff, and a field an agent can test beats a note it
+      // has to read. `effective` is read off the bundle that was built, so it
+      // is a report and not a restatement of `saved`.
       llmLine("budgets", { scope: "saved", ...budgetFields(diff.budgets.saved) }),
       ...(diff.budgets.requested
-        ? [llmLine("budgets", { scope: "requested", ...budgetFields(diff.budgets.requested), applied: false })]
+        ? [llmLine("budgets", {
+            scope: "requested",
+            ...budgetFields(diff.budgets.requested),
+            applied: diff.budgets.requestedApplied,
+          })]
         : []),
       llmLine("budgets", { scope: "effective", ...budgetFields(diff.budgets.effective) }),
       // One record rather than eight, and the zeros are kept: "nothing was
@@ -928,14 +1068,25 @@ export function renderInvestigationDiff(
       // `change=` rather than a `+`/`-` prefix on the record kind: a consumer
       // routing on the kind should still match `entity` on both sides of the
       // comparison, and a fused marker means it matches neither.
-      ...diff.added.entities.map((e) => llmLine("entity", { change: "added", kind: e.kind, name: e.name })),
-      ...diff.removed.entities.map((e) => llmLine("entity", { change: "removed", kind: e.kind, name: e.name })),
+      //
+      // `id=` on entities is what makes the stream joinable. Relationship
+      // records name their endpoints by entity id, so without it
+      // `relationship src=entity-1 dst=entity-2` resolves to nothing a reader
+      // has seen and an added entity cannot be matched to the edge that
+      // involves it. `--format json` loses none of this, and llm carrying less
+      // than the format it is meant to replace is the wrong trade.
+      ...diff.added.entities.map(entityRecord("added")),
+      ...diff.removed.entities.map(entityRecord("removed")),
       ...diff.added.relationships.map((r) => llmLine("relationship", { change: "added", src: r.src, pred: r.predicate, dst: r.dst })),
       ...diff.removed.relationships.map((r) => llmLine("relationship", { change: "removed", src: r.src, pred: r.predicate, dst: r.dst })),
-      ...diff.added.evidence.map((e) => llmLine("evidence", { change: "added", score: e.score, kind: e.kind, title: e.title })),
-      ...diff.removed.evidence.map((e) => llmLine("evidence", { change: "removed", score: e.score, kind: e.kind, title: e.title })),
-      ...diff.added.claims.map((c) => llmLine("claim", { change: "added", id: c.id, status: c.status })),
-      ...diff.removed.claims.map((c) => llmLine("claim", { change: "removed", id: c.id, status: c.status })),
+      ...diff.added.evidence.map(evidenceRecord("added")),
+      ...diff.removed.evidence.map(evidenceRecord("removed")),
+      // `statement=` is the field that says what changed. The id is the
+      // backend's (`c-8f31a2`), so `claim change=added id=c-8f31a2
+      // status=active` told a reader that a claim changed and not what it
+      // says. The test fixture hid it by fabricating `claim-<statement>` ids.
+      ...diff.added.claims.map(claimRecord("added")),
+      ...diff.removed.claims.map(claimRecord("removed")),
     ]);
     return;
   }
@@ -983,7 +1134,7 @@ interface BuildInput {
   provenance: unknown;
   asOfRev?: number;
   depth?: string;
-  budgets: { maxEntities: number; maxRelationships: number; maxEvidence: number; maxChars: number };
+  budgets: BudgetSnapshot;
   /**
    * Per-entity staleness probe. Injected so buildBundle stays a pure function
    * under test; production passes nothing and gets the real baseline-backed one.
@@ -1248,31 +1399,42 @@ function rankEvidence(input: {
   return items.sort((a, b) => a.score - b.score || cmp(a.id, b.id));
 }
 
-function renderBundle(bundle: ContextBundle, format: string): void {
+export function renderBundle(bundle: ContextBundle, format: string): void {
   if (format === "json") {
     console.log(JSON.stringify(bundle, null, 2));
     return;
   }
   if (format === "llm") {
+    // Every line through `llmLine`, none through a template literal. This block
+    // built `target=${name}` and `evidence 30 relationship <title>` by
+    // interpolation: the first breaks on any name containing a space or an `=`,
+    // and the second is positional, unquoted, and breaks on every title, which
+    // is a sentence. `ix context --diff --format llm` emits the keyed form for
+    // the same record kinds, so a consumer routing on `evidence` from the same
+    // command was handed two grammars.
     printLlmLines([
-      `target=${bundle.target.name}`,
-      `target_kind=${bundle.target.kind}`,
-      `stale=${bundle.freshness.stale}`,
-      `classification=${bundle.freshness.classification}`,
-      `entities=${bundle.entities.length}`,
-      `relationships=${bundle.relationships.length}`,
-      `claims=${bundle.claims.length}`,
-      `decisions=${bundle.decisions.length}`,
-      `conflicts=${bundle.conflicts.length}`,
-      `intents=${bundle.intents.length}`,
-      `evidence=${bundle.evidence.length}`,
-      `truncated_entities=${bundle.truncation.entitiesTruncated}`,
-      `truncated_relationships=${bundle.truncation.relationshipsTruncated}`,
-      `truncated_evidence=${bundle.truncation.evidenceTruncated}`,
-      `truncated_chars=${bundle.truncation.charactersTruncated}`,
-      ...bundle.evidence.map(
-        (item) => `evidence ${item.score} ${item.kind} ${item.title.replaceAll("\n", " ")}`,
-      ),
+      llmLine("context", {
+        target: bundle.target.name,
+        target_kind: bundle.target.kind,
+        stale: bundle.freshness.stale,
+        classification: bundle.freshness.classification,
+        entities: bundle.entities.length,
+        relationships: bundle.relationships.length,
+        claims: bundle.claims.length,
+        decisions: bundle.decisions.length,
+        conflicts: bundle.conflicts.length,
+        intents: bundle.intents.length,
+        evidence: bundle.evidence.length,
+        truncated_entities: bundle.truncation.entitiesTruncated,
+        truncated_relationships: bundle.truncation.relationshipsTruncated,
+        truncated_evidence: bundle.truncation.evidenceTruncated,
+        truncated_chars: bundle.truncation.charactersTruncated,
+      }),
+      // Evidence only, as before. The entity, relationship and claim lists are
+      // deliberately still counts here: `--format llm` is the token-minimal
+      // surface, the ranked evidence is what it exists to deliver, and
+      // `--format json` carries the rest for a caller that wants it.
+      ...bundle.evidence.map(evidenceRecord(undefined)),
     ]);
     return;
   }
@@ -1319,12 +1481,6 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 function asString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
-}
-
-function clampInt(raw: string | undefined, min: number, max: number, fallback: number): number {
-  const parsed = raw ? parseInt(raw, 10) : NaN;
-  if (Number.isNaN(parsed)) return fallback;
-  return Math.min(max, Math.max(min, parsed));
 }
 
 function cmp(a: string, b: string): number {
