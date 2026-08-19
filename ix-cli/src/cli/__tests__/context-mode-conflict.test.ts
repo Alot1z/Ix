@@ -73,14 +73,19 @@ describe("detectContextModeConflict", () => {
     expect(msg).toMatch(/--resume cannot be combined with --out/);
   });
 
-  it("suggests --format json to --resume --out when format is non-json", () => {
-    const msg = detectContextModeConflict({
-      resume: "x",
-      out: "/tmp/x.json",
-      format: "llm",
-    });
-    expect(msg).toMatch(/--resume cannot be combined with --out/);
-    expect(msg).toMatch(/--format json with --out/);
+  it("never advises --resume --out to retry a combination it also rejects", () => {
+    // The hint used to be "use --format json with --out", which fires this same
+    // branch: the user did as they were told and got the identical error, this
+    // time with no advice at all. Whatever the message suggests must be
+    // something that is not itself refused here.
+    for (const format of ["text", "json", "llm"]) {
+      const msg = detectContextModeConflict({ resume: "x", out: "/tmp/x.json", format })!;
+      expect(msg).toMatch(/--resume cannot be combined with --out/);
+      expect(msg).not.toMatch(/--format json with --out/);
+      // And the way out it does name has to work.
+      expect(msg).toMatch(/>/);
+      expect(detectContextModeConflict({ resume: "x", format: "json" })).toBeUndefined();
+    }
   });
 
   it("flags --diff + --save (C-1)", () => {
@@ -141,6 +146,73 @@ describe("detectDiffModeConflict", () => {
     expect(a).toMatch(/--summary ignores --limit and --full/);
     const b = detectDiffModeConflict({ summary: true, full: true });
     expect(b).toMatch(/--summary ignores --limit and --full/);
+  });
+
+  it("names --summary, not --full, when all three are passed", () => {
+    // Only the two-flag pairs were covered, and the three-flag case took the
+    // `--full && --limit` branch: the user was told to drop one of two flags
+    // that `--summary` was going to ignore anyway, while the message naming the
+    // flag actually in charge was unreachable for this input.
+    const msg = detectDiffModeConflict({ summary: true, full: true, limit: "20" });
+    expect(msg).toMatch(/--summary ignores --limit and --full/);
+    expect(msg).not.toMatch(/--full and --limit cannot be combined/);
+  });
+});
+
+/**
+ * The gap the detectors are for is a flag the user typed doing nothing. A flag
+ * added later with no rule written for it reopens exactly that gap, silently:
+ * `ContextModeOptions` was a hand-copied five-field shape, `--list` was added
+ * to `ContextOptions` on a sibling branch, and neither the typechecker nor any
+ * test noticed the detector could not see it.
+ *
+ * So one side of this comes from the live Commander registration and the other
+ * is hand-listed. Two hand-lists can be wrong together; a list checked against
+ * the command cannot be. Adding an option to `ix context` fails here until it
+ * is classified — a mode flag with a rule, or a build knob.
+ */
+describe("mode-flag coverage does not drift from the command", () => {
+  /** Flags that select what the command does, or where its output goes. */
+  const CONTEXT_MODE_FLAGS = ["out", "save", "resume", "diff"] as const;
+  /** Flags that shape the bundle a mode produces; any pair of these is legal. */
+  const CONTEXT_BUILD_FLAGS = [
+    "kind", "path", "pick", "depth", "asOfRev",
+    "maxEntities", "maxRelationships", "maxEvidence", "maxChars", "format",
+  ];
+
+  function registeredAttributes(register: (p: Command) => void, name: string): string[] {
+    const program = new Command();
+    program.name("ix").exitOverride();
+    register(program);
+    const cmd = program.commands.find((c) => c.name() === name)!;
+    return cmd.options.map((o) => o.attributeName()).sort();
+  }
+
+  it("classifies every option ix context registers", () => {
+    expect(registeredAttributes(registerContextCommand, "context")).toEqual(
+      [...CONTEXT_MODE_FLAGS, ...CONTEXT_BUILD_FLAGS].sort(),
+    );
+  });
+
+  it("refuses every pair of mode flags", () => {
+    for (const a of CONTEXT_MODE_FLAGS) {
+      for (const b of CONTEXT_MODE_FLAGS) {
+        if (a >= b) continue;
+        const opts = { [a]: "x", [b]: "y" } as Record<string, string>;
+        expect(
+          detectContextModeConflict(opts),
+          `no rule for --${a} + --${b}`,
+        ).toBeTruthy();
+      }
+    }
+  });
+
+  it("leaves every single mode flag alone", () => {
+    // The mirror of the above: a rule that fires on one flag would refuse the
+    // command's ordinary use, and a pair-only assertion cannot see that.
+    for (const flag of CONTEXT_MODE_FLAGS) {
+      expect(detectContextModeConflict({ [flag]: "x" })).toBeUndefined();
+    }
   });
 });
 

@@ -2,7 +2,6 @@ import type { Command } from "commander";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import chalk from "chalk";
 
 import {
   BUNDLE_SCHEMA,
@@ -20,7 +19,7 @@ import type {
 } from "../../client/types.js";
 import { getEndpoint } from "../config.js";
 import { collectFacts, type EntityFacts } from "../explain/facts.js";
-import { llmError, printLlmLines } from "../llm.js";
+import { printLlmLines, reportModeConflict } from "../llm.js";
 import { parsePickOption } from "../options.js";
 import { resolveFileOrEntity } from "../resolve.js";
 import { createStaleProbe } from "../stale.js";
@@ -138,7 +137,7 @@ export function registerContextCommand(program: Command): void {
     .action(async (target: string | undefined, opts: ContextOptions) => {
       const conflict = detectContextModeConflict(opts);
       if (conflict) {
-        reportContextModeConflict(conflict, opts.format);
+        reportModeConflict(conflict, opts.format);
         return;
       }
       if (opts.resume) {
@@ -271,18 +270,20 @@ async function buildFreshBundle(
 }
 
 
-/** Saved investigation state lives under ~/.ix/investigations. */
 /**
- * Subset of `ContextOptions` consumed by `detectContextModeConflict`. Kept as a
- * structural type so the detector can be unit-tested without driving Commander.
+ * The `ContextOptions` fields `detectContextModeConflict` consumes.
+ *
+ * `Pick`, not a hand-copied shape: the detector exists to stop a typed flag
+ * being a no-op, so its idea of the flags must come from the same declaration
+ * the action handler uses. Written out field-by-field it drifted immediately --
+ * `--list` was added to `ContextOptions` on a sibling branch and the detector
+ * could not see it, with nothing from the typechecker to say so. `Partial` so
+ * the pure function can still be called with one flag at a time in a test,
+ * without inventing a `format`.
  */
-export interface ContextModeOptions {
-  resume?: string;
-  diff?: string;
-  save?: string;
-  out?: string;
-  format?: string;
-}
+export type ContextModeOptions = Partial<
+  Pick<ContextOptions, "resume" | "diff" | "save" | "out" | "format">
+>;
 
 /**
  * Detect mutually-incompatible mode/output flags on `ix context` and return a
@@ -306,10 +307,14 @@ export function detectContextModeConflict(
     return "--resume cannot be combined with --save; --resume only renders a saved investigation, while --save writes a new one. Run --save on a fresh build instead.";
   }
   if (opts.resume && opts.out) {
+    // No "use --format json with --out" hint here. That hint was unactionable:
+    // this branch fires on `--resume` plus `--out` whatever the format, so a
+    // user who followed it landed straight back on the same error, this time
+    // with no advice at all. The two things that do work are a redirect and
+    // the saved file itself, so name those.
     return "--resume cannot be combined with --out; --resume renders to stdout."
-      + (opts.format && opts.format !== "json"
-        ? " Use --format json with --out if you need to persist the rendered output."
-        : "");
+      + " Redirect it (`ix context --resume <id> --format json > <path>`), or read"
+      + " IX_HOME/investigations/<id>.json, which is already the saved JSON.";
   }
   if (opts.diff && opts.save) {
     return "--diff cannot be combined with --save; --diff renders a comparison against a saved investigation. To persist the fresh side as a new investigation, run the fresh build without --diff and use --save there.";
@@ -323,21 +328,7 @@ export function detectContextModeConflict(
   return undefined;
 }
 
-/**
- * Render a detected mode conflict and mark the process exit code.
- *
- * `--format llm` gets the record form the rest of the CLI emits for errors —
- * `error code=... message="..."`, on stdout, with the exit code still non-zero
- * (imports.ts, trace.ts, smells.ts, locate.ts, callers.ts all do this, and
- * docs/llm-format.md specifies the shape). An agent is told to pass the flag
- * unconditionally, so an error it cannot read is an error it cannot act on.
- */
-export function reportContextModeConflict(message: string, format?: string): void {
-  if (format === "llm") console.log(llmError("mode_conflict", message));
-  else console.error(chalk.red("Error:"), message);
-  process.exitCode = 1;
-}
-
+/** Saved investigation state lives under ~/.ix/investigations. */
 function investigationDir(): string {
   // IX_HOME is the Ix home *directory*, not the investigations directory —
   // backend-status.ts, docker.ts and upgrade.ts all read it as `IX_HOME ||

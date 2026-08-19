@@ -10,7 +10,7 @@ import { IxClient } from "../../client/api.js";
 import { getEndpoint } from "../config.js";
 import { resolveFileOrEntity, resolveEntityFull, printResolved, looksFileLike, type ResolvedEntity } from "../resolve.js";
 import { formatDiff, relativePath } from "../format.js";
-import { llmLine, llmError } from "../llm.js";
+import { llmLine, llmError, reportModeConflict } from "../llm.js";
 import { parsePickOption } from "../options.js";
 
 /**
@@ -35,6 +35,13 @@ export interface DiffModeOptions {
  * explicit-conflict style in subsystems.ts. `--full --limit <n>` is also
  * flagged: `--full` is documented as "no limit" so the silent precedence over
  * `--limit` was the same kind of UX gap.
+ *
+ * Order is load-bearing, not incidental. `--summary` is the flag that wins at
+ * runtime, so when it is present its message is the one that names the flag
+ * actually in charge. Checking `--full --limit` first meant
+ * `ix diff 3 5 --summary --full --limit 20` reported "--full and --limit cannot
+ * be combined" -- two flags `--summary` was going to ignore anyway -- and the
+ * message that would have explained the run was unreachable for that input.
  */
 export function detectDiffModeConflict(
   opts: DiffModeOptions,
@@ -42,31 +49,16 @@ export function detectDiffModeConflict(
   if (opts.summary && opts.content) {
     return "--summary and --content cannot be combined; --summary renders counts only, --content renders the full textual diff. Pick one.";
   }
-  if (opts.full && opts.limit !== undefined) {
-    return "--full and --limit cannot be combined; --full is documented to return all changes without a limit. Drop --limit, or drop --full to keep the existing limit.";
-  }
   if (
     opts.summary &&
     (opts.full || opts.limit !== undefined)
   ) {
     return "--summary ignores --limit and --full; --summary is server-side counts only. Drop --summary to control change volume, or drop --limit/--full.";
   }
+  if (opts.full && opts.limit !== undefined) {
+    return "--full and --limit cannot be combined; --full is documented to return all changes without a limit. Drop --limit, or drop --full to keep the existing limit.";
+  }
   return undefined;
-}
-
-/**
- * Render a detected mode conflict and mark the process exit code.
- *
- * `--format llm` gets the record form the rest of the CLI emits for errors —
- * `error code=... message="..."`, on stdout, with the exit code still non-zero
- * (imports.ts, trace.ts, smells.ts, locate.ts, callers.ts all do this, and
- * docs/llm-format.md specifies the shape). An agent is told to pass the flag
- * unconditionally, so an error it cannot read is an error it cannot act on.
- */
-export function reportDiffModeConflict(message: string, format?: string): void {
-  if (format === "llm") console.log(llmError("mode_conflict", message));
-  else console.error(chalk.red("Error:"), message);
-  process.exitCode = 1;
 }
 
 /** Render a `--summary` diff as a single llm record. */
@@ -490,7 +482,7 @@ export function registerDiffCommand(program: Command): void {
     }) => {
       const conflict = detectDiffModeConflict(opts);
       if (conflict) {
-        reportDiffModeConflict(conflict, opts.format);
+        reportModeConflict(conflict, opts.format);
         return;
       }
       const client = new IxClient(getEndpoint());
