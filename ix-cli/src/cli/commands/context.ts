@@ -16,7 +16,7 @@ import type {
 } from "../../client/types.js";
 import { getEndpoint } from "../config.js";
 import { collectFacts, type EntityFacts } from "../explain/facts.js";
-import { printLlmLines } from "../llm.js";
+import { llmError, printLlmLines } from "../llm.js";
 import { parsePickOption } from "../options.js";
 import { resolveFileOrEntity } from "../resolve.js";
 import { createStaleProbe } from "../stale.js";
@@ -140,7 +140,7 @@ export function registerContextCommand(program: Command): void {
     .action(async (target: string | undefined, opts: ContextOptions) => {
       const conflict = detectContextModeConflict(opts);
       if (conflict) {
-        reportContextModeConflict(conflict);
+        reportContextModeConflict(conflict, opts.format);
         return;
       }
       if (opts.resume) {
@@ -325,9 +325,18 @@ export function detectContextModeConflict(
   return undefined;
 }
 
-/** Render a detected mode conflict and mark the process exit code. */
-export function reportContextModeConflict(message: string): void {
-  console.error(chalk.red("Error:"), message);
+/**
+ * Render a detected mode conflict and mark the process exit code.
+ *
+ * `--format llm` gets the record form the rest of the CLI emits for errors —
+ * `error code=... message="..."`, on stdout, with the exit code still non-zero
+ * (imports.ts, trace.ts, smells.ts, locate.ts, callers.ts all do this, and
+ * docs/llm-format.md specifies the shape). An agent is told to pass the flag
+ * unconditionally, so an error it cannot read is an error it cannot act on.
+ */
+export function reportContextModeConflict(message: string, format?: string): void {
+  if (format === "llm") console.log(llmError("mode_conflict", message));
+  else console.error(chalk.red("Error:"), message);
   process.exitCode = 1;
 }
 

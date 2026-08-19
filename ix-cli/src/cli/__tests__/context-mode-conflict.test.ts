@@ -167,10 +167,16 @@ function runProgram(
   const stderr: string[] = [];
   const origStdout = process.stdout.write.bind(process.stdout);
   const origErr = console.error;
+  // Both, and console.log is the one that matters: under vitest `console` is
+  // replaced wholesale, so it never reaches `process.stdout.write` and a
+  // capture that patches only the stream sees nothing — which makes
+  // `expect(stdout).toBe("")` pass no matter what the command printed.
+  const origLog = console.log;
   process.stdout.write = ((chunk: unknown) => {
     stdout.push(String(chunk));
     return true;
   }) as typeof process.stdout.write;
+  console.log = (...a: unknown[]) => void stdout.push(a.join(" ") + "\n");
   console.error = (...a: unknown[]) => void stderr.push(a.join(" "));
 
   let code: number | string | undefined;
@@ -184,6 +190,7 @@ function runProgram(
   } finally {
     code = process.exitCode;
     process.stdout.write = origStdout;
+    console.log = origLog;
     console.error = origErr;
   }
   return { stderr: stderr.join("\n"), stdout: stdout.join(""), exitCode: code };
@@ -218,6 +225,53 @@ describe("ix diff action surfaces mode conflicts on stderr and exits 1", () => {
     expect(r.stderr).toMatch(/^Error:/m);
     expect(r.stderr).toMatch(re);
     expect(r.stdout).toBe("");
+  });
+});
+
+describe("a caller that asked for records gets the error as a record", () => {
+  // An agent is told to pass `--format llm` unconditionally, so an error it
+  // cannot read is an error it cannot act on. Same shape the rest of the CLI
+  // emits (imports/trace/smells/locate/callers) and the one docs/llm-format.md
+  // specifies: on stdout, in-stream, exit code still non-zero.
+  it("emits an error record for ix context and keeps the exit code", () => {
+    const r = runProgram(registerContextCommand, [
+      "context",
+      "--resume",
+      "x",
+      "--diff",
+      "y",
+      "--format",
+      "llm",
+    ]);
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toMatch(/^error code=mode_conflict message="/);
+    // One record, on one line, with the message quoted rather than bare.
+    expect(r.stdout.trimEnd().split("\n")).toHaveLength(1);
+    expect(r.stderr).toBe("");
+  });
+
+  it("emits an error record for ix diff and keeps the exit code", () => {
+    const r = runProgram(registerDiffCommand, [
+      "diff",
+      "3",
+      "5",
+      "--summary",
+      "--content",
+      "--format",
+      "llm",
+    ]);
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toMatch(/^error code=mode_conflict message="/);
+    expect(r.stderr).toBe("");
+  });
+
+  it("still writes prose to stderr for every other format", () => {
+    for (const format of ["text", "json"]) {
+      const r = runProgram(registerContextCommand, ["context", "--resume", "x", "--diff", "y", "--format", format]);
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr).toMatch(/^Error:/m);
+      expect(r.stdout).toBe("");
+    }
   });
 });
 

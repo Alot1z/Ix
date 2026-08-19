@@ -7,6 +7,12 @@ import type { Command } from "commander";
 import chalk from "chalk";
 import { IxClient } from "../../client/api.js";
 
+import { getEndpoint } from "../config.js";
+import { resolveFileOrEntity, resolveEntityFull, printResolved, looksFileLike, type ResolvedEntity } from "../resolve.js";
+import { formatDiff, relativePath } from "../format.js";
+import { llmLine, llmError } from "../llm.js";
+import { parsePickOption } from "../options.js";
+
 /**
  * Subset of `DiffOptions` consumed by `detectDiffModeConflict`. Kept as a
  * structural type so the detector can be unit-tested without driving Commander.
@@ -48,16 +54,20 @@ export function detectDiffModeConflict(
   return undefined;
 }
 
-/** Render a detected mode conflict and mark the process exit code. */
-export function reportDiffModeConflict(message: string): void {
-  console.error(chalk.red("Error:"), message);
+/**
+ * Render a detected mode conflict and mark the process exit code.
+ *
+ * `--format llm` gets the record form the rest of the CLI emits for errors —
+ * `error code=... message="..."`, on stdout, with the exit code still non-zero
+ * (imports.ts, trace.ts, smells.ts, locate.ts, callers.ts all do this, and
+ * docs/llm-format.md specifies the shape). An agent is told to pass the flag
+ * unconditionally, so an error it cannot read is an error it cannot act on.
+ */
+export function reportDiffModeConflict(message: string, format?: string): void {
+  if (format === "llm") console.log(llmError("mode_conflict", message));
+  else console.error(chalk.red("Error:"), message);
   process.exitCode = 1;
 }
-import { getEndpoint } from "../config.js";
-import { resolveFileOrEntity, resolveEntityFull, printResolved, looksFileLike, type ResolvedEntity } from "../resolve.js";
-import { formatDiff, relativePath } from "../format.js";
-import { llmLine, llmError } from "../llm.js";
-import { parsePickOption } from "../options.js";
 
 /** Render a `--summary` diff as a single llm record. */
 function renderDiffSummaryLlm(result: any): string {
@@ -480,7 +490,7 @@ export function registerDiffCommand(program: Command): void {
     }) => {
       const conflict = detectDiffModeConflict(opts);
       if (conflict) {
-        reportDiffModeConflict(conflict);
+        reportDiffModeConflict(conflict, opts.format);
         return;
       }
       const client = new IxClient(getEndpoint());
