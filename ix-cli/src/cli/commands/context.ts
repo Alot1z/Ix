@@ -15,7 +15,7 @@ import type {
 } from "../../client/types.js";
 import { getEndpoint } from "../config.js";
 import { collectFacts, type EntityFacts } from "../explain/facts.js";
-import { printLlmLines } from "../llm.js";
+import { llmLine, printLlmLines } from "../llm.js";
 import { parsePickOption } from "../options.js";
 import { resolveFileOrEntity } from "../resolve.js";
 import { createStaleProbe } from "../stale.js";
@@ -447,32 +447,48 @@ export function renderInvestigationDiff(saved: SavedInvestigation, fresh: Contex
     return;
   }
   if (format === "llm") {
-    // `ix context --diff --format llm` previously fell through to the prose
-    // renderer below because the diff path only branched on `json`. That made
-    // the most common agent path (`--diff --format llm`) the worst one: the
-    // prose scaling was the whole reason `llm` exists. Mirror `renderBundle`'s
-    // llm branch and emit one record per line in the same `key=value` wire
-    // format the rest of the CLI uses.
+    // `ix context --diff --format llm` used to fall through to the prose
+    // renderer below, because this path only branched on `json`. That made the
+    // most common agent path the worst one: escaping the prose is what `llm`
+    // exists for.
+    //
+    // Every line goes through `llmLine`, never a template literal. The values
+    // here are the ones most likely to contain a space in the whole CLI — an
+    // evidence title is a sentence, and a claim id carries the statement — and
+    // `key=value` with an unquoted space is not a record a consumer can split.
+    // `llmQuote` also encodes newlines, so a title cannot break the one
+    // record per line invariant.
     printLlmLines([
-      `diff investigation=${saved.id} target=${fresh.target.name}`,
-      `freshness_previous=${prev.freshness.classification}`,
-      `freshness_current=${fresh.freshness.classification}`,
-      `count added_entities=${diff.added.entities.length}`,
-      `count removed_entities=${diff.removed.entities.length}`,
-      `count added_relationships=${diff.added.relationships.length}`,
-      `count removed_relationships=${diff.removed.relationships.length}`,
-      `count added_evidence=${diff.added.evidence.length}`,
-      `count removed_evidence=${diff.removed.evidence.length}`,
-      `count added_claims=${diff.added.claims.length}`,
-      `count removed_claims=${diff.removed.claims.length}`,
-      ...diff.added.entities.map((e) => `+entity kind=${e.kind} name=${e.name}`),
-      ...diff.removed.entities.map((e) => `-entity kind=${e.kind} name=${e.name}`),
-      ...diff.added.relationships.map((r) => `+relationship src=${r.src} pred=${r.predicate} dst=${r.dst}`),
-      ...diff.removed.relationships.map((r) => `-relationship src=${r.src} pred=${r.predicate} dst=${r.dst}`),
-      ...diff.added.evidence.map((e) => `+evidence score=${e.score} kind=${e.kind} title=${e.title.replaceAll("\n", " ")}`),
-      ...diff.removed.evidence.map((e) => `-evidence score=${e.score} kind=${e.kind} title=${e.title.replaceAll("\n", " ")}`),
-      ...diff.added.claims.map((c) => `+claim id=${(c as { id?: string }).id ?? ""}`),
-      ...diff.removed.claims.map((c) => `-claim id=${(c as { id?: string }).id ?? ""}`),
+      llmLine("diff", {
+        investigation: saved.id,
+        target: fresh.target.name,
+        freshness_previous: prev.freshness.classification,
+        freshness_current: fresh.freshness.classification,
+      }),
+      // One record rather than eight, and the zeros are kept: "nothing was
+      // added" is the answer to the question `--diff` was asked, so dropping
+      // it as a default would remove the signal.
+      llmLine("count", {
+        added_entities: diff.added.entities.length,
+        removed_entities: diff.removed.entities.length,
+        added_relationships: diff.added.relationships.length,
+        removed_relationships: diff.removed.relationships.length,
+        added_evidence: diff.added.evidence.length,
+        removed_evidence: diff.removed.evidence.length,
+        added_claims: diff.added.claims.length,
+        removed_claims: diff.removed.claims.length,
+      }),
+      // `change=` rather than a `+`/`-` prefix on the record kind: a consumer
+      // routing on the kind should still match `entity` on both sides of the
+      // comparison, and a fused marker means it matches neither.
+      ...diff.added.entities.map((e) => llmLine("entity", { change: "added", kind: e.kind, name: e.name })),
+      ...diff.removed.entities.map((e) => llmLine("entity", { change: "removed", kind: e.kind, name: e.name })),
+      ...diff.added.relationships.map((r) => llmLine("relationship", { change: "added", src: r.src, pred: r.predicate, dst: r.dst })),
+      ...diff.removed.relationships.map((r) => llmLine("relationship", { change: "removed", src: r.src, pred: r.predicate, dst: r.dst })),
+      ...diff.added.evidence.map((e) => llmLine("evidence", { change: "added", score: e.score, kind: e.kind, title: e.title })),
+      ...diff.removed.evidence.map((e) => llmLine("evidence", { change: "removed", score: e.score, kind: e.kind, title: e.title })),
+      ...diff.added.claims.map((c) => llmLine("claim", { change: "added", id: c.id, status: c.status })),
+      ...diff.removed.claims.map((c) => llmLine("claim", { change: "removed", id: c.id, status: c.status })),
     ]);
     return;
   }

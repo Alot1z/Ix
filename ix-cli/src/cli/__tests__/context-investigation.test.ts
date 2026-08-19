@@ -294,22 +294,20 @@ describe("ix context investigation state", () => {
 
       const lines = captureLog(() => renderInvestigationDiff(stored, fresh, "llm"));
 
-      expect(lines[0]).toBe("diff investigation=widget-llm target=Widget");
-      expect(lines).toContain("freshness_previous=current");
-      expect(lines).toContain("freshness_current=current");
-      expect(lines).toContain("count added_entities=0");
-      expect(lines).toContain("count removed_entities=0");
-      expect(lines).toContain("count added_relationships=0");
-      expect(lines).toContain("count removed_relationships=0");
-      expect(lines).toContain("count added_evidence=0");
-      expect(lines).toContain("count removed_evidence=0");
-      expect(lines).toContain("count added_claims=0");
-      expect(lines).toContain("count removed_claims=0");
+      expect(lines[0]).toBe(
+        "diff investigation=widget-llm target=Widget freshness_previous=current freshness_current=current",
+      );
+      // Zero is the answer to the question --diff was asked, so it is carried
+      // rather than dropped as a default.
+      expect(lines[1]).toBe(
+        "count added_entities=0 removed_entities=0 added_relationships=0 removed_relationships=0" +
+          " added_evidence=0 removed_evidence=0 added_claims=0 removed_claims=0",
+      );
       // No `renderSection` lines means we did not fall back to prose.
       expect(lines.some((l) => l.startsWith("==") || l.startsWith("  "))).toBe(false);
     });
 
-    it("lists added/removed entities, relationships, evidence and claims with +/- prefixes", () => {
+    it("lists added and removed entities, relationships, evidence and claims", () => {
       const saved = bundleWith([makeClaim("renders to DOM", 0.9)]);
       saveInvestigation("widget-llm-busy", saved);
       const stored = loadInvestigation("widget-llm-busy")!;
@@ -363,36 +361,30 @@ describe("ix context investigation state", () => {
       // skolem IDs are `claim:<claim_id>` and
       // `relationship:<src>:<dst>:<predicate>`, so a stale predicate in the
       // ranked evidence list yields a real added/removed pair.
-      expect(lines).toContain("count added_entities=1");
-      expect(lines).toContain("count removed_entities=0");
-      expect(lines).toContain("count added_relationships=1");
-      expect(lines).toContain("count removed_relationships=1");
-      expect(lines).toContain("count added_evidence=2");
-      expect(lines).toContain("count removed_evidence=1");
-      expect(lines).toContain("count added_claims=1");
-      expect(lines).toContain("count removed_claims=0");
+      expect(lines[1]).toBe(
+        "count added_entities=1 removed_entities=0 added_relationships=1 removed_relationships=1" +
+          " added_evidence=2 removed_evidence=1 added_claims=1 removed_claims=0",
+      );
 
-      // Items tagged with +/- so an agent can route without parsing prose.
-      expect(lines).toContain("+entity kind=method name=mount");
-      expect(lines).toContain("-relationship src=entity-1 pred=calls dst=entity-2");
-      expect(lines).toContain("+relationship src=entity-1 pred=holds dst=entity-3");
-      expect(lines).toContain("+claim id=claim-mounts to DOM");
-      expect(
-        lines.some(
-          (l) =>
-            l.startsWith("+evidence ") &&
-            l.includes("kind=relationship") &&
-            l.includes("entity-1 --holds--> entity-3"),
-        ),
-      ).toBe(true);
-      expect(
-        lines.some(
-          (l) =>
-            l.startsWith("-evidence ") &&
-            l.includes("kind=relationship") &&
-            l.includes("entity-1 --calls--> entity-2"),
-        ),
-      ).toBe(true);
+      // The change is a field, not a prefix fused to the record kind, so a
+      // consumer routing on `entity` matches both sides of the comparison.
+      expect(lines).toContain("entity change=added kind=method name=mount");
+      expect(lines).toContain("relationship change=removed src=entity-1 pred=calls dst=entity-2");
+      expect(lines).toContain("relationship change=added src=entity-1 pred=holds dst=entity-3");
+
+      // A claim id carries the statement, so it contains spaces — quoted, per
+      // docs/llm-format.md. Unquoted, `id=claim-mounts to DOM` is three tokens
+      // and a consumer reads the id as `claim-mounts`.
+      expect(lines).toContain('claim change=added id="claim-mounts to DOM" status=active');
+
+      // An evidence title is a sentence. Same rule, and the reason the value
+      // must never be built with a template literal.
+      expect(lines).toContain(
+        'evidence change=added score=30 kind=relationship title="entity-1 --holds--> entity-3"',
+      );
+      expect(lines).toContain(
+        'evidence change=removed score=30 kind=relationship title="entity-1 --calls--> entity-2"',
+      );
 
       // One record per line — the wire format invariant.
       for (const line of lines) expect(line).not.toContain("\n");
