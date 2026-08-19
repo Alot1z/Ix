@@ -109,6 +109,34 @@ describe("detectContextModeConflict", () => {
       expect(detectContextModeConflict({ resume: "x", ...other })).toMatch(/--resume/);
     }
   });
+
+  it("flags --list + --resume, which its own guard could never reach", () => {
+    // `--list`'s guard named `--resume`, but it sat below `if (opts.resume)`,
+    // which returns first. `ix context --list --resume widget` rendered one
+    // investigation, exited 0, and never said the listing had been dropped.
+    // Checked before any mode branch, that race cannot happen.
+    expect(detectContextModeConflict({ list: true, resume: "x" })).toMatch(
+      /--list and --resume cannot be combined/,
+    );
+  });
+
+  it("flags --list + --out, which nothing checked at all", () => {
+    // `ix context --list --out /tmp/list.json` listed to stdout, wrote no file,
+    // and exited 0 — the silent-ignore gap this detector exists to close, on
+    // the newest flag on the command it guards.
+    expect(detectContextModeConflict({ list: true, out: "/tmp/list.json" })).toMatch(
+      /--list cannot be combined with --out/,
+    );
+  });
+
+  it("flags a positional target alongside --list", () => {
+    // A positional is as ignorable as a flag: `ix context Widget --list`
+    // dropped the target with nothing said.
+    expect(detectContextModeConflict({ list: true }, "Widget")).toMatch(/--list takes no target/);
+    // …and a target without --list is the ordinary path.
+    expect(detectContextModeConflict({}, "Widget")).toBeUndefined();
+    expect(detectContextModeConflict({ list: true })).toBeUndefined();
+  });
 });
 
 describe("detectDiffModeConflict", () => {
@@ -173,7 +201,7 @@ describe("detectDiffModeConflict", () => {
  */
 describe("mode-flag coverage does not drift from the command", () => {
   /** Flags that select what the command does, or where its output goes. */
-  const CONTEXT_MODE_FLAGS = ["out", "save", "resume", "diff"] as const;
+  const CONTEXT_MODE_FLAGS = ["out", "save", "resume", "diff", "list"] as const;
   /** Flags that shape the bundle a mode produces; any pair of these is legal. */
   const CONTEXT_BUILD_FLAGS = [
     "kind", "path", "pick", "depth", "asOfRev",
@@ -276,6 +304,11 @@ describe("ix context action surfaces mode conflicts on stderr and exits 1", () =
     { args: ["context", "--diff", "x", "--save", "y"], expect: /--diff cannot be combined with --save/ },
     { args: ["context", "--diff", "x", "--out", "/tmp/x.json"], expect: /--diff cannot be combined with --out/ },
     { args: ["context", "--save", "y", "--out", "/tmp/x.json"], expect: /--save and --out cannot be combined/ },
+    { args: ["context", "--list", "--resume", "x"], expect: /--list and --resume cannot be combined/ },
+    { args: ["context", "--list", "--diff", "x"], expect: /--list and --diff cannot be combined/ },
+    { args: ["context", "--list", "--save", "y"], expect: /--list cannot be combined with --save/ },
+    { args: ["context", "--list", "--out", "/tmp/x.json"], expect: /--list cannot be combined with --out/ },
+    { args: ["context", "Widget", "--list"], expect: /--list takes no target/ },
   ])("ix $args → stderr matches $expect and exit code is 1", ({ args, expect: re }) => {
     const r = runProgram(registerContextCommand, args);
     expect(r.exitCode).toBe(1);

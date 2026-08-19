@@ -137,7 +137,7 @@ export function registerContextCommand(program: Command): void {
       "\nExamples:\n  ix context IngestionService\n  ix context src/main.ts --format json\n  ix context Widget --max-entities 20 --max-evidence 10\n  ix context Widget --save widget-investigation\n  ix context --resume widget-investigation\n  ix context --diff widget-investigation\n  ix context --list",
     )
     .action(async (target: string | undefined, opts: ContextOptions) => {
-      const conflict = detectContextModeConflict(opts);
+      const conflict = detectContextModeConflict(opts, target);
       if (conflict) {
         reportModeConflict(conflict, opts.format);
         return;
@@ -147,14 +147,9 @@ export function registerContextCommand(program: Command): void {
         return;
       }
       if (opts.list) {
-        if (opts.save || opts.diff || opts.resume) {
-          // A refusal exits non-zero, the way `refuseInvestigation` does two
-          // functions down and the way the sibling commands do: a warning with
-          // a success status tells a script the listing it never got was fine.
-          renderWarning("--list cannot be combined with --save, --diff or --resume.");
-          process.exitCode = 1;
-          return;
-        }
+        // No guard of its own: every combination it used to check is refused
+        // above, before any mode branch can return first. The old one lived
+        // here, below `if (opts.resume)`, so its `--resume` arm was dead.
         const listed = listInvestigations();
         renderInvestigationList(listed.saved, listed.skipped, opts.format);
         return;
@@ -297,7 +292,7 @@ async function buildFreshBundle(
  * without inventing a `format`.
  */
 export type ContextModeOptions = Partial<
-  Pick<ContextOptions, "resume" | "diff" | "save" | "out" | "format">
+  Pick<ContextOptions, "resume" | "diff" | "save" | "out" | "list" | "format">
 >;
 
 /**
@@ -311,10 +306,37 @@ export type ContextModeOptions = Partial<
  * well-defined combined behaviour. Catching these combinations up front and
  * surfacing them as a hard error mirrors the explicit-conflict style in
  * subsystems.ts and prevents the user's typed flag from being a no-op.
+ *
+ * `--list` is checked here rather than inside the list branch, and that is the
+ * point rather than tidiness. Its own guard sat below `if (opts.resume)`, which
+ * returns first, so the `--list --resume` arm of it could never fire: the user
+ * asked for a listing, silently got one investigation rendered, and the exit
+ * code said it went fine. A guard that runs before every mode branch cannot
+ * lose that race.
+ *
+ * `target` is a parameter because a positional is as ignorable as a flag:
+ * `ix context Widget --list` dropped the target with nothing said.
  */
 export function detectContextModeConflict(
   opts: ContextModeOptions,
+  target?: string,
 ): string | undefined {
+  if (opts.list && target) {
+    return `--list takes no target; it enumerates every saved investigation. Drop "${target}", or drop --list to build a fresh bundle for it.`;
+  }
+  if (opts.list && opts.resume) {
+    return "--list and --resume cannot be combined; --list enumerates saved investigations, --resume renders one. Run --list first, then --resume the id you want.";
+  }
+  if (opts.list && opts.diff) {
+    return "--list and --diff cannot be combined; --list enumerates saved investigations, --diff compares one against a fresh build.";
+  }
+  if (opts.list && opts.save) {
+    return "--list cannot be combined with --save; --list reads saved investigations, --save writes one, and --list builds no bundle to write.";
+  }
+  if (opts.list && opts.out) {
+    return "--list cannot be combined with --out; --list enumerates to stdout."
+      + " Redirect it (`ix context --list --format json > <path>`) if you need the listing on disk.";
+  }
   if (opts.resume && opts.diff) {
     return "--resume and --diff cannot be combined; --resume renders a saved investigation, --diff renders a comparison against one.";
   }
@@ -379,6 +401,29 @@ export function sanitizeId(id: string): string {
   }
   if (out.startsWith(".")) out = `~2E${out.slice(1)}`;
   return out || "unnamed";
+}
+
+/**
+ * Recover the id the user typed from the id stored on disk.
+ *
+ * `sanitizeId` is injective and deliberately *not* idempotent — it encodes `~`
+ * as `~7E` precisely so a raw `~` cannot be confused with an escape — so the
+ * stored form is the wrong thing to hand back to the user. `ix context --list`
+ * printed it anyway, next to "Resume with: ix context --resume <id>", and
+ * `--resume` sanitizes what it is given: an id saved as `widget/auth` was
+ * listed as `widget~2Fauth`, and resuming that looked for `widget~7E2Fauth`,
+ * which does not exist. `saveInvestigation`'s own note echoes the id the user
+ * typed, so the two affordances contradicted each other.
+ *
+ * `sanitizeId(unsanitizeId(stored)) === stored` for every id this CLI wrote,
+ * which is what makes the listed id usable. A hand-written file whose id is
+ * outside `sanitizeId`'s range has no input that reaches it and is not a case
+ * this recovers.
+ */
+export function unsanitizeId(stored: string): string {
+  return stored.replace(/~([0-9A-Fa-f]{2})/g, (_m, hex: string) =>
+    String.fromCharCode(parseInt(hex, 16)),
+  );
 }
 
 export function saveInvestigation(id: string, bundle: ContextBundle): void {
@@ -482,23 +527,58 @@ export function listInvestigations(): { saved: SavedInvestigation[]; skipped: nu
   return { saved: out, skipped };
 }
 
+/** One saved investigation as `--list` describes it: what it is, not what is in it. */
+interface InvestigationSummary {
+  /** The id to type back, not the id on disk — see `unsanitizeId`. */
+  id: string;
+  savedAt: string;
+  target: { name: string; kind: string };
+  freshness: ContextBundle["freshness"];
+  counts: { entities: number; relationships: number; evidence: number };
+  truncation: ContextBundle["truncation"];
+}
+
+/** Summarise one saved investigation for the listing. */
+function summariseInvestigation(s: SavedInvestigation): InvestigationSummary {
+  const b = s.bundle;
+  return {
+    id: unsanitizeId(s.id),
+    savedAt: s.savedAt,
+    target: { name: b.target.name, kind: b.target.kind },
+    freshness: b.freshness,
+    counts: {
+      entities: b.entities.length,
+      relationships: b.relationships.length,
+      evidence: b.evidence.length,
+    },
+    truncation: b.truncation,
+  };
+}
+
 /**
  * Render the saved investigations produced by `listInvestigations`.
  *
- * JSON stays the array of saved envelopes; llm emits a summary record and one
- * record per investigation; text prints the tabular summary.
+ * Every format carries the same summary: what each investigation is, how big
+ * it is, and how stale. Not the bundles themselves — `--list` is the discovery
+ * step, and twenty saved investigations is twenty complete bundles, up to 50
+ * entities, 100 relationships and 12000 characters of evidence each. A caller
+ * that wants one of them asks for it by id with `--resume <id> --format json`.
  *
  * `skipped` is reported in each format's own terms, and never on stdout except
- * as a field. It used to be a `renderWarning` inside the enumerator — which is
- * `console.log` — so a single corrupt file prepended a chalk-coloured prose
- * line to the payload and `ix context --list --format json | jq` failed on it.
- * The human warning goes to stderr; the machine formats carry a count.
+ * as a field — including in `json`, which returns an object for exactly that
+ * reason: an array has nowhere to put it, so a machine caller could not tell
+ * that files had been rejected while the human saw a warning saying so. It used
+ * to be a `renderWarning` inside the enumerator — which is `console.log` — so a
+ * single corrupt file prepended a chalk-coloured prose line to the payload and
+ * `ix context --list --format json | jq` failed on it. The human warning goes to
+ * stderr; the machine formats carry a count.
  */
 export function renderInvestigationList(
   items: SavedInvestigation[],
   skipped: number,
   format: string,
 ): void {
+  const summaries = items.map(summariseInvestigation);
   if (skipped > 0 && format !== "llm") {
     // `console.error`, not `renderWarning`: every renderer in ui.ts writes to
     // stdout, which is exactly how this line used to end up inside the JSON a
@@ -511,57 +591,56 @@ export function renderInvestigationList(
     );
   }
   if (format === "json") {
-    console.log(JSON.stringify(items, null, 2));
+    console.log(JSON.stringify({ investigations: summaries, skipped }, null, 2));
     return;
   }
   if (format === "llm") {
     printLlmLines([
       // `skipped` is a field rather than a warning: it is the one thing about
       // the listing an agent cannot see from the records themselves.
-      llmLine("investigations", { total: items.length, skipped: skipped || undefined }),
-      ...items.map((s) =>
+      llmLine("investigations", { total: summaries.length, skipped: skipped || undefined }),
+      ...summaries.map((s) =>
         llmLine("investigation", {
           id: s.id,
           saved_at: s.savedAt,
-          target: s.bundle.target.name,
-          target_kind: s.bundle.target.kind,
-          classification: s.bundle.freshness.classification,
-          stale: s.bundle.freshness.stale,
-          entities: s.bundle.entities.length,
-          relationships: s.bundle.relationships.length,
-          evidence: s.bundle.evidence.length,
-          truncated_entities: s.bundle.truncation.entitiesTruncated,
-          truncated_relationships: s.bundle.truncation.relationshipsTruncated,
-          truncated_evidence: s.bundle.truncation.evidenceTruncated,
-          truncated_chars: s.bundle.truncation.charactersTruncated,
+          target: s.target.name,
+          target_kind: s.target.kind,
+          classification: s.freshness.classification,
+          stale: s.freshness.stale,
+          entities: s.counts.entities,
+          relationships: s.counts.relationships,
+          evidence: s.counts.evidence,
+          truncated_entities: s.truncation.entitiesTruncated,
+          truncated_relationships: s.truncation.relationshipsTruncated,
+          truncated_evidence: s.truncation.evidenceTruncated,
+          truncated_chars: s.truncation.charactersTruncated,
         }),
       ),
     ]);
     return;
   }
 
-  if (items.length === 0) {
+  if (summaries.length === 0) {
     renderNote("No saved investigations. Use `ix context <target> --save <id>` to create one.");
     return;
   }
-  renderSection(`Saved investigations (${items.length})`);
-  for (const s of items) {
-    const b = s.bundle;
+  renderSection(`Saved investigations (${summaries.length})`);
+  for (const s of summaries) {
     console.log(`  ${s.id}`);
-    console.log(`    target:       ${b.target.name} (${b.target.kind})`);
+    console.log(`    target:       ${s.target.name} (${s.target.kind})`);
     console.log(`    saved_at:     ${s.savedAt}`);
-    console.log(`    freshness:    ${b.freshness.classification}`);
+    console.log(`    freshness:    ${s.freshness.classification}`);
     console.log(
-      `    counts:       entities=${b.entities.length} relationships=${b.relationships.length} evidence=${b.evidence.length}`,
+      `    counts:       entities=${s.counts.entities} relationships=${s.counts.relationships} evidence=${s.counts.evidence}`,
     );
     if (
-      b.truncation.entitiesTruncated ||
-      b.truncation.relationshipsTruncated ||
-      b.truncation.evidenceTruncated ||
-      b.truncation.charactersTruncated
+      s.truncation.entitiesTruncated ||
+      s.truncation.relationshipsTruncated ||
+      s.truncation.evidenceTruncated ||
+      s.truncation.charactersTruncated
     ) {
       console.log(
-        `    truncated:    entities=${b.truncation.entitiesTruncated} relationships=${b.truncation.relationshipsTruncated} evidence=${b.truncation.evidenceTruncated} chars=${b.truncation.charactersTruncated}`,
+        `    truncated:    entities=${s.truncation.entitiesTruncated} relationships=${s.truncation.relationshipsTruncated} evidence=${s.truncation.evidenceTruncated} chars=${s.truncation.charactersTruncated}`,
       );
     }
   }

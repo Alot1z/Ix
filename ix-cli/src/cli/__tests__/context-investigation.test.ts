@@ -426,15 +426,87 @@ describe("ix context investigation state", () => {
   // Without it, neither humans nor agents can see what they have stored —
   // the only path was reading the JSON files directly.
   describe("listInvestigations", () => {
+    /**
+     * Run `fn` with stdout and stderr captured separately.
+     *
+     * One helper for the whole block, and multi-arg calls joined with a space
+     * the way a terminal shows them: the two ad-hoc capturers this replaces
+     * disagreed on that (one joined, one pushed each argument as its own line),
+     * so identical output produced different arrays depending on which test you
+     * happened to be reading.
+     */
+    const captureStreams = (fn: () => void) => {
+      const out: string[] = [];
+      const err: string[] = [];
+      const origLog = console.log;
+      const origErr = console.error;
+      console.log = (...a: unknown[]) => void out.push(a.join(" "));
+      console.error = (...a: unknown[]) => void err.push(a.join(" "));
+      try {
+        fn();
+      } finally {
+        console.log = origLog;
+        console.error = origErr;
+      }
+      return { out: out.join("\n"), err: err.join("\n") };
+    };
+
+    /** Restamp a saved investigation's `savedAt`, leaving everything else alone. */
+    const stampSavedAt = (id: string, savedAt: string) => {
+      const path = join(investigationsDir(), `${id}.json`);
+      const state = JSON.parse(readFileSync(path, "utf8"));
+      writeFileSync(path, JSON.stringify({ ...state, savedAt }), "utf8");
+    };
+
     it("returns saved investigations newest-first", () => {
+      // The timestamps are set explicitly because `saveInvestigation` stamps
+      // them from the clock and three writes inside one millisecond is the
+      // ordinary case, not the rare one. The previous version of this test
+      // asserted `saved[0].id === "widget-a" || saved[0].id === "widget-b"` and
+      // called `.sort()` on the ids before comparing them, so it was true for
+      // either order: inverting the comparator left every assertion green and
+      // ordering — the function's whole stated purpose — had no coverage.
       saveInvestigation("widget-a", bundleWith([makeClaim("renders to DOM", 0.9)]));
       saveInvestigation("widget-b", bundleWith([makeClaim("mounts to DOM", 0.7)]));
+      saveInvestigation("widget-c", bundleWith([makeClaim("unmounts cleanly", 0.5)]));
+      stampSavedAt("widget-a", "2026-01-02T00:00:00.000Z");
+      stampSavedAt("widget-b", "2026-01-03T00:00:00.000Z");
+      stampSavedAt("widget-c", "2026-01-01T00:00:00.000Z");
+
       const list = listInvestigations();
-      expect(list.saved.map((s) => s.id).sort()).toEqual(["widget-a", "widget-b"]);
+      expect(list.saved.map((s) => s.id)).toEqual(["widget-b", "widget-a", "widget-c"]);
       expect(list.skipped).toBe(0);
-      // savedAt differs at least by a millisecond across the two writes; even
-      // on the rare same-ms tie the id tiebreaker keeps order deterministic.
-      expect(list.saved[0].id === "widget-a" || list.saved[0].id === "widget-b").toBe(true);
+    });
+
+    it("breaks a same-millisecond tie on the id, stably", () => {
+      // The reason the comparator has a second clause at all: two saves in the
+      // same millisecond must still come back in the same order every run.
+      for (const id of ["widget-c", "widget-a", "widget-b"]) {
+        saveInvestigation(id, bundleWith([makeClaim("renders to DOM", 0.9)]));
+        stampSavedAt(id, "2026-01-01T00:00:00.000Z");
+      }
+      expect(listInvestigations().saved.map((s) => s.id)).toEqual([
+        "widget-a",
+        "widget-b",
+        "widget-c",
+      ]);
+    });
+
+    it("lists an id that --resume can actually take back", () => {
+      // `sanitizeId` is injective and deliberately not idempotent — it encodes
+      // `~` as `~7E` so a raw `~` cannot be mistaken for an escape — so the id
+      // stored on disk is the wrong thing to print next to "Resume with:".
+      // `widget/auth` was saved as `widget~2Fauth` and listed as that, and
+      // resuming it looked for `widget~7E2Fauth`, which does not exist.
+      saveInvestigation("widget/auth", bundleWith([makeClaim("renders to DOM", 0.9)]));
+      const [only] = listInvestigations().saved;
+      expect(only.id).toBe("widget~2Fauth"); // on disk, as stored
+
+      const { out } = captureStreams(() => renderInvestigationList([only], 0, "json"));
+      const listed = JSON.parse(out).investigations[0].id;
+      expect(listed).toBe("widget/auth");
+      // The whole point: the id the listing offers has to load.
+      expect(loadInvestigation(listed)?.bundle.target.name).toBe("Widget");
     });
 
     it("skips files whose envelope or bundle does not match the contract", () => {
@@ -471,36 +543,46 @@ describe("ix context investigation state", () => {
       saveInvestigation("good", bundleWith([makeClaim("renders to DOM", 0.9)]));
       const { saved } = listInvestigations();
 
-      const capture = (fn: () => void) => {
-        const out: string[] = [];
-        const err: string[] = [];
-        const origLog = console.log;
-        const origErr = console.error;
-        console.log = (...a: unknown[]) => void out.push(a.join(" "));
-        console.error = (...a: unknown[]) => void err.push(a.join(" "));
-        try {
-          fn();
-        } finally {
-          console.log = origLog;
-          console.error = origErr;
-        }
-        return { out: out.join("\n"), err: err.join("\n") };
-      };
-
-      const json = capture(() => renderInvestigationList(saved, 3, "json"));
+      const json = captureStreams(() => renderInvestigationList(saved, 3, "json"));
       expect(() => JSON.parse(json.out)).not.toThrow();
-      expect(JSON.parse(json.out)).toHaveLength(1);
+      const parsed = JSON.parse(json.out);
+      expect(parsed.investigations).toHaveLength(1);
+      // An array had nowhere to put this, so a machine caller could not tell
+      // three files had been rejected while the human saw a warning saying so.
+      expect(parsed.skipped).toBe(3);
       expect(json.err).toContain("3 saved investigation file(s)");
 
-      const llm = capture(() => renderInvestigationList(saved, 3, "llm"));
+      const llm = captureStreams(() => renderInvestigationList(saved, 3, "llm"));
       expect(llm.out.split("\n")[0]).toBe("investigations total=1 skipped=3");
       // The count is the record's business; nothing is written beside it.
       expect(llm.err).toBe("");
 
       // And with nothing skipped the field is simply absent.
-      const clean = capture(() => renderInvestigationList(saved, 0, "llm"));
+      const clean = captureStreams(() => renderInvestigationList(saved, 0, "llm"));
       expect(clean.out.split("\n")[0]).toBe("investigations total=1");
       expect(clean.err).toBe("");
+      // `skipped` is still there in json, as a zero rather than as nothing:
+      // "none were rejected" is an answer, and its absence is not.
+      const cleanJson = captureStreams(() => renderInvestigationList(saved, 0, "json"));
+      expect(JSON.parse(cleanJson.out).skipped).toBe(0);
+    });
+
+    it("returns a summary per investigation, not the bundles themselves", () => {
+      // `--list` is the discovery step. Twenty saved investigations is twenty
+      // complete bundles — up to 50 entities, 100 relationships and 12000
+      // characters of evidence each — and a caller that wants one of them asks
+      // for it by id with `--resume <id> --format json`.
+      saveInvestigation("widget", bundleWith([makeClaim("renders to DOM", 0.9)]));
+      const { saved } = listInvestigations();
+      expect(saved[0].bundle.evidence.length).toBeGreaterThan(0);
+
+      const { out } = captureStreams(() => renderInvestigationList(saved, 0, "json"));
+      const [item] = JSON.parse(out).investigations;
+      expect(Object.keys(item).sort()).toEqual(
+        ["counts", "freshness", "id", "savedAt", "target", "truncation"].sort(),
+      );
+      expect(item.counts.evidence).toBe(saved[0].bundle.evidence.length);
+      expect(out).not.toContain("renders to DOM");
     });
 
     it("prints nothing itself, whatever it finds", () => {
