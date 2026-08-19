@@ -18,6 +18,8 @@
  *     newlines/tabs are encoded as `\n`/`\r`/`\t` so a record never spans lines.
  */
 
+import chalk from "chalk";
+
 /** A field value before rendering. Nullish/empty values are omitted. */
 export type LlmValue = string | number | boolean | null | undefined;
 
@@ -97,4 +99,27 @@ export function printLlmLines(lines: Array<string | null | undefined>): void {
   for (const line of lines) {
     if (line != null) console.log(line);
   }
+}
+
+/**
+ * Report a mutually-exclusive flag combination in the format the caller asked
+ * for, and mark the run failed.
+ *
+ * Both halves matter. `--format llm` gets the `error code=... message="..."`
+ * record on stdout that imports.ts, trace.ts, locate.ts and callers.ts already
+ * emit and that docs/llm-format.md specifies: an agent is told to pass the flag
+ * unconditionally, so an error it cannot parse is an error it cannot act on.
+ * Every other format gets the human line on stderr, so a `--format json` caller
+ * piping to `jq` never finds prose in the payload.
+ *
+ * One function because it was otherwise written twice, byte for byte including
+ * its docblock, in `context.ts` and `diff.ts`. What it encodes -- which stream,
+ * which record kind, which exit code -- is a convention that has to change
+ * everywhere at once or not at all, and `subsystems.ts` already carries six
+ * copies of the stderr half for the same reason.
+ */
+export function reportModeConflict(message: string, format?: string): void {
+  if (format === "llm") console.log(llmError("mode_conflict", message));
+  else console.error(chalk.red("Error:"), message);
+  process.exitCode = 1;
 }

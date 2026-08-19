@@ -98,6 +98,20 @@ The counts keep their zeros: "nothing was added" is the answer `--diff` was
 asked for, not a default worth dropping. Added and removed share one record
 kind and separate on `change=`, so a consumer routing on `entity` sees both
 sides of the comparison.
+`ix context --list`:
+
+```
+investigations total=2 skipped=1
+investigation id=widget saved_at=2026-01-03T09:12:44.108Z target=Widget target_kind=class classification=current entities=12 relationships=20 evidence=8
+investigation id=auth-path saved_at=2026-01-02T17:03:11.882Z target=verify_token target_kind=function classification=stale stale=true entities=31 relationships=64 evidence=25 truncated_evidence=4
+```
+
+`skipped` counts saved files that did not match the contract and is present
+only when it is non-zero — it is the one thing about a listing that cannot be
+seen from the records themselves. `id` is the id `--resume` and `--diff` take,
+not the file name on disk; the two differ whenever an id contains a character
+outside `[A-Za-z0-9._-]`. The counts describe each bundle; the bundles
+themselves are not in the listing, and `ix context --resume <id>` fetches one.
 
 Error line:
 

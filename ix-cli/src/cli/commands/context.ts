@@ -1,5 +1,5 @@
 import type { Command } from "commander";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -19,7 +19,7 @@ import type {
 } from "../../client/types.js";
 import { getEndpoint } from "../config.js";
 import { collectFacts, type EntityFacts } from "../explain/facts.js";
-import { llmLine, printLlmLines } from "../llm.js";
+import { llmLine, printLlmLines, reportModeConflict } from "../llm.js";
 import { parsePickOption } from "../options.js";
 import { resolveFileOrEntity } from "../resolve.js";
 import { createStaleProbe } from "../stale.js";
@@ -39,6 +39,7 @@ interface ContextOptions {
   save?: string;
   resume?: string;
   diff?: string;
+  list?: boolean;
   format: string;
 }
 
@@ -134,13 +135,27 @@ export function registerContextCommand(program: Command): void {
     .option("--save <id>", "Persist the bundle as a resumable investigation state")
     .option("--resume <id>", "Render a saved investigation state without a backend")
     .option("--diff <id>", "Diff a saved investigation against a fresh build of the same target")
+    .option("--list", "List saved investigations (no target, no backend)")
     .addHelpText(
       "after",
-      "\nExamples:\n  ix context IngestionService\n  ix context src/main.ts --format json\n  ix context Widget --max-entities 20 --max-evidence 10\n  ix context Widget --save widget-investigation\n  ix context --resume widget-investigation\n  ix context --diff widget-investigation",
+      "\nExamples:\n  ix context IngestionService\n  ix context src/main.ts --format json\n  ix context Widget --max-entities 20 --max-evidence 10\n  ix context Widget --save widget-investigation\n  ix context --resume widget-investigation\n  ix context --diff widget-investigation\n  ix context --list",
     )
     .action(async (target: string | undefined, opts: ContextOptions) => {
+      const conflict = detectContextModeConflict(opts, target);
+      if (conflict) {
+        reportModeConflict(conflict, opts.format);
+        return;
+      }
       if (opts.resume) {
         renderSavedInvestigation(opts.resume, opts.format);
+        return;
+      }
+      if (opts.list) {
+        // No guard of its own: every combination it used to check is refused
+        // above, before any mode branch can return first. The old one lived
+        // here, below `if (opts.resume)`, so its `--resume` arm was dead.
+        const listed = listInvestigations();
+        renderInvestigationList(listed.saved, listed.skipped, opts.format);
         return;
       }
       if (opts.diff) {
@@ -275,6 +290,91 @@ async function buildFreshBundle(
 }
 
 
+/**
+ * The `ContextOptions` fields `detectContextModeConflict` consumes.
+ *
+ * `Pick`, not a hand-copied shape: the detector exists to stop a typed flag
+ * being a no-op, so its idea of the flags must come from the same declaration
+ * the action handler uses. Written out field-by-field it drifted immediately --
+ * `--list` was added to `ContextOptions` on a sibling branch and the detector
+ * could not see it, with nothing from the typechecker to say so. `Partial` so
+ * the pure function can still be called with one flag at a time in a test,
+ * without inventing a `format`.
+ */
+export type ContextModeOptions = Partial<
+  Pick<ContextOptions, "resume" | "diff" | "save" | "out" | "list" | "format">
+>;
+
+/**
+ * Detect mutually-incompatible mode/output flags on `ix context` and return a
+ * human-readable message naming the conflict, or `undefined` if no conflict.
+ *
+ * The action handler used to silently drop `--save` and `--out` whenever
+ * `--resume` or `--diff` was passed (those branches `return` before the
+ * `--save`/`--out` branches ever run). It also accepted `--save <id>` alongside
+ * `--out <file>`, which describes two different write targets and so has no
+ * well-defined combined behaviour. Catching these combinations up front and
+ * surfacing them as a hard error mirrors the explicit-conflict style in
+ * subsystems.ts and prevents the user's typed flag from being a no-op.
+ *
+ * `--list` is checked here rather than inside the list branch, and that is the
+ * point rather than tidiness. Its own guard sat below `if (opts.resume)`, which
+ * returns first, so the `--list --resume` arm of it could never fire: the user
+ * asked for a listing, silently got one investigation rendered, and the exit
+ * code said it went fine. A guard that runs before every mode branch cannot
+ * lose that race.
+ *
+ * `target` is a parameter because a positional is as ignorable as a flag:
+ * `ix context Widget --list` dropped the target with nothing said.
+ */
+export function detectContextModeConflict(
+  opts: ContextModeOptions,
+  target?: string,
+): string | undefined {
+  if (opts.list && target) {
+    return `--list takes no target; it enumerates every saved investigation. Drop "${target}", or drop --list to build a fresh bundle for it.`;
+  }
+  if (opts.list && opts.resume) {
+    return "--list and --resume cannot be combined; --list enumerates saved investigations, --resume renders one. Run --list first, then --resume the id you want.";
+  }
+  if (opts.list && opts.diff) {
+    return "--list and --diff cannot be combined; --list enumerates saved investigations, --diff compares one against a fresh build.";
+  }
+  if (opts.list && opts.save) {
+    return "--list cannot be combined with --save; --list reads saved investigations, --save writes one, and --list builds no bundle to write.";
+  }
+  if (opts.list && opts.out) {
+    return "--list cannot be combined with --out; --list enumerates to stdout."
+      + " Redirect it (`ix context --list --format json > <path>`) if you need the listing on disk.";
+  }
+  if (opts.resume && opts.diff) {
+    return "--resume and --diff cannot be combined; --resume renders a saved investigation, --diff renders a comparison against one.";
+  }
+  if (opts.resume && opts.save) {
+    return "--resume cannot be combined with --save; --resume only renders a saved investigation, while --save writes a new one. Run --save on a fresh build instead.";
+  }
+  if (opts.resume && opts.out) {
+    // No "use --format json with --out" hint here. That hint was unactionable:
+    // this branch fires on `--resume` plus `--out` whatever the format, so a
+    // user who followed it landed straight back on the same error, this time
+    // with no advice at all. The two things that do work are a redirect and
+    // the saved file itself, so name those.
+    return "--resume cannot be combined with --out; --resume renders to stdout."
+      + " Redirect it (`ix context --resume <id> --format json > <path>`), or read"
+      + " IX_HOME/investigations/<id>.json, which is already the saved JSON.";
+  }
+  if (opts.diff && opts.save) {
+    return "--diff cannot be combined with --save; --diff renders a comparison against a saved investigation. To persist the fresh side as a new investigation, run the fresh build without --diff and use --save there.";
+  }
+  if (opts.diff && opts.out) {
+    return "--diff cannot be combined with --out; --diff renders the comparison to stdout.";
+  }
+  if (opts.save && opts.out) {
+    return "--save and --out cannot be combined; --save writes to IX_HOME/investigations/<id>.json, while --out writes to a caller-chosen path. Pick one.";
+  }
+  return undefined;
+}
+
 /** Saved investigation state lives under ~/.ix/investigations. */
 function investigationDir(): string {
   // IX_HOME is the Ix home *directory*, not the investigations directory —
@@ -311,6 +411,29 @@ export function sanitizeId(id: string): string {
   }
   if (out.startsWith(".")) out = `~2E${out.slice(1)}`;
   return out || "unnamed";
+}
+
+/**
+ * Recover the id the user typed from the id stored on disk.
+ *
+ * `sanitizeId` is injective and deliberately *not* idempotent — it encodes `~`
+ * as `~7E` precisely so a raw `~` cannot be confused with an escape — so the
+ * stored form is the wrong thing to hand back to the user. `ix context --list`
+ * printed it anyway, next to "Resume with: ix context --resume <id>", and
+ * `--resume` sanitizes what it is given: an id saved as `widget/auth` was
+ * listed as `widget~2Fauth`, and resuming that looked for `widget~7E2Fauth`,
+ * which does not exist. `saveInvestigation`'s own note echoes the id the user
+ * typed, so the two affordances contradicted each other.
+ *
+ * `sanitizeId(unsanitizeId(stored)) === stored` for every id this CLI wrote,
+ * which is what makes the listed id usable. A hand-written file whose id is
+ * outside `sanitizeId`'s range has no input that reaches it and is not a case
+ * this recovers.
+ */
+export function unsanitizeId(stored: string): string {
+  return stored.replace(/~([0-9A-Fa-f]{2})/g, (_m, hex: string) =>
+    String.fromCharCode(parseInt(hex, 16)),
+  );
 }
 
 export function saveInvestigation(id: string, bundle: ContextBundle): void {
@@ -366,6 +489,174 @@ export function mergeDiffOptions(
     asOfRev: opts.asOfRev ?? (savedRev === undefined ? undefined : String(savedRev)),
     depth: opts.depth ?? saved.bundle.metadata.depth,
   };
+}
+
+/**
+ * Enumerate every saved investigation under IX_HOME/investigations.
+ *
+ * Validated with `savedInvestigationSchema` — the same contract the write side
+ * and `loadInvestigation` enforce — rather than a hand-rolled envelope check
+ * beside it. A file that fails it is skipped and counted; the count is
+ * returned, not printed, because this runs before the renderer knows which
+ * format was asked for.
+ *
+ * Determinism: newest first by `savedAt`, falling back to the id so two files
+ * saved in the same millisecond still order stably across runs.
+ */
+export function listInvestigations(): { saved: SavedInvestigation[]; skipped: number } {
+  const dir = investigationDir();
+  if (!existsSync(dir)) return { saved: [], skipped: 0 };
+  const entries = readdirSync(dir).filter((f) => f.endsWith(".json"));
+  const out: SavedInvestigation[] = [];
+  let skipped = 0;
+  for (const file of entries) {
+    let raw: unknown;
+    // Scoped to the read and the parse, as in `loadInvestigation`: they are the
+    // only calls here that throw.
+    try {
+      raw = JSON.parse(readFileSync(join(dir, file), "utf8"));
+    } catch {
+      skipped += 1;
+      continue;
+    }
+    const parsed = savedInvestigationSchema.safeParse(raw);
+    if (!parsed.success) {
+      skipped += 1;
+      continue;
+    }
+    // The validated value, not the raw parse — the same assertion
+    // `loadInvestigation` makes, and for the same reason: it re-narrows the
+    // open report arrays the schema leaves as records, and every field the
+    // renderer dereferences has been checked by this point.
+    out.push(parsed.data as unknown as SavedInvestigation);
+  }
+  out.sort((a, b) => {
+    if (a.savedAt !== b.savedAt) return a.savedAt < b.savedAt ? 1 : -1;
+    return cmp(a.id, b.id);
+  });
+  return { saved: out, skipped };
+}
+
+/** One saved investigation as `--list` describes it: what it is, not what is in it. */
+interface InvestigationSummary {
+  /** The id to type back, not the id on disk — see `unsanitizeId`. */
+  id: string;
+  savedAt: string;
+  target: { name: string; kind: string };
+  freshness: ContextBundle["freshness"];
+  counts: { entities: number; relationships: number; evidence: number };
+  truncation: ContextBundle["truncation"];
+}
+
+/** Summarise one saved investigation for the listing. */
+function summariseInvestigation(s: SavedInvestigation): InvestigationSummary {
+  const b = s.bundle;
+  return {
+    id: unsanitizeId(s.id),
+    savedAt: s.savedAt,
+    target: { name: b.target.name, kind: b.target.kind },
+    freshness: b.freshness,
+    counts: {
+      entities: b.entities.length,
+      relationships: b.relationships.length,
+      evidence: b.evidence.length,
+    },
+    truncation: b.truncation,
+  };
+}
+
+/**
+ * Render the saved investigations produced by `listInvestigations`.
+ *
+ * Every format carries the same summary: what each investigation is, how big
+ * it is, and how stale. Not the bundles themselves — `--list` is the discovery
+ * step, and twenty saved investigations is twenty complete bundles, up to 50
+ * entities, 100 relationships and 12000 characters of evidence each. A caller
+ * that wants one of them asks for it by id with `--resume <id> --format json`.
+ *
+ * `skipped` is reported in each format's own terms, and never on stdout except
+ * as a field — including in `json`, which returns an object for exactly that
+ * reason: an array has nowhere to put it, so a machine caller could not tell
+ * that files had been rejected while the human saw a warning saying so. It used
+ * to be a `renderWarning` inside the enumerator — which is `console.log` — so a
+ * single corrupt file prepended a chalk-coloured prose line to the payload and
+ * `ix context --list --format json | jq` failed on it. The human warning goes to
+ * stderr; the machine formats carry a count.
+ */
+export function renderInvestigationList(
+  items: SavedInvestigation[],
+  skipped: number,
+  format: string,
+): void {
+  const summaries = items.map(summariseInvestigation);
+  if (skipped > 0 && format !== "llm") {
+    // `console.error`, not `renderWarning`: every renderer in ui.ts writes to
+    // stdout, which is exactly how this line used to end up inside the JSON a
+    // caller was piping. Plain text rather than chalk — nothing else in this
+    // file writes to stderr, and a colour code is not worth an import that
+    // only this line needs.
+    console.error(
+      `  Warning  ${skipped} saved investigation file(s) did not match the contract; skipped.` +
+        " Run `ix context --resume <id>` for a per-file report.",
+    );
+  }
+  if (format === "json") {
+    console.log(JSON.stringify({ investigations: summaries, skipped }, null, 2));
+    return;
+  }
+  if (format === "llm") {
+    printLlmLines([
+      // `skipped` is a field rather than a warning: it is the one thing about
+      // the listing an agent cannot see from the records themselves.
+      llmLine("investigations", { total: summaries.length, skipped: skipped || undefined }),
+      ...summaries.map((s) =>
+        llmLine("investigation", {
+          id: s.id,
+          saved_at: s.savedAt,
+          target: s.target.name,
+          target_kind: s.target.kind,
+          classification: s.freshness.classification,
+          stale: s.freshness.stale,
+          entities: s.counts.entities,
+          relationships: s.counts.relationships,
+          evidence: s.counts.evidence,
+          truncated_entities: s.truncation.entitiesTruncated,
+          truncated_relationships: s.truncation.relationshipsTruncated,
+          truncated_evidence: s.truncation.evidenceTruncated,
+          truncated_chars: s.truncation.charactersTruncated,
+        }),
+      ),
+    ]);
+    return;
+  }
+
+  if (summaries.length === 0) {
+    renderNote("No saved investigations. Use `ix context <target> --save <id>` to create one.");
+    return;
+  }
+  renderSection(`Saved investigations (${summaries.length})`);
+  for (const s of summaries) {
+    console.log(`  ${s.id}`);
+    console.log(`    target:       ${s.target.name} (${s.target.kind})`);
+    console.log(`    saved_at:     ${s.savedAt}`);
+    console.log(`    freshness:    ${s.freshness.classification}`);
+    console.log(
+      `    counts:       entities=${s.counts.entities} relationships=${s.counts.relationships} evidence=${s.counts.evidence}`,
+    );
+    if (
+      s.truncation.entitiesTruncated ||
+      s.truncation.relationshipsTruncated ||
+      s.truncation.evidenceTruncated ||
+      s.truncation.charactersTruncated
+    ) {
+      console.log(
+        `    truncated:    entities=${s.truncation.entitiesTruncated} relationships=${s.truncation.relationshipsTruncated} evidence=${s.truncation.evidenceTruncated} chars=${s.truncation.charactersTruncated}`,
+      );
+    }
+  }
+  console.log();
+  console.log(`Resume with: ix context --resume <id>`);
+  console.log(`Diff with:   ix context --diff <id>`);
 }
 
 /**
