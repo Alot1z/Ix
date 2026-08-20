@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as nodePath from "node:path";
+import { readBoundedFile } from "./bounded-read.js";
 
 interface PathRule {
   pattern: string;
@@ -133,14 +134,6 @@ function parseJsonc(text: string): unknown {
 }
 
 /**
- * Config files are read while the resolver is built, which happens *before*
- * ingestion's own size gate, so they need their own. Mirrors `MAX_FILE_BYTES`
- * in `ingest.ts`: anything larger is not a tsconfig, and parsing one is how a
- * 64 MB JSONC file takes the process out with an uncatchable OOM.
- */
-const MAX_CONFIG_BYTES = 1024 * 1024;
-
-/**
  * True when the file we are *holding open* lives inside the workspace.
  *
  * The lexical check in {@link isWithinWorkspace} cannot see through a symlinked
@@ -184,31 +177,16 @@ function openedWithinWorkspace(
 }
 
 function readObject(workspaceRoot: string, filePath: string): Record<string, unknown> | undefined {
+  // The FIFO-safe open, the regular-file check and the bound are shared with
+  // the manifest readers — see bounded-read.ts, which also explains why the
+  // size check alone does not bound the read. Containment stays here: the root
+  // it is measured against is this caller's, and it runs on the same open
+  // handle, before any content is read.
+  const text = readBoundedFile(filePath, {
+    accept: (stats) => openedWithinWorkspace(workspaceRoot, filePath, stats),
+  });
+  if (text === null) return undefined;
   try {
-    // Open once and fstat the same handle so the checks and the read observe the
-    // same inode — no stat-then-read window (CodeQL js/file-system-race). This is
-    // the pattern ingest.ts already uses.
-    //
-    // O_NONBLOCK is load-bearing, not tidiness: opening a FIFO for reading
-    // *blocks until a writer appears*, so without it the open never returns and
-    // no later check can help. It is the one case a guard placed after the open
-    // cannot cover. Undefined on Windows, where `|` with undefined degrades to
-    // a plain read — and Windows has no FIFO to open this way.
-    const handle = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
-    let text: string;
-    try {
-      const stats = fs.fstatSync(handle);
-      // `openSync` follows symlinks, so fstat describes the *target*. Refusing
-      // anything that is not a regular file is what stops a link to /dev/zero
-      // (an unbounded read) and a FIFO (which would otherwise deliver no data
-      // and no EOF) — neither of which a size check catches, since both
-      // report size 0.
-      if (!stats.isFile() || stats.size > MAX_CONFIG_BYTES) return undefined;
-      if (!openedWithinWorkspace(workspaceRoot, filePath, stats)) return undefined;
-      text = fs.readFileSync(handle, "utf8");
-    } finally {
-      fs.closeSync(handle);
-    }
     const parsed = parseJsonc(text);
     return parsed && typeof parsed === "object" && !Array.isArray(parsed)
       ? (parsed as Record<string, unknown>)

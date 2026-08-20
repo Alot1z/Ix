@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as nodePath from "node:path";
 import { createHash } from "node:crypto";
+import { readBoundedFile } from "./bounded-read.js";
 
 /**
  * Multi-repo system auto-detection (Ix#225 Path 1).
@@ -38,6 +39,40 @@ function isRepoRoot(dir: string): boolean {
   }
 }
 
+/**
+ * Read a build manifest out of a scanned directory, or null.
+ *
+ * Every path this module reads is *named by the repository being scanned*, so a
+ * hostile or merely broken one decides what `ix map` opens. These three readers
+ * were the last ones in the ingest path with no guard on what came back: a bare
+ * `readFileSync` follows `package.json -> /dev/zero` and never returns — it does
+ * not throw, it consumes memory until the process dies — and a plain 2 GB
+ * `Cargo.toml` does the same without needing a symlink.
+ *
+ * The guard is shared with the module resolver, which reads tsconfigs under
+ * exactly these conditions; `readBoundedFile` documents what each part of it is
+ * for, and why a size check alone bounds nothing.
+ *
+ * No containment check, deliberately. Both roots that could be used here break
+ * a layout that works today, and break it silently:
+ *
+ * - the scanned directory itself refuses a manifest a repo legitimately
+ *   symlinks within itself, and does not refuse the case worth refusing — a
+ *   symlinked member directory resolves root and file to the same outside tree;
+ * - the mapped root refuses every symlinked member repo, which `detectSystem`
+ *   has admitted on purpose since Ix#225 (see the `isSymbolicLink()` filter
+ *   below): a folder collecting independently-cloned repos is exactly what it
+ *   is for, and collecting them by symlink is the ordinary way to do it.
+ *
+ * A refusal here is indistinguishable from "no manifest", so either choice
+ * deletes a package from the registry with nothing said. Confining what a
+ * scanned repo may name is worth doing, but it needs a diagnostic and a way
+ * out, not a silent default bolted onto a read.
+ */
+function readManifest(dir: string, file: string): string | null {
+  return readBoundedFile(nodePath.join(dir, file));
+}
+
 /** A directory is its own git repository iff it contains a `.git` entry (a dir
  *  for a normal clone, or a file for a submodule/worktree). This is the
  *  ground-truth signal that a child is a DISTINCT repository — a monorepo's
@@ -54,7 +89,7 @@ function hasOwnGit(dir: string): boolean {
  */
 function hasWorkspaceMarker(dir: string): boolean {
   const has = (f: string) => { try { return fs.existsSync(nodePath.join(dir, f)); } catch { return false; } };
-  const reads = (f: string): string | null => { try { return fs.readFileSync(nodePath.join(dir, f), "utf8"); } catch { return null; } };
+  const reads = (f: string): string | null => readManifest(dir, f);
   // Dedicated workspace/monorepo config files.
   if (has("pnpm-workspace.yaml") || has("lerna.json") || has("nx.json") ||
       has("turbo.json") || has("rush.json") || has("go.work") ||
@@ -97,9 +132,7 @@ function isInsideSingleRepo(dir: string): boolean {
  */
 export function readPackageNames(dir: string): string[] {
   const names = new Set<string>();
-  const read = (f: string): string | null => {
-    try { return fs.readFileSync(nodePath.join(dir, f), "utf8"); } catch { return null; }
-  };
+  const read = (f: string): string | null => readManifest(dir, f);
   const add = (n: unknown) => { if (typeof n === "string" && n.trim()) names.add(n.trim()); };
 
   const pkg = read("package.json");                                  // JS / TS
@@ -192,9 +225,7 @@ export function lookupPackage(registry: Record<string, string>, mod: string): st
  */
 export function readPackageDeps(dir: string): string[] {
   const deps = new Set<string>();
-  const read = (f: string): string | null => {
-    try { return fs.readFileSync(nodePath.join(dir, f), "utf8"); } catch { return null; }
-  };
+  const read = (f: string): string | null => readManifest(dir, f);
   const add = (n: unknown) => { if (typeof n === "string" && n.trim()) deps.add(n.trim()); };
 
   // PRODUCTION deps only. The declared-dependency graph gates cross-repo edges,
