@@ -18,6 +18,7 @@ import { loadIngestionModules } from './ingestion-loader.js';
 import { ensureWorkspaceIdState } from '../bootstrap.js';
 import { detectSystem, repoWorkspaceIdFor, lookupPackage, readPackageNames, readPackageDeps } from '../system.js';
 import { CLIENT_EXPECTED_SCHEMA_VERSION } from '../backend-status.js';
+import { readBackendHealth } from './upgrade.js';
 import { SUPPORTED_EXTENSIONS } from '../supported-extensions.js';
 import { canRenderProgress } from '../stderr.js';
 import { createTypeScriptModuleResolver } from '../ts-module-resolution.js';
@@ -940,7 +941,7 @@ export async function ingestFiles(
   // absolute→relative source_uri migration, or folding workspace_id into ids).
   // CLIENT_EXPECTED_SCHEMA_VERSION is shared with doctor/upgrade (backend-status).
   try {
-    const health = await client.health();
+    const health = await readBackendHealth(client);
     const serverVersion = (health as any)?.schema_version;
     if (typeof serverVersion === 'number' && serverVersion !== CLIENT_EXPECTED_SCHEMA_VERSION) {
       process.stderr.write(
