@@ -303,10 +303,10 @@ describe("mode-flag coverage does not drift from the command", () => {
  * No HTTP backend is required for the conflict paths because the detector
  * runs at the top of the action handler.
  */
-function runProgram(
+async function runProgram(
   register: (program: Command) => void,
   args: string[],
-): { stderr: string; exitCode: number | string | undefined; stdout: string } {
+): Promise<{ stderr: string; exitCode: number | string | undefined; stdout: string }> {
   const program = new Command();
   program.name("ix").exitOverride();
   register(program);
@@ -329,7 +329,10 @@ function runProgram(
 
   let code: number | string | undefined;
   try {
-    program.parse(["node", "ix", ...args]);
+    // Use parseAsync so async action handlers are properly awaited;
+    // synchronous parse() would let the handler's fetch Promise float as
+    // an unhandled rejection when there is no backend running.
+    await program.parseAsync(["node", "ix", ...args]);
   } catch (e) {
     // exitOverride turns process.exit into a CommanderError; we still want
     // the (possibly already-set) exitCode. The error message ends up in
@@ -360,8 +363,8 @@ describe("ix context action surfaces mode conflicts on stderr and exits 1", () =
     { args: ["context", "Widget", "--resume", "x"], expect: /--resume takes no target/ },
     { args: ["context", "--list", "--max-entities", "10"], expect: /--max-entities cannot be combined with --list/ },
     { args: ["context", "--resume", "x", "--kind", "class"], expect: /--kind cannot be combined with --resume/ },
-  ])("ix $args → stderr matches $expect and exit code is 1", ({ args, expect: re }) => {
-    const r = runProgram(registerContextCommand, args);
+  ])("ix $args → stderr matches $expect and exit code is 1", async ({ args, expect: re }) => {
+    const r = await runProgram(registerContextCommand, args);
     expect(r.exitCode).toBe(1);
     expect(r.stderr).toMatch(/^Error:/m);
     expect(r.stderr).toMatch(re);
@@ -375,8 +378,8 @@ describe("ix diff action surfaces mode conflicts on stderr and exits 1", () => {
     { args: ["diff", "3", "5", "--full", "--limit", "20"], expect: /--full and --limit cannot be combined/ },
     { args: ["diff", "3", "5", "--summary", "--limit", "20"], expect: /--summary ignores --limit and --full/ },
     { args: ["diff", "3", "5", "--summary", "--full"], expect: /--summary ignores --limit and --full/ },
-  ])("ix diff $args → stderr matches $expect and exit code is 1", ({ args, expect: re }) => {
-    const r = runProgram(registerDiffCommand, args);
+  ])("ix diff $args → stderr matches $expect and exit code is 1", async ({ args, expect: re }) => {
+    const r = await runProgram(registerDiffCommand, args);
     expect(r.exitCode).toBe(1);
     expect(r.stderr).toMatch(/^Error:/m);
     expect(r.stderr).toMatch(re);
@@ -389,8 +392,8 @@ describe("a caller that asked for records gets the error as a record", () => {
   // cannot read is an error it cannot act on. Same shape the rest of the CLI
   // emits (imports/trace/smells/locate/callers) and the one docs/llm-format.md
   // specifies: on stdout, in-stream, exit code still non-zero.
-  it("emits an error record for ix context and keeps the exit code", () => {
-    const r = runProgram(registerContextCommand, [
+  it("emits an error record for ix context and keeps the exit code", async () => {
+    const r = await runProgram(registerContextCommand, [
       "context",
       "--resume",
       "x",
@@ -406,8 +409,8 @@ describe("a caller that asked for records gets the error as a record", () => {
     expect(r.stderr).toBe("");
   });
 
-  it("emits an error record for ix diff and keeps the exit code", () => {
-    const r = runProgram(registerDiffCommand, [
+  it("emits an error record for ix diff and keeps the exit code", async () => {
+    const r = await runProgram(registerDiffCommand, [
       "diff",
       "3",
       "5",
@@ -421,9 +424,9 @@ describe("a caller that asked for records gets the error as a record", () => {
     expect(r.stderr).toBe("");
   });
 
-  it("still writes prose to stderr for every other format", () => {
+  it("still writes prose to stderr for every other format", async () => {
     for (const format of ["text", "json"]) {
-      const r = runProgram(registerContextCommand, ["context", "--resume", "x", "--diff", "y", "--format", format]);
+      const r = await runProgram(registerContextCommand, ["context", "--resume", "x", "--diff", "y", "--format", format]);
       expect(r.exitCode).toBe(1);
       expect(r.stderr).toMatch(/^Error:/m);
       expect(r.stdout).toBe("");
@@ -782,46 +785,46 @@ describe("reportFailure with llm format", () => {
 // ── Integration: edge-case Commander invocations ────────────────────
 
 describe("ix context edge-case integration", () => {
-  it("--resume x alone does NOT set exit code (no target needed)", () => {
+  it("--resume x alone does NOT set exit code (no target needed)", async () => {
     // --resume loads from disk; it does not need a target or backend.
     // This verifies that resume-only does not accidentally trigger the conflict detector.
-    const r = runProgram(registerContextCommand, ["context", "--resume", "nonexistent-id"]);
+    const r = await runProgram(registerContextCommand, ["context", "--resume", "nonexistent-id"]);
     // The loadInvestigation function prints a warning but does NOT set exitCode=1
     // (it is a warning, not a conflict). The conflict detector should NOT fire.
     expect(r.stderr).not.toMatch(/cannot be combined/);
   });
 
-  it("--diff x alone does NOT set exit code (no target needed)", () => {
-    const r = runProgram(registerContextCommand, ["context", "--diff", "nonexistent-id"]);
+  it("--diff x alone does NOT set exit code (no target needed)", async () => {
+    const r = await runProgram(registerContextCommand, ["context", "--diff", "nonexistent-id"]);
     expect(r.stderr).not.toMatch(/cannot be combined/);
   });
 
-  it("--save x alone does NOT set exit code (requires target)", () => {
+  it("--save x alone does NOT set exit code (requires target)", async () => {
     // --save without a target prints a warning, not a conflict.
-    const r = runProgram(registerContextCommand, ["context", "--save", "test-id"]);
+    const r = await runProgram(registerContextCommand, ["context", "--save", "test-id"]);
     expect(r.stderr).not.toMatch(/cannot be combined/);
   });
 
-  it("--out /tmp/x.json alone does NOT set exit code (requires target)", () => {
-    const r = runProgram(registerContextCommand, ["context", "--out", "/tmp/test.json"]);
+  it("--out /tmp/x.json alone does NOT set exit code (requires target)", async () => {
+    const r = await runProgram(registerContextCommand, ["context", "--out", "/tmp/test.json"]);
     expect(r.stderr).not.toMatch(/cannot be combined/);
   });
 });
 
 describe("ix diff edge-case integration", () => {
-  it("--summary alone does NOT set exit code (requires valid revs)", () => {
-    const r = runProgram(registerDiffCommand, ["diff", "1", "2", "--summary"]);
+  it("--summary alone does NOT set exit code (requires valid revs)", async () => {
+    const r = await runProgram(registerDiffCommand, ["diff", "1", "2", "--summary"]);
     // May fail due to no backend, but should NOT fail due to conflict detection
     expect(r.stderr).not.toMatch(/cannot be combined/);
   });
 
-  it("--content alone does NOT set exit code", () => {
-    const r = runProgram(registerDiffCommand, ["diff", "1", "2", "--content"]);
+  it("--content alone does NOT set exit code", async () => {
+    const r = await runProgram(registerDiffCommand, ["diff", "1", "2", "--content"]);
     expect(r.stderr).not.toMatch(/cannot be combined/);
   });
 
-  it("--full alone does NOT set exit code", () => {
-    const r = runProgram(registerDiffCommand, ["diff", "1", "2", "--full"]);
+  it("--full alone does NOT set exit code", async () => {
+    const r = await runProgram(registerDiffCommand, ["diff", "1", "2", "--full"]);
     expect(r.stderr).not.toMatch(/cannot be combined/);
   });
 });
