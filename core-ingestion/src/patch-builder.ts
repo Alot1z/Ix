@@ -366,12 +366,21 @@ export function buildPatch(
   }
 
   // AssertClaim for each relationship (feeds the confidence/conflict engine)
+  // phpCallKind splits the relationship dedup key, so `handle(); $obj->handle();`
+  // arrives as two relationships that produce byte-identical claims. The kind is
+  // not part of a claim, so nothing downstream can tell them apart.
+  const emittedClaims = new Set<string>();
   for (const r of relationships) {
     const srcKey = resolveKey(r.srcName);
+    const entityId = nodeId(idPath, srcKey);
+    const field = `${r.predicate.toLowerCase()}:${r.dstName}`;
+    const claimIdentity = `${entityId}\x00${field}`;
+    if (emittedClaims.has(claimIdentity)) continue;
+    emittedClaims.add(claimIdentity);
     ops.push({
       type: 'AssertClaim',
-      entityId: nodeId(idPath, srcKey),
-      field: `${r.predicate.toLowerCase()}:${r.dstName}`,
+      entityId,
+      field,
       value: r.dstName,
       confidence: null,
     });
@@ -478,7 +487,8 @@ export function buildPatchWithResolution(
   const edgeResolution = new Map<string, { dstFilePath: string; dstQualifiedKey: string }>();
   for (const edge of resolvedEdges) {
     if (edge.srcFilePath !== result.filePath) continue;
-    edgeResolution.set(`${edge.srcName}:${edge.predicate}:${edge.dstName}`, {
+    const callKind = edge.phpCallKind ? `:${edge.phpCallKind}` : '';
+    edgeResolution.set(`${edge.srcName}:${edge.predicate}:${edge.dstName}${callKind}`, {
       dstFilePath: edge.dstFilePath,
       dstQualifiedKey: edge.dstQualifiedKey,
     });
@@ -616,6 +626,12 @@ export function buildPatchWithResolution(
   }
 
   const seenExternalNodes2 = new Set<string>();
+  const emittedEdgeIdentities = new Set<string>();
+  const relationshipShapeCounts = new Map<string, number>();
+  for (const relationship of relationships) {
+    const key = `${relationship.srcName}:${relationship.predicate}:${relationship.dstName}`;
+    relationshipShapeCounts.set(key, (relationshipShapeCounts.get(key) ?? 0) + 1);
+  }
   for (const r of relationships) {
     const srcKey = resolveKey(r.srcName);
     const dstKey = r.predicate === 'CONTAINS'
@@ -623,12 +639,18 @@ export function buildPatchWithResolution(
       : resolveKey(r.dstName);
 
     let dstNodeId: string;
-    const resolutionKey = `${r.srcName}:${r.predicate}:${r.dstName}`;
+    const baseResolutionKey = `${r.srcName}:${r.predicate}:${r.dstName}`;
+    const resolutionKey = r.phpCallKind
+      ? `${baseResolutionKey}:${r.phpCallKind}`
+      : baseResolutionKey;
+    const matchedResolutionKey = edgeResolution.has(resolutionKey)
+      ? resolutionKey
+      : baseResolutionKey;
 
-    if (edgeResolution.has(resolutionKey)) {
+    if (edgeResolution.has(matchedResolutionKey)) {
       // Cross-file resolved — use the defining file's nodeId, in the dst repo's
       // workspace namespace (matters only for cross-repo edges in a co-ingest).
-      const { dstFilePath, dstQualifiedKey } = edgeResolution.get(resolutionKey)!;
+      const { dstFilePath, dstQualifiedKey } = edgeResolution.get(matchedResolutionKey)!;
       dstNodeId = dstNodeIdInRepo(dstFilePath, dstQualifiedKey);
     } else if (r.predicate === 'CALLS' && dstKey.includes('::') && !allQKeys2.has(dstKey)) {
       const sep = dstKey.indexOf('::');
@@ -650,9 +672,20 @@ export function buildPatchWithResolution(
       dstNodeId = nodeId(idPath, dstKey);
     }
 
+    const edgeDstKey = r.phpCallKind && (relationshipShapeCounts.get(baseResolutionKey) ?? 0) > 1
+      ? `${dstKey}:${r.phpCallKind}`
+      : dstKey;
+    // The phpCallKind salt above exists so `foo()` and `Bar::foo()` keep distinct
+    // ids when they resolve to *different* targets. When they resolve to the same
+    // node it instead mints two ids for one edge, and since the dedup downstream
+    // keys on id, both commit. An edge is identified by (src, dst, predicate) —
+    // two of those with empty attrs are indistinguishable in the graph.
+    const edgeIdentity = `${nodeId(idPath, srcKey)}\x00${dstNodeId}\x00${r.predicate}`;
+    if (emittedEdgeIdentities.has(edgeIdentity)) continue;
+    emittedEdgeIdentities.add(edgeIdentity);
     ops.push({
       type: 'UpsertEdge',
-      id: edgeId(idPath, srcKey, dstKey, r.predicate),
+      id: edgeId(idPath, srcKey, edgeDstKey, r.predicate),
       src: nodeId(idPath, srcKey),
       dst: dstNodeId,
       predicate: r.predicate,
@@ -660,12 +693,21 @@ export function buildPatchWithResolution(
     });
   }
 
+  // phpCallKind splits the relationship dedup key, so `handle(); $obj->handle();`
+  // arrives as two relationships that produce byte-identical claims. The kind is
+  // not part of a claim, so nothing downstream can tell them apart.
+  const emittedClaims = new Set<string>();
   for (const r of relationships) {
     const srcKey = resolveKey(r.srcName);
+    const entityId = nodeId(idPath, srcKey);
+    const field = `${r.predicate.toLowerCase()}:${r.dstName}`;
+    const claimIdentity = `${entityId}\x00${field}`;
+    if (emittedClaims.has(claimIdentity)) continue;
+    emittedClaims.add(claimIdentity);
     ops.push({
       type: 'AssertClaim',
-      entityId: nodeId(idPath, srcKey),
-      field: `${r.predicate.toLowerCase()}:${r.dstName}`,
+      entityId,
+      field,
       value: r.dstName,
       confidence: null,
     });

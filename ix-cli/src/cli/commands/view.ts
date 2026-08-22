@@ -23,7 +23,18 @@ const PID_FILE = join(IX_HOME, "compass.pid");
 // already-running (differently-scoped) instance.
 const SCOPE_FILE = join(IX_HOME, "compass.scope");
 const PORT_FILE = join(IX_HOME, "compass.port");
-const SERVER_SCRIPT_FILE = join(IX_HOME, "tmp", "compass-server.js");
+/**
+ * `.cjs`, not `.js`.
+ *
+ * The script this writes is CommonJS — it `require`s http, fs and path. A `.js`
+ * file's module system is decided by the nearest `package.json` *above it*, so
+ * with `IX_HOME` anywhere under a directory declaring `"type": "module"`, node
+ * refuses the script with `require is not defined in ES module scope` and
+ * `ix view` reports only "started … but is not yet serving", which names
+ * neither the cause nor the fix. `.cjs` is CommonJS whatever any ancestor
+ * says. (`$HOME/package.json` is rare but real — this box has one.)
+ */
+const SERVER_SCRIPT_FILE = join(IX_HOME, "tmp", "compass-server.cjs");
 const BACKEND_URL = "http://localhost:8090";
 
 /** Resolve the compass dist directory — installed path first, then dev fallback. */
@@ -115,11 +126,18 @@ function readRunningPort(): number | null {
  *
  * Pure, because the decision is all this is, and inline in a command action it
  * could only be exercised by launching a detached server.
+ *
+ * `token` is threaded rather than read from `CACHE_BUST` so this stays pure.
+ * The URL it prints carries the bust for a reason: `ix upgrade` replaces the
+ * dist in place and leaves the server running, so the next `ix view` lands
+ * here, prints a URL and opens nothing. That is the reporter's exact path, and
+ * a bust that only covered the opened tab would miss it.
  */
 export function runningInstanceLines(
   runningPort: number | null,
   requestedPort: number,
   portWasRequested: boolean,
+  token: string = CACHE_BUST,
 ): string[] {
   if (runningPort === null) {
     return [
@@ -128,7 +146,7 @@ export function runningInstanceLines(
     ];
   }
 
-  const lines = [`  http://localhost:${runningPort}`];
+  const lines = [`  ${browserUrl(`http://localhost:${runningPort}`, token)}`];
   if (portWasRequested && runningPort !== requestedPort) {
     lines.push(`[!] You asked for port ${requestedPort}, but it is serving on ${runningPort}.`);
     lines.push(`    Run 'ix view stop' then 'ix view -p ${requestedPort}' to move it.`);
@@ -245,6 +263,16 @@ const { execFile } = require("child_process");
 
 const DIST = process.argv[2];
 const PORT = Number(process.argv[3]);
+// How long to wait on the backend before answering 504. Generous, because it
+// must not fire on a legitimately slow read: /v1/map rebuilds the whole map on
+// every call and has been measured at 276s on a large graph. Overridable only
+// under NODE_ENV=test, like the seams below, so a shipped install cannot be
+// given a short timeout through the environment — and so the timeout itself
+// can be tested without a ten-minute test.
+const PROXY_TIMEOUT_MS = (process.env.NODE_ENV === "test" && process.env.IX_VIEW_PROXY_TIMEOUT_MS)
+  ? Number(process.env.IX_VIEW_PROXY_TIMEOUT_MS)
+  : 600000;
+
 const BACKEND = (process.env.NODE_ENV === "test" && process.env.IX_VIEW_BACKEND_URL)
   ? process.env.IX_VIEW_BACKEND_URL
   : ${JSON.stringify(BACKEND_URL)};
@@ -290,6 +318,50 @@ const MIME = {
   ".map":  "application/json",
 };
 
+// ── Cache policy ────────────────────────────────────────────────────────────
+//
+// Sending no cache headers is not the same as sending "do not cache": with no
+// Cache-Control, no ETag and no Last-Modified, a browser picks its own freshness
+// heuristic and may reuse a response without ever asking. This server always
+// serves 127.0.0.1 on a port it reuses, so that cache outlives an upgrade -- the
+// old index.html comes back, names the old content-hashed bundles, and the
+// entire previous Compass runs while /.version, fetched separately, reports the
+// new build. The result is a status bar that says the fix shipped while the
+// screen shows the build before it.
+//
+// The decision is keyed on the file about to be sent, never on the URL that
+// asked for it. Those are not the same path: the SPA fallback rewrites filePath
+// to index.html for any extensionless miss, so GET /assets/anything answers with
+// index.html -- and deciding from the URL would stamp the entry point
+// "immutable" for a year under an /assets/ key, which is the permanent form of
+// the bug this exists to prevent.
+//
+// A content hash in the name is what makes "keep this forever" safe: the name
+// changes whenever the bytes do. Sitting under assets/ is not the same claim.
+// Compass is built in another repo, so nothing here can verify what it puts
+// there, and one stable name -- a hand-placed file, a build whose
+// assetFileNames drops [hash] -- would be pinned in a user's browser for a year
+// against a fixed origin, with no revalidation path and no recovery short of
+// clearing site data. So the guard checks for the hash it is asserting. The
+// charset excludes the dash on purpose: a hash containing one simply misses
+// the optimisation and is revalidated, while my-long-name.css matching would
+// be the unrecoverable direction.
+//
+// No backslash escapes and no backticks anywhere in this block: the whole
+// script is emitted from a template literal, so an escape is eaten before it
+// reaches the generated file and a backtick ends the literal outright. Both
+// were tried here; the second took the server down. Hence a bracketed dot
+// rather than an escaped one, path.sep rather than a literal separator, and
+// no backticks even inside these comments -- one here ends the literal just
+// as surely as one in the code, which is how this block first failed to parse.
+const DIST_ROOT = path.resolve(DIST);
+const ASSET_PREFIX = path.join(DIST_ROOT, "assets") + path.sep;
+const FINGERPRINTED = /-[A-Za-z0-9_]{8,}[.]/;
+const cacheControl = (f) =>
+  f.startsWith(ASSET_PREFIX) && FINGERPRINTED.test(path.basename(f))
+    ? "public, max-age=31536000, immutable"
+    : "no-store";
+
 const server = http.createServer((req, res) => {
   const parsed = url.parse(req.url);
   const pathname = parsed.pathname || "/";
@@ -317,9 +389,26 @@ const server = http.createServer((req, res) => {
       res.writeHead(proxyRes.statusCode, proxyRes.headers);
       proxyRes.pipe(res);
     });
-    proxyReq.on("error", () => {
-      res.writeHead(502, { "Content-Type": "text/plain" });
-      res.end("Backend unavailable");
+    // A backend that accepts the socket and then never answers used to hang
+    // here for ever: node puts no timeout on an outgoing request, so the
+    // browser waited indefinitely, Compass recorded neither a result nor a
+    // failure, and the region sat at "loading …" with nothing to distinguish a
+    // slow map from a dead one. Answering 504 turns that into a state the
+    // client can render and a user can act on.
+    //
+    // Generous, because it must not fire on a legitimately slow read: /v1/map
+    // rebuilds the whole map on every call and has been measured at 276s on a
+    // large graph. This is the point past which silence is a fault rather than
+    // patience.
+    proxyReq.setTimeout(PROXY_TIMEOUT_MS, () => {
+      proxyReq.destroy(new Error("backend timed out"));
+    });
+    proxyReq.on("error", (err) => {
+      // Whatever went wrong, the client is still waiting; say something.
+      if (res.headersSent) { res.destroy(); return; }
+      const timedOut = err && err.message === "backend timed out";
+      res.writeHead(timedOut ? 504 : 502, { "Content-Type": "text/plain" });
+      res.end(timedOut ? "Backend timed out" : "Backend unavailable");
     });
     req.pipe(proxyReq);
     return;
@@ -411,8 +500,22 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Serve static files
-  let filePath = path.join(DIST, pathname === "/" ? "index.html" : pathname);
+  // Serve static files.
+  let filePath = path.resolve(path.join(DIST, pathname === "/" ? "index.html" : pathname));
+
+  // Everything served comes from inside DIST. url.parse does not normalise
+  // a dot-dot segment, and path.join resolves straight out of the tree, so
+  // without this GET /../../../../etc/passwd is read and returned 200. A
+  // browser normalises dot-dot before sending, so the exposure is to other local
+  // processes reading files as the user who ran the CLI rather than as
+  // themselves -- which is still a file read this server has no business
+  // doing. Checked before the SPA fallback, because an escaping path that
+  // happens to exist never reaches it.
+  if (filePath !== DIST_ROOT && !filePath.startsWith(DIST_ROOT + path.sep)) {
+    res.writeHead(404, { "Content-Type": "text/plain", "Cache-Control": "no-store" });
+    res.end("Not found");
+    return;
+  }
 
   // SPA fallback: if file doesn't exist and no extension, serve index.html
   if (!fs.existsSync(filePath) && !path.extname(filePath)) {
@@ -428,14 +531,20 @@ const server = http.createServer((req, res) => {
           res.end("Not found");
           return;
         }
-        res.writeHead(200, { "Content-Type": "text/html" });
+        res.writeHead(200, {
+          "Content-Type": "text/html",
+          "Cache-Control": "no-store",
+        });
         res.end(fallback);
       });
       return;
     }
     const ext = path.extname(filePath).toLowerCase();
     const mime = MIME[ext] || "application/octet-stream";
-    res.writeHead(200, { "Content-Type": mime });
+    res.writeHead(200, {
+      "Content-Type": mime,
+      "Cache-Control": cacheControl(filePath),
+    });
     res.end(data);
   });
 });
@@ -444,6 +553,43 @@ server.listen(PORT, "127.0.0.1", () => {
   // Server ready — parent already detached
 });
 `;
+}
+
+/**
+ * One cache-bust token per CLI invocation.
+ *
+ * Base-36 milliseconds: short, URL-safe, and made here rather than read from
+ * anywhere, so nothing on disk reaches the shell `openBrowser` runs.
+ */
+const CACHE_BUST = Date.now().toString(36);
+
+/**
+ * The visualizer URL, with the cache-bust token.
+ *
+ * `Cache-Control: no-store` only reaches a response the browser actually asks
+ * for. The client that reported this cached `/` before the upgrade, so it never
+ * asks — its entry is still fresh, it keeps serving the old index.html naming
+ * the old hashed bundles, and it never learns the policy changed. `ix view`
+ * reuses 127.0.0.1 on the same port across upgrades, so that entry outlives the
+ * install meant to replace it. Without a different key the header is
+ * prospective only: it protects the next upgrade, not the one the user just
+ * ran, which is the one they are looking at.
+ *
+ * Every URL the CLI names goes through this, not just the one it opens. The
+ * reporter's path is `ix upgrade` (which replaces the dist in place and leaves
+ * the server running) then `ix view`, which takes the already-running branch
+ * and only *prints* a URL; a bust on the opened tab alone would miss it
+ * entirely, along with `--no-open`, a copied URL and a bookmark.
+ *
+ * Per invocation rather than keyed on the build stamp. The entry point is
+ * `no-store` now, so there is no cache entry a repeat start could have hit and
+ * nothing is lost by changing the key every time — while a stamp would have to
+ * be read from the dist, which is absent in a dev build, exactly where an
+ * iterating developer needs this most. Assets keep their own URLs, so they
+ * still come from cache.
+ */
+export function browserUrl(serverUrl: string, token: string = CACHE_BUST): string {
+  return `${serverUrl}/?ix=${token}`;
 }
 
 function openBrowser(url: string): void {
@@ -609,7 +755,11 @@ export function registerViewCommand(program: Command): void {
       writeFileSync(SCOPE_FILE, scopeKey);
       writeFileSync(PORT_FILE, String(port));
 
-      const url = `http://localhost:${port}`;
+      // One URL, printed and opened. They used to differ: only the opened
+      // one carried the cache bust, so --no-open, a copied URL, a bookmark
+      // and the not-ready branch below all still resolved to the entry the
+      // browser cached before the upgrade.
+      const url = browserUrl(`http://localhost:${port}`);
 
       // Reported rather than fatal: the wait is a heuristic, and a machine slow
       // enough to exceed it would otherwise have a working visualizer killed off

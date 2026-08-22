@@ -83,6 +83,90 @@ contains method=12 field=4
 item name=parseFile kind=method
 ```
 
+`ix context <target>`:
+
+```
+context target=Widget target_kind=class stale=false classification=current entities=2 relationships=1 claims=1 decisions=0 conflicts=0 intents=0 evidence=7 truncated_entities=0 truncated_relationships=0 truncated_evidence=0 truncated_chars=0
+evidence score=0 kind=target title="Widget (class)"
+evidence score=20 kind=claim title="renders to DOM"
+evidence score=30 kind=relationship title="entity-1 --calls--> entity-2"
+```
+
+One header record, then the ranked evidence. The entity, relationship and claim
+lists stay counts here — `llm` is the token-minimal surface and the ranked
+evidence is what it exists to deliver; `--format json` carries the rest.
+
+`ix context --diff <id>`:
+
+```
+diff investigation=widget target=Widget saved_at=2026-01-03T09:12:44.108Z generated_at=2026-01-19T11:02:07.441Z freshness_previous=current freshness_current=stale
+budgets scope=saved entities=50 relationships=100 evidence=25 chars=12000
+budgets scope=requested entities=10 applied=false
+budgets scope=effective entities=50 relationships=100 evidence=25 chars=12000
+count added_entities=1 removed_entities=0 added_relationships=1 removed_relationships=1 added_evidence=2 removed_evidence=1 added_claims=1 removed_claims=0
+entity change=added id=entity-3 kind=method name=mount path=src/widget.ts
+relationship change=removed src=entity-1 pred=calls dst=entity-2
+evidence change=added score=30 kind=relationship title="entity-1 --holds--> entity-3"
+claim change=added id=c-8f31a2 entity=entity-1 status=active statement="mounts to DOM"
+```
+
+The counts keep their zeros: "nothing was added" is the answer `--diff` was
+asked for, not a default worth dropping. Added and removed share one record
+kind and separate on `change=`, so a consumer routing on `entity` sees both
+sides of the comparison.
+
+`saved_at` is when the baseline snapshot was taken. `freshness_previous` says
+whether it was fresh *then*, not how long ago that was, so a snapshot from five
+minutes ago and one from three months ago read identically without it.
+
+The three `budgets` records say which limits governed the comparison.
+`scope=saved` is the saved investigation's, `scope=effective` is what the fresh
+bundle was actually built with, and `scope=requested` appears only when
+`--max-*` flags were passed — carrying `applied=`, because saved budgets govern
+`--diff` and a flag that changed nothing is worth saying so in a field a
+consumer can test.
+
+An `entity` record carries `id=` because `relationship` records name their
+endpoints by entity id; without it `src=`/`dst=` resolve to nothing the reader
+has seen. A `claim` record carries `statement=` for the same reason its `id=`
+is not enough: the id is the backend's, and the statement is what changed.
+
+`ix context --list`:
+
+```
+investigations total=2 skipped=1
+investigation id=widget saved_at=2026-01-03T09:12:44.108Z target=Widget target_kind=class classification=current stale=false entities=12 relationships=20 evidence=8 truncated_entities=0 truncated_relationships=0 truncated_evidence=0 truncated_chars=0
+investigation id=auth-path saved_at=2026-01-02T17:03:11.882Z target=verify_token target_kind=function classification=stale stale=true entities=31 relationships=64 evidence=25 truncated_entities=0 truncated_relationships=0 truncated_evidence=4 truncated_chars=0
+```
+
+`skipped` counts saved files that did not match the contract and is present
+only when it is non-zero — it is the one thing about a listing that cannot be
+seen from the records themselves. Note that `stale=` and the four `truncated_*`
+fields are *not* dropped when zero or false: `llmField` omits only nullish and
+empty-string values, and these say "measured, and it was none", which a missing
+field does not.
+
+`id` is the id `--resume` and `--diff` take, not necessarily the file name on
+disk; the two differ whenever an id contains a character outside
+`[A-Za-z0-9._-]`. Both forms load, because the encoding is not always
+reversible — above U+00FF the escape width is ambiguous, and the listing shows
+the stored name rather than guess.
+
+The counts describe each bundle; the bundles themselves are not in the listing,
+and `ix context --resume <id>` fetches one:
+
+```
+resumed id=widget saved_at=2026-01-03T09:12:44.108Z
+context target=Widget target_kind=class stale=false classification=current entities=2 relationships=1 claims=1 decisions=0 conflicts=0 intents=0 evidence=7 truncated_entities=0 truncated_relationships=0 truncated_evidence=0 truncated_chars=0
+evidence score=0 kind=target title="Widget (class)"
+```
+
+`resumed`, not `investigation`: the record kinds are distinct because the
+shapes are, and a consumer routing on the kind should not have to guess which
+of two field sets it is holding. `saved_at` is on it because the `context`
+record that follows says whether the snapshot was fresh when it was taken, not
+when that was.
+
 Error line:
 
 ```

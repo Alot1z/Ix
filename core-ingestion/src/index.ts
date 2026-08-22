@@ -134,12 +134,9 @@ export interface ParsedEntity {
   /** Direct enclosing class/interface/trait, if any (undefined for file-level entities). */
   container?: string;
   /**
-   * Package name for languages that group entities into namespaces (currently
-   * Go only). Used by downstream layers to prefix qualifiedName so the symbol
-   * table indexes entities under their fully-qualified path. Without this,
-   * bare-name resolution at edge-resolver collides between packages (e.g.
-   * kubernetes has 191 distinct `addKnownTypes` functions, one per API group)
-   * and CALL targets are picked non-deterministically.
+   * Package or namespace name for languages that group entities. Used by
+   * downstream resolution to distinguish identically named declarations and
+   * index entities under their fully-qualified path.
    */
   packageScope?: string;
 }
@@ -172,6 +169,12 @@ export interface ParsedRelationship {
   // that happens to flatten to the same stem ("core"). Absent on non-import rels
   // and on dotted/symbol imports where dstName is already the full identifier.
   importRaw?: string;
+  /** PHP namespace import category. Absent for all other languages. */
+  importKind?: 'type' | 'function' | 'const';
+  /** PHP aliases need binding metadata before exact FQCN resolution is safe. */
+  importAliased?: boolean;
+  /** PHP call shape used to distinguish constructors from same-named functions. */
+  phpCallKind?: 'constructor' | 'function' | 'member' | 'static';
   /**
    * JS/TS only: whether this identifier use is lexically bound to its matching
    * import. False means a parameter or local declaration shadows that import.
@@ -215,6 +218,13 @@ export interface FileParseResult {
   importBindings?: ImportBinding[];
   /** JS/TS provider-side aliased/default public export names. */
   exportPublicNames?: ExportPublicName[];
+  /**
+   * PHP only: how many namespaces the file declares, braced or not. Consumers
+   * that key an index per FILE need this to detect the multi-namespace files
+   * where a per-file index would be wrong (a `use` is scoped to its block).
+   * Absent for non-PHP files and for PHP files in the global namespace.
+   */
+  phpNamespaceBlocks?: number;
   fileRole: RoleClassification;
 }
 
@@ -1983,6 +1993,73 @@ function unwrapRustCfgMacros(source: string): string {
 // Main parse function
 // ---------------------------------------------------------------------------
 
+interface PhpNamespaceSpan {
+  startIndex: number;
+  namespace: string;
+}
+
+interface PhpNamespaces {
+  /** Unbraced `namespace X;` declarations, ascending by start offset. */
+  spans: PhpNamespaceSpan[];
+  /** Every top-level `namespace` declaration, braced or not. */
+  blocks: number;
+}
+
+/**
+ * The file's namespace structure: start offsets of every unbraced
+ * `namespace X;` at top level (ascending), plus how many namespaces the file
+ * declares in total.
+ *
+ * Built once per parse. Doing the span scan per definition instead made the
+ * file cost O(definitions x top-level nodes): a valid 890 KB PSR-12 file with
+ * ~16k functions took ~197s, against ~355ms without it. Both results come off
+ * that single walk on purpose — reading `namedChildren` a second time pays the
+ * whole node-wrapper materialization cost again, which is the dominant term.
+ *
+ * A braced `namespace X { ... }` scopes by containment rather than position, so
+ * it is handled by the ancestor walk in {@link phpNamespaceForNode} and is
+ * excluded from `spans` — but it still counts towards `blocks`.
+ */
+function collectPhpNamespaces(rootNode: any): PhpNamespaces {
+  const spans: PhpNamespaceSpan[] = [];
+  let blocks = 0;
+  // `namedChildren` materializes the list in a single walk; indexing
+  // `namedChild(i)` in a loop is what made the original scan expensive.
+  for (const child of rootNode.namedChildren ?? []) {
+    if (!child || child.type !== 'namespace_definition') continue;
+    blocks++;
+    if (child.childForFieldName?.('body')) continue;
+    spans.push({
+      startIndex: child.startIndex,
+      namespace: child.childForFieldName?.('name')?.text?.replace(/\s+/g, '') ?? '',
+    });
+  }
+  return { spans, blocks };
+}
+
+function phpNamespaceForNode(node: any, spans: PhpNamespaceSpan[]): string | undefined {
+  for (let current = node.parent; current; current = current.parent) {
+    if (current.type === 'namespace_definition') {
+      return current.childForFieldName?.('name')?.text?.replace(/\s+/g, '') ?? '';
+    }
+  }
+
+  // The last unbraced declaration starting before this node wins.
+  let low = 0;
+  let high = spans.length - 1;
+  let active: string | undefined;
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    if (spans[mid].startIndex < node.startIndex) {
+      active = spans[mid].namespace;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return active;
+}
+
 export function parseFile(filePath: string, source: string): FileParseResult | null {
   const language = detectLanguageForSource(filePath, source);
   if (!language) return null;
@@ -2127,6 +2204,12 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
       }
     }
 
+    // Same idea for PHP: collect the file's namespace boundaries once rather
+    // than rescanning the top level for every definition.
+    const phpNamespaces: PhpNamespaces = language === SupportedLanguages.PHP
+      ? collectPhpNamespaces(tree.rootNode)
+      : { spans: [], blocks: 0 };
+
     // --- First pass: collect definitions ---
     for (const match of pass1Matches) {
       // Definition captures: name + definition.*
@@ -2198,7 +2281,11 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
           lineEnd,
           language,
           container: effectiveContainer,
-          packageScope: goPackage,
+          packageScope: goPackage ?? (
+            language === SupportedLanguages.PHP
+              ? phpNamespaceForNode(defNode, phpNamespaces.spans)
+              : undefined
+          ),
         });
 
         pendingChunks.push({
@@ -2419,6 +2506,27 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
         continue;
       }
 
+      // PHP grouped use: `use Vendor\Package\{A, B};` (also `use function` /
+      // `use const`). Each member is its own namespace_use_clause under the
+      // group; the shared prefix arrives via @import.prefix. The clause's FIRST
+      // name child is the imported symbol (a second one is an `as` alias and
+      // must never become an import), so rebuild the FQCN from prefix + first
+      // name, matching the single-clause form's modName/importRaw shape.
+      const phpGroupPrefix = match.captures.find((c: any) => c.name === 'import.prefix')?.node.text;
+      const phpGroupClauses = match.captures.filter((c: any) => c.name === 'import.clause');
+      if (language === SupportedLanguages.PHP && phpGroupClauses.length > 0) {
+        for (const clause of phpGroupClauses) {
+          const firstName = clause.node.namedChildren.find((c: any) => c.type === 'name');
+          if (!firstName) continue;
+          const fqcn = phpGroupPrefix ? `${phpGroupPrefix}\\${firstName.text}` : firstName.text;
+          const modName = normalizeCapturedImport(fqcn, language);
+          const importRaw = unwrapImportSpecifier(fqcn);
+          entities.push({ name: modName, kind: 'module', lineStart: firstName.startPosition.row + 1, lineEnd: firstName.startPosition.row + 1, language });
+          relationships.push({ srcName: fileName, dstName: modName, predicate: 'IMPORTS', importRaw });
+        }
+        continue;
+      }
+
       // Import captures (JS/TS/Python path-based)
       const importSource = match.captures.find((c: any) => c.name === 'import.source');
       if (importSource) {
@@ -2456,8 +2564,33 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
           // Preserve the raw specifier (./core vs @nestjs/core) for the multi-repo
           // dependency gate; modName remains the flattened stem used everywhere else.
           const importRaw = unwrapImportSpecifier(importSource.node.text);
+          const importNode = match.captures.find((c: any) => c.name === 'import')?.node;
+          const phpImportText = language === SupportedLanguages.PHP ? importNode?.text ?? '' : '';
+          const importKind = language === SupportedLanguages.PHP
+            ? /^use\s+function\b/i.test(phpImportText)
+              ? 'function' as const
+              : /^use\s+const\b/i.test(phpImportText)
+                ? 'const' as const
+                : undefined
+            : undefined;
+          // Alias detection is per *clause*, not per statement. `use A\B, C\D as E;`
+          // is one declaration with two clauses, so testing the statement text
+          // flagged the un-aliased clause too and silently disabled FQCN
+          // resolution for it. Reading the node also drops an unanchored
+          // /\s+as\s+/ over repo-controlled text, which backtracks quadratically.
+          const phpUseClause = importSource.node.parent;
+          const phpImportAliased = language === SupportedLanguages.PHP
+            && phpUseClause?.type === 'namespace_use_clause'
+            && phpUseClause.namedChildCount > 1;
           entities.push({ name: modName, kind: 'module', lineStart: importSource.node.startPosition.row + 1, lineEnd: importSource.node.startPosition.row + 1, language });
-          relationships.push({ srcName: fileName, dstName: modName, predicate: 'IMPORTS', importRaw });
+          relationships.push({
+            srcName: fileName,
+            dstName: modName,
+            predicate: 'IMPORTS',
+            importRaw,
+            ...(importKind ? { importKind } : {}),
+            ...(phpImportAliased ? { importAliased: true } : {}),
+          });
         }
         continue;
       }
@@ -2490,6 +2623,16 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
       if (callName) {
         const callee = callName.node.text;
         if (!callee || callee.length <= 1) continue;
+        const phpCallKind = language === SupportedLanguages.PHP
+          ? callName.node.parent?.type === 'object_creation_expression'
+            ? 'constructor' as const
+            : callName.node.parent?.type === 'member_call_expression' ||
+                callName.node.parent?.type === 'nullsafe_member_call_expression'
+              ? 'member' as const
+              : callName.node.parent?.type === 'scoped_call_expression'
+                ? 'static' as const
+                : 'function' as const
+          : undefined;
 
         // If a _qualifier capture is present (field_expression / stable_identifier
         // patterns like NodeKind.Decision, or Python attribute calls like
@@ -2662,9 +2805,15 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
           recordJsTsImportUse('CALLS', caller, effectiveCallee, callName.node, callee);
         }
 
-        if (!seen.has(effectiveCallee)) {
-          seen.add(effectiveCallee);
-          relationships.push({ srcName: caller, dstName: effectiveCallee, predicate: 'CALLS' });
+        const callKey = phpCallKind ? `${phpCallKind}:${effectiveCallee}` : effectiveCallee;
+        if (!seen.has(callKey)) {
+          seen.add(callKey);
+          relationships.push({
+            srcName: caller,
+            dstName: effectiveCallee,
+            predicate: 'CALLS',
+            ...(phpCallKind ? { phpCallKind } : {}),
+          });
         }
         continue;
       }
@@ -2772,6 +2921,10 @@ export function parseFile(filePath: string, source: string): FileParseResult | n
       importAliases: Object.keys(importAliases).length > 0 ? importAliases : undefined,
       importBindings: importBindings.length > 0 ? importBindings : undefined,
       exportPublicNames: exportPublicNames.length > 0 ? exportPublicNames : undefined,
+      // Spread rather than `: undefined` so the key is absent for every non-PHP
+      // file. A key that is present-but-undefined still serializes, which would
+      // rewrite every checked-in parseFile snapshot for no behavioural reason.
+      ...(phpNamespaces.blocks > 0 ? { phpNamespaceBlocks: phpNamespaces.blocks } : {}),
       fileRole: classifyFileRole(filePath, source),
     };
   } catch (e) {
@@ -2804,6 +2957,7 @@ export interface ResolvedEdge {
   dstQualifiedKey: string;      // qualified key used for nodeId in the defining file
   predicate: string;            // "CALLS" | "EXTENDS"
   confidence: number;           // 0.9 import-scoped | 0.8 transitive | 0.5 global
+  phpCallKind?: ParsedRelationship['phpCallKind'];
 }
 
 // ---------------------------------------------------------------------------
@@ -2813,6 +2967,37 @@ export interface ResolvedEdge {
 /** Build the qualified key for an entity (mirrors buildPatch's entityQKey logic). */
 function qualifiedKey(e: ParsedEntity): string {
   return e.container ? `${e.container}.${e.name}` : e.name;
+}
+
+const PHP_TYPE_KINDS = new Set(['class', 'interface', 'trait', 'enum']);
+
+function trimPhpNamespace(namespace: string | undefined): string {
+  if (!namespace) return '';
+  let start = 0;
+  let end = namespace.length;
+  while (start < end && namespace.charCodeAt(start) === 92) start++;
+  while (end > start && namespace.charCodeAt(end - 1) === 92) end--;
+  return namespace.slice(start, end);
+}
+
+function phpTypeFqcn(entity: ParsedEntity): string | undefined {
+  if (entity.language !== SupportedLanguages.PHP || !PHP_TYPE_KINDS.has(entity.kind) || entity.container) {
+    return undefined;
+  }
+  const namespace = trimPhpNamespace(entity.packageScope);
+  return `${namespace ? `${namespace}\\` : ''}${entity.name}`.toLowerCase();
+}
+
+function ambiguousPhpTypeNames(entities: ParsedEntity[]): Set<string> {
+  const counts = new Map<string, number>();
+  for (const entity of entities) {
+    if (entity.language !== SupportedLanguages.PHP || !PHP_TYPE_KINDS.has(entity.kind) || entity.container) {
+      continue;
+    }
+    const name = entity.name.toLowerCase();
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  return new Set([...counts].filter(([, count]) => count > 1).map(([name]) => name));
 }
 
 /**
@@ -2831,6 +3016,24 @@ function bestQKey(
   return qks.length === 1 ? qks[0] : null;
 }
 
+function bestPhpQKey(
+  fileQKeys: Map<string, Map<string, string[]>>,
+  filePath: string,
+  plainName: string,
+  preferredQKey?: string,
+): string | null {
+  const qks = [...new Set(
+    [...(fileQKeys.get(filePath) ?? [])]
+      .filter(([name]) => name.toLowerCase() === plainName.toLowerCase())
+      .flatMap(([, keys]) => keys),
+  )];
+  if (preferredQKey) {
+    const preferred = qks.find(key => key.toLowerCase() === preferredQKey.toLowerCase());
+    if (preferred) return preferred;
+  }
+  return qks.length === 1 ? qks[0] : null;
+}
+
 // ---------------------------------------------------------------------------
 // Global resolution index — pre-scan for cross-batch edge resolution
 // ---------------------------------------------------------------------------
@@ -2845,6 +3048,7 @@ export interface GlobalResolutionIndex {
   packageToFiles:   Map<string, string[]>;
   goPkgDirToFiles:  Map<string, string[]>;
   goPkgPathToFiles: Map<string, string[]>;
+  phpFqcnToTypes?:  Map<string, Array<{ filePath: string; typeName: string }>>;
 }
 
 /**
@@ -2869,6 +3073,7 @@ export function buildGlobalResolutionIndex(
   const packageToFiles = new Map<string, string[]>();
   const goPkgDirToFiles = new Map<string, string[]>();
   const goPkgPathToFiles = new Map<string, string[]>();
+  const phpFqcnToTypes = new Map<string, Array<{ filePath: string; typeName: string }>>();
 
   for (const fp of filePaths) {
     const ext = nodePath.extname(fp);
@@ -3025,11 +3230,20 @@ export function buildGlobalResolutionIndex(
       const parsed = preParsed?.get(fp) ?? parseFile(fp, src);
       if (!parsed) continue;
       const qkMap = new Map<string, string[]>();
+      const ambiguousTypes = ambiguousPhpTypeNames(parsed.entities);
       for (const e of parsed.entities) {
         if (e.kind === 'file' || e.kind === 'module') continue;
         const list = qkMap.get(e.name) ?? [];
         list.push(qualifiedKey(e));
         qkMap.set(e.name, list);
+        const fqcn = phpTypeFqcn(e);
+        if (fqcn && !ambiguousTypes.has(e.name.toLowerCase())) {
+          const entries = phpFqcnToTypes.get(fqcn) ?? [];
+          if (!entries.some(entry => entry.filePath === fp && entry.typeName === e.name)) {
+            entries.push({ filePath: fp, typeName: e.name });
+          }
+          phpFqcnToTypes.set(fqcn, entries);
+        }
       }
       if (qkMap.size > 0) {
         fileQKeys.set(fp, qkMap);
@@ -3078,6 +3292,7 @@ export function buildGlobalResolutionIndex(
     packageToFiles,
     goPkgDirToFiles,
     goPkgPathToFiles,
+    phpFqcnToTypes,
   };
 }
 
@@ -3165,6 +3380,14 @@ export function resolveEdges(
     // cross-repo gate so genuine edges survive even where import-to-package matching
     // can't bridge the gap (e.g. Java's Maven artifactId vs `import com.google...`).
     declaredRepoDeps?: Record<string, string[]>;
+    // Workspace-aware JS/TS module resolution supplied by the CLI. `undefined`
+    // preserves the existing fallback; an empty array is authoritative and
+    // prevents a configured import from falling through to an unrelated stem.
+    resolveModuleSpecifier?: (
+      srcFilePath: string,
+      specifier: string,
+      kind?: 'runtime' | 'types',
+    ) => string[] | undefined;
   },
 ): ResolvedEdge[] {
   // Provide a default no-op stats bag when caller passes none (backward compat).
@@ -3200,6 +3423,40 @@ export function resolveEdges(
       let m = callBindings.get(r.filePath);
       if (!m) { m = new Map(); callBindings.set(r.filePath, m); }
       if (!m.has(b.local)) m.set(b.local, b.imported);
+    }
+  }
+  const phpFqcnImportsByLocal = new Map<string, Map<string, string | null>>();
+  for (const result of results) {
+    if (result.language !== SupportedLanguages.PHP) continue;
+    // A `use` is scoped to its namespace *block*, but this index is per file.
+    // In a file with several namespaces, an import in one block would be
+    // applied to the others — resolving a name that a later block declares
+    // itself, and pointing it confidently at the wrong file. One namespace per
+    // file is the PSR-12 norm, so skip the rare multi-block file entirely
+    // rather than mis-resolve it; it simply keeps the pre-existing behaviour.
+    //
+    // The count comes from the parser's `namespace_definition` nodes, NOT from
+    // the entities' packageScope. Two things are invisible from the entity side:
+    // two blocks may declare the SAME namespace name (one distinct scope string,
+    // still two scopes), and a block containing only `use` statements declares
+    // no entities at all (no scope string, but its imports are still confined
+    // to it). Both were mis-classified as single-namespace files.
+    if ((result.phpNamespaceBlocks ?? 0) > 1) continue;
+    for (const rel of result.relationships) {
+      if (
+        rel.predicate !== 'IMPORTS' ||
+        rel.importKind === 'function' ||
+        rel.importKind === 'const' ||
+        rel.importAliased ||
+        typeof rel.importRaw !== 'string'
+      ) continue;
+      const fqcn = rel.importRaw.replace(/^\\+/, '').toLowerCase();
+      const local = fqcn.split('\\').pop();
+      if (!local) continue;
+      const imports = phpFqcnImportsByLocal.get(result.filePath) ?? new Map<string, string | null>();
+      if (!imports.has(local)) imports.set(local, fqcn);
+      else if (imports.get(local) !== fqcn) imports.set(local, null);
+      phpFqcnImportsByLocal.set(result.filePath, imports);
     }
   }
   // Cross-repo dependency graph: repo R depends on repo D when any file in R
@@ -3337,6 +3594,24 @@ export function resolveEdges(
   const fileHasSymbol = new Map<string, Set<string>>();
   for (const [fp, qkMap] of fileQKeys) {
     fileHasSymbol.set(fp, new Set(qkMap.keys()));
+  }
+
+  const phpFqcnToTypes = new Map<string, Array<{ filePath: string; typeName: string }>>();
+  for (const [fqcn, entries] of globalIndex?.phpFqcnToTypes ?? []) {
+    phpFqcnToTypes.set(fqcn, [...entries]);
+  }
+  for (const result of results) {
+    if (result.language !== SupportedLanguages.PHP) continue;
+    const ambiguousTypes = ambiguousPhpTypeNames(result.entities);
+    for (const entity of result.entities) {
+      const fqcn = phpTypeFqcn(entity);
+      if (!fqcn || ambiguousTypes.has(entity.name.toLowerCase())) continue;
+      const entries = phpFqcnToTypes.get(fqcn) ?? [];
+      if (!entries.some(entry => entry.filePath === result.filePath && entry.typeName === entity.name)) {
+        entries.push({ filePath: result.filePath, typeName: entity.name });
+      }
+      phpFqcnToTypes.set(fqcn, entries);
+    }
   }
 
   // resultsByPath: O(1) lookup replacing results.find() in transitive import loop
@@ -3690,13 +3965,25 @@ export function resolveEdges(
     srcLanguage: SupportedLanguages,
     modName: unknown,
     importRaw?: unknown,
+    kind: 'runtime' | 'types' = 'runtime',
   ): string[] {
+    const configuredMatches =
+      (srcLanguage === SupportedLanguages.JavaScript || srcLanguage === SupportedLanguages.TypeScript) &&
+      typeof importRaw === 'string' &&
+      !importRaw.startsWith('./') &&
+      !importRaw.startsWith('../')
+        ? opts?.resolveModuleSpecifier?.(srcFilePath, importRaw, kind)
+        : undefined;
+    const indexedConfiguredMatches = configuredMatches?.flatMap(filePath =>
+      normalizedPathToFiles.get(normalizedPathKey(filePath)) ?? []
+    ).filter(filePath => normalizedPathKey(filePath) !== normalizedPathKey(srcFilePath));
     // fileLanguage only covers the current parse batch; cross-batch candidates
     // come from the global stem index, so fall back to the extension-derived
     // language (always available) — otherwise an undefined dst language would
     // slip cross-language matches (e.g. a Python import -> a Rust/Elixir file).
-    const importMatches = (resolveRelativeImportTargets(srcFilePath, srcLanguage, importRaw) ??
-      modNameToFiles(modName, srcFilePath))
+    const importMatches = (configuredMatches === undefined
+      ? resolveRelativeImportTargets(srcFilePath, srcLanguage, importRaw) ?? modNameToFiles(modName, srcFilePath)
+      : indexedConfiguredMatches ?? [])
       .filter(fp => importLanguageCompatible(srcLanguage, fileLanguage.get(fp) ?? languageFromPath(fp)));
     if (srcLanguage !== SupportedLanguages.Go || importMatches.length <= 1) return importMatches;
     return narrowGoImportCandidates(srcFilePath, modName, importMatches, files => {
@@ -3847,6 +4134,28 @@ export function resolveEdges(
     );
   }
 
+  function importedPhpType(srcFilePath: string, rel: ParsedRelationship): {
+    entries: Array<{ filePath: string; typeName: string }>;
+    memberName?: string;
+  } | undefined {
+    if (rel.predicate === 'IMPORTS' && (rel.importKind === 'function' || rel.importKind === 'const')) {
+      return undefined;
+    }
+    const parts = rel.dstName.split('.');
+    if (rel.predicate === 'CALLS' && parts.length === 1 && rel.phpCallKind !== 'constructor') {
+      return undefined;
+    }
+    const imports = phpFqcnImportsByLocal.get(srcFilePath);
+    const local = parts[0].toLowerCase();
+    if (!imports?.has(local)) return undefined;
+    const fqcn = imports.get(local);
+    if (!fqcn) return { entries: [] };
+    return {
+      entries: phpFqcnToTypes.get(fqcn) ?? [],
+      memberName: parts.length > 1 ? parts[parts.length - 1] : undefined,
+    };
+  }
+
   const resolved: ResolvedEdge[] = [];
 
   for (const result of results) {
@@ -3860,6 +4169,13 @@ export function resolveEdges(
     for (const rel of result.relationships) {
       if (rel.predicate !== 'IMPORTS') continue;
       if (pythonHasRelativeModuleImport && rel.importRaw === undefined) continue;
+      const phpType = srcLanguage === SupportedLanguages.PHP
+        ? importedPhpType(srcFilePath, rel)
+        : undefined;
+      if (phpType) {
+        for (const entry of phpType.entries) importedFilePaths.add(entry.filePath);
+        continue;
+      }
       for (const fp of resolveImportTargets(srcFilePath, srcLanguage, rel.dstName, rel.importRaw)) {
         importedFilePaths.add(fp);
       }
@@ -3888,6 +4204,27 @@ export function resolveEdges(
       // name ("ClaimId"), find files registered under that package, then find
       // the one that defines the entity.
       if (rel.predicate === 'IMPORTS') {
+        const phpType = srcLanguage === SupportedLanguages.PHP
+          ? importedPhpType(srcFilePath, rel)
+          : undefined;
+        if (phpType) {
+          if (phpType.entries.length === 1) {
+            const fp = phpType.entries[0].filePath;
+            resolved.push({
+              srcFilePath,
+              srcName: rel.srcName,
+              dstFilePath: fp,
+              dstName: rel.dstName,
+              dstQualifiedKey: fileEntityName(fp),
+              predicate: 'IMPORTS',
+              confidence: 0.9,
+            });
+            stats.resolvedImport++;
+          } else if (phpType.entries.length > 1) {
+            stats.skippedAmbiguous++;
+          }
+          continue;
+        }
         if (result.language === SupportedLanguages.Scala || result.language === SupportedLanguages.Java) {
           const dstName = rel.dstName;
           const lastDot = dstName.lastIndexOf('.');
@@ -3959,6 +4296,36 @@ export function resolveEdges(
         // fall through to Tier 1b → Tier 2 → Tier 3 below
       }
 
+      const phpType = srcLanguage === SupportedLanguages.PHP
+        ? importedPhpType(srcFilePath, rel)
+        : undefined;
+      if (phpType) {
+        if (phpType.entries.length === 1) {
+          const entry = phpType.entries[0];
+          const plainName = phpType.memberName ?? entry.typeName;
+          const preferredQKey = phpType.memberName
+            ? `${entry.typeName}.${phpType.memberName}`
+            : entry.typeName;
+          const dstQualifiedKey = bestPhpQKey(fileQKeys, entry.filePath, plainName, preferredQKey);
+          if (dstQualifiedKey !== null) {
+            resolved.push({
+              srcFilePath,
+              srcName: rel.srcName,
+              dstFilePath: entry.filePath,
+              dstName: rel.dstName,
+              dstQualifiedKey,
+              predicate: rel.predicate,
+              confidence: 0.9,
+              ...(rel.phpCallKind ? { phpCallKind: rel.phpCallKind } : {}),
+            });
+            stats.resolvedQualifier++;
+          }
+        } else if (phpType.entries.length > 1) {
+          stats.skippedAmbiguous++;
+        }
+        continue;
+      }
+
       const origDstName = rel.dstName;
       // Z: resolve a renamed-import call by the provider's public symbol, but keep the
       // ORIGINAL local name on the emitted edge (buildPatchWithResolution maps the edge
@@ -3968,6 +4335,16 @@ export function resolveEdges(
       const binding = rel.importBinding === false
         ? undefined
         : importBindingsByLocal.get(srcFilePath)?.get(origDstName);
+      const configuredBindingTargets = binding &&
+        (srcLanguage === SupportedLanguages.JavaScript || srcLanguage === SupportedLanguages.TypeScript) &&
+        !binding.pkg.startsWith('./') &&
+        !binding.pkg.startsWith('../')
+          ? opts?.resolveModuleSpecifier?.(
+              srcFilePath,
+              binding.pkg,
+              rel.predicate === 'CALLS' ? 'runtime' : 'types',
+            )
+          : undefined;
 
       // Tier 1: same-file — already correct in buildPatch, skip here. Check the
       // call-site name before any import binding rewrite so a local shadow wins.
@@ -3986,10 +4363,37 @@ export function resolveEdges(
             srcLanguage,
             binding.pkg,
             binding.pkg,
+            rel.predicate === 'CALLS' ? 'runtime' : 'types',
           ))];
+          if (
+            configuredBindingTargets !== undefined &&
+            providerFiles.length === 1 &&
+            fileHasSymbol.get(providerFiles[0])?.has(binding.imported)
+          ) {
+            const fp = providerFiles[0];
+            const dstQualifiedKey = bestQKey(fileQKeys, fp, binding.imported);
+            if (dstQualifiedKey !== null) {
+              resolved.push({
+                srcFilePath,
+                srcName,
+                dstFilePath: fp,
+                dstName: origDstName,
+                dstQualifiedKey,
+                predicate: rel.predicate,
+                confidence: 0.9,
+              });
+              continue;
+            }
+          }
           const publicMatches: Array<{ fp: string; local: string }> = [];
           for (const fp of providerFiles.length === 1 ? providerFiles : []) {
-            const local = filePublicNames.get(fp)?.get(binding.imported);
+            // `imported` is the literal sentinel 'default' for a default import, never a
+            // real export name, so a provider member that happens to be *called* `default`
+            // (a method, getter, or static) must not satisfy the fallback.
+            const local = filePublicNames.get(fp)?.get(binding.imported)
+              ?? (binding.imported !== 'default' && fileHasSymbol.get(fp)?.has(binding.imported)
+                ? binding.imported
+                : undefined);
             if (local && fileHasSymbol.get(fp)?.has(local)) publicMatches.push({ fp, local });
           }
           if (publicMatches.length === 1) {
@@ -4120,6 +4524,7 @@ export function resolveEdges(
         resolved.push({ srcFilePath, srcName, dstFilePath: fp, dstName: origDstName, dstQualifiedKey, predicate: rel.predicate, confidence: 0.8 });
         continue;
       }
+      if (configuredBindingTargets?.length === 0) continue;
       if (rel.predicate === 'CALLS' && relativeCallBindings.get(srcFilePath)?.has(origDstName)) {
         stats.skippedAmbiguous++;
         continue;

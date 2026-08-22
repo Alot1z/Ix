@@ -267,7 +267,9 @@ ix inventory --kind function --format json
 - Use `ix inventory` instead of `ix search ""` for listing entities by kind
 - Use `ix diff --summary` for broad revision comparisons (server-side, fast)
 - Use `--full` only when you need every individual change
-- Always use `--limit` to cap result sets
+- Always use `--limit` to cap result sets — except on `ix diff`, where
+  `--summary` and `--full` each already fix the volume and passing `--limit`
+  alongside either is refused rather than silently ignored
 - Use `--format llm` when you are reading the output; `--format json` only when chaining results between commands or extracting a specific field
 - Use `--path` or `--language` to restrict text searches
 - Use exact entity IDs from previous JSON results
