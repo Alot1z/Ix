@@ -6,11 +6,61 @@ import { promisify } from "node:util";
 import type { Command } from "commander";
 import chalk from "chalk";
 import { IxClient } from "../../client/api.js";
+
 import { getEndpoint } from "../config.js";
 import { resolveFileOrEntity, resolveEntityFull, printResolved, looksFileLike, type ResolvedEntity } from "../resolve.js";
 import { formatDiff, relativePath } from "../format.js";
 import { llmLine, llmError } from "../llm.js";
+import { reportFailure } from "../ui.js";
 import { parsePickOption } from "../options.js";
+
+/**
+ * Subset of `DiffOptions` consumed by `detectDiffModeConflict`. Kept as a
+ * structural type so the detector can be unit-tested without driving Commander.
+ */
+export interface DiffModeOptions {
+  summary?: boolean;
+  content?: boolean;
+  full?: boolean;
+  limit?: string;
+}
+
+/**
+ * Detect mutually-incompatible output flags on `ix diff` and return a
+ * human-readable message naming the conflict, or `undefined` if no conflict.
+ *
+ * The action handler early-returns on `--summary` before the `--content` branch
+ * is reached, so passing both flags silently dropped `--content` (and the user
+ * got a summary when they asked for the full textual diff). Catching the
+ * combination up front and surfacing it as a hard error mirrors the
+ * explicit-conflict style in subsystems.ts. `--full --limit <n>` is also
+ * flagged: `--full` is documented as "no limit" so the silent precedence over
+ * `--limit` was the same kind of UX gap.
+ *
+ * Order is load-bearing, not incidental. `--summary` is the flag that wins at
+ * runtime, so when it is present its message is the one that names the flag
+ * actually in charge. Checking `--full --limit` first meant
+ * `ix diff 3 5 --summary --full --limit 20` reported "--full and --limit cannot
+ * be combined" -- two flags `--summary` was going to ignore anyway -- and the
+ * message that would have explained the run was unreachable for that input.
+ */
+export function detectDiffModeConflict(
+  opts: DiffModeOptions,
+): string | undefined {
+  if (opts.summary && opts.content) {
+    return "--summary and --content cannot be combined; --summary renders counts only, --content renders the full textual diff. Pick one.";
+  }
+  if (
+    opts.summary &&
+    (opts.full || opts.limit !== undefined)
+  ) {
+    return "--summary ignores --limit and --full; --summary is server-side counts only. Drop --summary to control change volume, or drop --limit/--full.";
+  }
+  if (opts.full && opts.limit !== undefined) {
+    return "--full and --limit cannot be combined; --full is documented to return all changes without a limit. Drop --limit, or drop --full to keep the existing limit.";
+  }
+  return undefined;
+}
 
 /** Render a `--summary` diff as a single llm record. */
 function renderDiffSummaryLlm(result: any): string {
@@ -431,6 +481,11 @@ export function registerDiffCommand(program: Command): void {
       entity?: string; summary?: boolean; content?: boolean; limit?: string; full?: boolean; format: string;
       kind?: string; path?: string; pick?: number;
     }) => {
+      const conflict = detectDiffModeConflict(opts);
+      if (conflict) {
+        reportFailure("mode_conflict", conflict, opts.format);
+        return;
+      }
       const client = new IxClient(getEndpoint());
       const from = parseInt(fromRev, 10);
       const to = parseInt(toRev, 10);

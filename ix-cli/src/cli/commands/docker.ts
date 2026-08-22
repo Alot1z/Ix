@@ -4,6 +4,7 @@ import { createInterface } from "readline";
 import { existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
+import { stampBackendVersionAfterPull } from "./upgrade.js";
 
 const IX_HOME = process.env.IX_HOME || join(homedir(), ".ix");
 const COMPOSE_DIR = join(IX_HOME, "backend");
@@ -143,6 +144,18 @@ export function registerDockerCommand(program: Command): void {
         console.error("[error] Failed to start Docker containers.");
         process.exit(1);
       }
+
+      // `--pull always` just fetched the images this compose names, so if it
+      // tracks `:latest` the container is now running the current backend
+      // release — record it. Without this the tracked version only ever moves
+      // when `ix upgrade` runs, so starting the backend any other way leaves a
+      // file naming an older release and the update notice fires on every
+      // command for ever. The compose file is passed because it decides whether
+      // that premise holds at all: this falls back to any docker-compose.yml in
+      // the working directory, which may pin a tag, a digest, or a local build.
+      // Awaited so the stamp is on disk before the command returns, and it
+      // cannot fail the start: the helper swallows its own errors.
+      await stampBackendVersionAfterPull(composeFile);
 
       console.log("Waiting for services to become healthy...");
       for (let i = 0; i < 30; i++) {

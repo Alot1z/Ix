@@ -1026,9 +1026,23 @@ export const PHP_QUERIES = `
 
 ; ── Imports: use statements ──────────────────────────────────────────────────
 ; Simple: use App\\Models\\User;
+; The leading anchor pins the capture to the clause's FIRST named child. In
+; "use A\\B\\C as Alias" the alias is a sibling (name) of the (qualified_name),
+; so an unanchored alternation would capture it too and emit a phantom import
+; of Alias. "use GlobalThing;" is a lone (name) child and still matches.
 (namespace_use_declaration
   (namespace_use_clause
-    (qualified_name) @import.source)) @import
+    . [(qualified_name) (name)] @import.source)) @import
+
+; Grouped: use App\\Models\\{User, Repo};
+; The shared prefix is a namespace_name; each member is its own
+; namespace_use_clause carrying the bare member name (and optionally an
+; 'as' alias). The clause is captured whole so the handler can take the
+; FIRST name child as the imported symbol and skip the alias.
+(namespace_use_declaration
+  (namespace_name) @import.prefix
+  (namespace_use_group
+    (namespace_use_clause) @import.clause)) @import
 
 ; ── Function/method calls ────────────────────────────────────────────────────
 ; Regular function call: foo()

@@ -26,6 +26,9 @@ export const DEFAULT_TIMEOUT_MS = 30_000;
  */
 const MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 
+/** How much of a thrown error's text to keep once the output cap has fired. */
+const FAILURE_DETAIL_CHARS = 2 * 1024;
+
 export interface IxRunResult {
   ok: boolean;
   stdout: string;
@@ -422,6 +425,16 @@ async function executeInProcess(
   } finally {
     commandExitCode = commandExitCode ?? (exitCodeIsOurs ? process.exitCode : undefined);
     process.exitCode = callerExitCode;
+    if (failure !== null) {
+      if (run.truncated) {
+        // appendChunk is a no-op once the cap has fired, but *why* the command
+        // threw is the one thing an operator still needs — otherwise a crash is
+        // reported as nothing but "output exceeded N bytes". Keep a bounded copy.
+        run.stderr.push(`\n[ix mcp] command failed: ${failure.slice(0, FAILURE_DETAIL_CHARS)}\n`);
+      } else {
+        appendChunk(run, "stderr", failure);
+      }
+    }
     run.closed = true;
     activeRun = null;
 
@@ -468,11 +481,11 @@ async function executeInProcess(
     }
   }
 
-  const ok = failure === null && (commandExitCode === undefined || commandExitCode === 0);
+  const ok = !run.truncated && failure === null && (commandExitCode === undefined || commandExitCode === 0);
   return {
     ok,
     stdout: run.stdout.join(""),
-    stderr: run.stderr.join("") + (failure ?? ""),
+    stderr: run.stderr.join(""),
   };
 }
 

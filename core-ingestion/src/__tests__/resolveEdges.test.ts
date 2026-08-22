@@ -240,7 +240,7 @@ describe('resolveEdges', () => {
       new Map([
         [
           targetPath,
-          '<?php interface DomainService { public function create(): void; }',
+          '<?php namespace App\\Contracts; interface DomainService { public function create(): void; }',
         ],
       ]),
     );
@@ -254,6 +254,498 @@ describe('resolveEdges', () => {
       predicate: 'CALLS',
       confidence: 0.9,
     });
+  });
+
+  it('does not resolve an imported PHP class to the same name in another namespace', () => {
+    const consumer = parseFile(
+      '/repo/Consumer.php',
+      `<?php
+use Vendor\\Package\\User;
+function run(User $user): void { new User(); $user->save(); }
+      `,
+    )!;
+    const wrong = parseFile(
+      '/repo/App/User.php',
+      `<?php
+namespace App;
+class User { public function save(): void {} }
+      `,
+    )!;
+
+    expect(resolveEdges([consumer, wrong])).toEqual([]);
+  });
+
+  it('normalizes repeated namespace separators without regex backtracking', () => {
+    const provider = parseFile(
+      '/repo/src/Vendor/User.php',
+      '<?php namespace Vendor\\Package; class User {}',
+    )!;
+    const entity = provider.entities.find((candidate) => candidate.name === 'User')!;
+    entity.packageScope = `${'\\'.repeat(4096)}Vendor\\Package${'\\'.repeat(4096)}`;
+    const consumer = parseFile(
+      '/repo/src/Consumer.php',
+      '<?php use Vendor\\Package\\User; function run(User $user): void { new User(); }',
+    )!;
+
+    const edges = resolveEdges([consumer, provider]).filter(
+      (edge) => edge.dstFilePath === '/repo/src/Vendor/User.php',
+    );
+
+    expect(edges).toHaveLength(3);
+  });
+
+  it('does not emit a phantom import for a PHP alias name', () => {
+    // The alias is a sibling (name) of the (qualified_name) inside the clause,
+    // so an unanchored capture treated `Admin` as a second imported module and
+    // matched it against an unrelated class of that name.
+    const consumer = parseFile(
+      '/repo/Consumer.php',
+      `<?php
+use Vendor\\Package\\User as Admin;
+function run(Admin $a): void { new Admin(); $a->save(); }
+      `,
+    )!;
+    const unrelated = parseFile(
+      '/repo/Admin.php',
+      '<?php class Admin { public function save(): void {} }',
+    )!;
+    const intended = parseFile(
+      '/repo/Vendor/Package/User.php',
+      '<?php namespace Vendor\\Package; class User { public function save(): void {} }',
+    )!;
+
+    const edges = resolveEdges([consumer, unrelated, intended]);
+
+    expect(
+      edges.filter(
+        (edge) => edge.predicate === 'IMPORTS' && edge.dstFilePath === '/repo/Admin.php',
+      ),
+    ).toEqual([]);
+    expect(
+      edges.filter((edge) => edge.dstFilePath === '/repo/Admin.php' && edge.confidence === 0.9),
+    ).toEqual([]);
+  });
+
+  it('resolves an un-aliased clause in a comma-separated PHP use statement', () => {
+    // `importAliased` was derived from the whole statement, so one alias
+    // anywhere in the list disabled FQCN resolution for every clause.
+    const consumer = parseFile(
+      '/repo/Consumer.php',
+      `<?php
+use Vendor\\One\\Alpha, Vendor\\Two\\Beta as Bee;
+function run(Alpha $a): void { new Alpha(); }
+      `,
+    )!;
+    const intended = parseFile(
+      '/repo/Vendor/One/Alpha.php',
+      '<?php namespace Vendor\\One; class Alpha {}',
+    )!;
+    const decoy = parseFile(
+      '/repo/Other/Alpha.php',
+      '<?php namespace Other\\Place; class Alpha {}',
+    )!;
+
+    const edges = resolveEdges([consumer, intended, decoy]);
+
+    expect(
+      edges.filter(
+        (edge) => edge.predicate === 'IMPORTS'
+          && edge.dstFilePath === '/repo/Vendor/One/Alpha.php'
+          && edge.confidence === 0.9,
+      ),
+    ).toHaveLength(1);
+    expect(edges.filter((edge) => edge.dstFilePath === '/repo/Other/Alpha.php')).toEqual([]);
+  });
+
+  it('does not leak a PHP use across braced namespace blocks', () => {
+    // `use` is scoped to its namespace block. `go` lives in namespace B, which
+    // declares its own Thing, so it must not resolve to the Thing imported by
+    // namespace A.
+    const consumer = parseFile(
+      '/repo/Multi.php',
+      `<?php
+namespace A {
+    use Vendor\\Package\\Thing;
+    function run(Thing $t): void { new Thing(); }
+}
+namespace B {
+    class Thing {}
+    function go(Thing $t): void { new Thing(); }
+}
+`,
+    )!;
+    const vendor = parseFile(
+      '/repo/Vendor/Package/Thing.php',
+      '<?php namespace Vendor\\Package; class Thing {}',
+    )!;
+
+    const edges = resolveEdges([consumer, vendor]);
+
+    expect(
+      edges.filter(
+        (edge) => edge.srcName === 'go' && edge.dstFilePath === '/repo/Vendor/Package/Thing.php',
+      ),
+    ).toEqual([]);
+  });
+
+  it('does not leak a PHP use across two blocks that declare the same namespace', () => {
+    // Both blocks are `namespace A`, so every entity carries the one scope
+    // string "A". Counting distinct packageScope values sees a single scope and
+    // treats the file as safe to index per-file — but the blocks are still two
+    // separate `use` scopes, and the second declares its own Thing.
+    const consumer = parseFile(
+      '/repo/SameName.php',
+      `<?php
+namespace A {
+    use Vendor\\Package\\Thing;
+    function run(Thing $t): void { new Thing(); }
+}
+namespace A {
+    class Thing {}
+    function go(Thing $t): void { new Thing(); }
+}
+`,
+    )!;
+    const vendor = parseFile(
+      '/repo/Vendor/Package/Thing.php',
+      '<?php namespace Vendor\\Package; class Thing {}',
+    )!;
+
+    expect(consumer.phpNamespaceBlocks).toBe(2);
+    expect(
+      resolveEdges([consumer, vendor]).filter(
+        (edge) => edge.srcName === 'go' && edge.dstFilePath === '/repo/Vendor/Package/Thing.php',
+      ),
+    ).toEqual([]);
+  });
+
+  it('does not leak a PHP use out of a block that declares nothing else', () => {
+    // Namespace A holds only the `use`, so it contributes no entity and no
+    // packageScope at all. From the entity side the file looks like a plain
+    // single-namespace B file, and A's import would be applied to B — where
+    // Thing is locally declared.
+    const consumer = parseFile(
+      '/repo/UseOnly.php',
+      `<?php
+namespace A {
+    use Vendor\\Package\\Thing;
+}
+namespace B {
+    class Thing {}
+    function go(Thing $t): void { new Thing(); }
+}
+`,
+    )!;
+    const vendor = parseFile(
+      '/repo/Vendor/Package/Thing.php',
+      '<?php namespace Vendor\\Package; class Thing {}',
+    )!;
+
+    expect(consumer.phpNamespaceBlocks).toBe(2);
+    expect(
+      resolveEdges([consumer, vendor]).filter(
+        (edge) => edge.srcName === 'go' && edge.dstFilePath === '/repo/Vendor/Package/Thing.php',
+      ),
+    ).toEqual([]);
+  });
+
+  it('still indexes a single-namespace PHP file per file', () => {
+    // The guard must stay off for the overwhelmingly common shape, otherwise
+    // "skip the ambiguous file" quietly becomes "skip every file".
+    const consumer = parseFile(
+      '/repo/Single.php',
+      `<?php
+namespace A;
+use Vendor\\Package\\Thing;
+function go(Thing $t): void { new Thing(); }
+`,
+    )!;
+    const vendor = parseFile(
+      '/repo/Vendor/Package/Thing.php',
+      '<?php namespace Vendor\\Package; class Thing {}',
+    )!;
+
+    expect(consumer.phpNamespaceBlocks).toBe(1);
+    expect(
+      resolveEdges([consumer, vendor]).filter(
+        (edge) => edge.dstFilePath === '/repo/Vendor/Package/Thing.php',
+      ).length,
+    ).toBeGreaterThan(0);
+  });
+
+  it('resolves PHP class imports, references, and calls by exact FQCN', () => {
+    const consumer = parseFile(
+      '/repo/Consumer.php',
+      `<?php
+use Vendor\\Package\\User;
+function run(User $user): void { new User(); $user->save(); }
+      `,
+    )!;
+    const intended = parseFile(
+      '/repo/Vendor/Package/User.php',
+      `<?php
+namespace Vendor\\Package;
+class User { public function save(): void {} }
+      `,
+    )!;
+    const wrong = parseFile(
+      '/repo/App/User.php',
+      `<?php
+namespace App;
+class User { public function save(): void {} }
+      `,
+    )!;
+
+    const resolved = resolveEdges([consumer, intended, wrong]);
+    expect(resolved).toContainEqual({
+      srcFilePath: '/repo/Consumer.php',
+      srcName: 'Consumer.php',
+      dstFilePath: '/repo/Vendor/Package/User.php',
+      dstName: 'User',
+      dstQualifiedKey: 'User.php',
+      predicate: 'IMPORTS',
+      confidence: 0.9,
+    });
+    expect(resolved).toContainEqual(expect.objectContaining({
+      srcFilePath: '/repo/Consumer.php',
+      dstFilePath: '/repo/Vendor/Package/User.php',
+      dstName: 'User',
+      dstQualifiedKey: 'User',
+      predicate: 'REFERENCES',
+      confidence: 0.9,
+    }));
+    expect(resolved).toContainEqual(expect.objectContaining({
+      srcFilePath: '/repo/Consumer.php',
+      dstFilePath: '/repo/Vendor/Package/User.php',
+      dstName: 'User',
+      dstQualifiedKey: 'User',
+      predicate: 'CALLS',
+      confidence: 0.9,
+    }));
+    expect(resolved).toContainEqual(expect.objectContaining({
+      srcFilePath: '/repo/Consumer.php',
+      dstFilePath: '/repo/Vendor/Package/User.php',
+      dstName: 'User.save',
+      dstQualifiedKey: 'User.save',
+      predicate: 'CALLS',
+      confidence: 0.9,
+    }));
+    expect(resolved.some(edge => edge.dstFilePath === '/repo/App/User.php')).toBe(false);
+  });
+
+  it('resolves PHP class names case-insensitively', () => {
+    const consumer = parseFile(
+      '/repo/Consumer.php',
+      `<?php
+use vendor\\package\\USER;
+function run(user $user): void { new user(); $user->save(); }
+      `,
+    )!;
+    const provider = parseFile(
+      '/repo/Vendor/Package/User.php',
+      `<?php
+namespace Vendor\\Package;
+class User { public function save(): void {} }
+      `,
+    )!;
+
+    const resolved = resolveEdges([consumer, provider]);
+    expect(resolved.filter(edge => edge.dstFilePath === '/repo/Vendor/Package/User.php')).toHaveLength(4);
+  });
+
+  it('keeps PHP function and constant imports on their existing resolution path', () => {
+    const consumer = parseFile(
+      '/repo/Consumer.php',
+      `<?php
+use function Vendor\\Package\\helper;
+use const Vendor\\Package\\FLAG;
+function run(): void { helper(); }
+      `,
+    )!;
+    const helper = parseFile(
+      '/repo/Vendor/Package/helper.php',
+      `<?php
+namespace Vendor\\Package;
+function helper(): void {}
+      `,
+    )!;
+    const flag = parseFile('/repo/Vendor/Package/FLAG.php', '<?php const FLAG = 1;')!;
+
+    const resolved = resolveEdges([consumer, helper, flag]);
+    expect(resolved).toContainEqual(expect.objectContaining({
+      dstFilePath: '/repo/Vendor/Package/helper.php',
+      predicate: 'IMPORTS',
+      confidence: 0.9,
+    }));
+    expect(resolved).toContainEqual(expect.objectContaining({
+      dstFilePath: '/repo/Vendor/Package/helper.php',
+      predicate: 'CALLS',
+      confidence: 0.9,
+    }));
+    expect(resolved).toContainEqual(expect.objectContaining({
+      dstFilePath: '/repo/Vendor/Package/FLAG.php',
+      predicate: 'IMPORTS',
+      confidence: 0.9,
+    }));
+  });
+
+  it('does not treat a namespaced function as an imported class provider', () => {
+    const consumer = parseFile(
+      '/repo/Consumer.php',
+      `<?php
+use Vendor\\Package\\User;
+function run(): void { new User(); }
+      `,
+    )!;
+    const functionOnly = parseFile(
+      '/repo/Vendor/Package/User.php',
+      `<?php
+namespace Vendor\\Package;
+function User(): void {}
+      `,
+    )!;
+
+    expect(resolveEdges([consumer, functionOnly])).toEqual([]);
+  });
+
+  it('does not resolve a same-named PHP function call as an imported constructor', () => {
+    const consumer = parseFile(
+      '/repo/Consumer.php',
+      `<?php
+use Vendor\\Package\\Helper;
+function Helper(): void {}
+function run(): void { Helper(); }
+      `,
+    )!;
+    const provider = parseFile(
+      '/repo/Vendor/Package/Helper.php',
+      '<?php namespace Vendor\\Package; class Helper {}',
+    )!;
+
+    const resolved = resolveEdges([consumer, provider]);
+    expect(resolved.some(edge =>
+      edge.predicate === 'CALLS' && edge.dstFilePath === '/repo/Vendor/Package/Helper.php'
+    )).toBe(false);
+  });
+
+  it('keeps a same-named PHP function import separate from a class import', () => {
+    const consumer = parseFile(
+      '/repo/Consumer.php',
+      `<?php
+use Vendor\\Package\\Helper;
+use function Other\\helper;
+function run(): void { helper(); }
+      `,
+    )!;
+    const typeProvider = parseFile(
+      '/repo/Vendor/Package/Helper.php',
+      '<?php namespace Vendor\\Package; class Helper {}',
+    )!;
+    const functionProvider = parseFile(
+      '/repo/Other/helper.php',
+      '<?php namespace Other; function helper(): void {}',
+    )!;
+
+    const resolved = resolveEdges([consumer, typeProvider, functionProvider]);
+    expect(resolved.filter(edge => edge.dstFilePath === '/repo/Other/helper.php')).toHaveLength(2);
+    expect(resolved.some(edge =>
+      edge.predicate === 'CALLS' && edge.dstFilePath === '/repo/Vendor/Package/Helper.php'
+    )).toBe(false);
+  });
+
+  it('resolves a PHP import from the global namespace exactly', () => {
+    const consumer = parseFile(
+      '/repo/Consumer.php',
+      `<?php
+namespace App;
+use GlobalUser;
+function run(GlobalUser $user): void { new GlobalUser(); $user->save(); }
+      `,
+    )!;
+    const intended = parseFile(
+      '/repo/GlobalUser.php',
+      '<?php class GlobalUser { public function save(): void {} }',
+    )!;
+    const wrong = parseFile(
+      '/repo/Other/GlobalUser.php',
+      '<?php namespace Other; class GlobalUser { public function save(): void {} }',
+    )!;
+
+    const resolved = resolveEdges([consumer, intended, wrong]);
+    expect(resolved.filter(edge => edge.dstFilePath === '/repo/GlobalUser.php')).toHaveLength(4);
+    expect(resolved.some(edge => edge.dstFilePath === '/repo/Other/GlobalUser.php')).toBe(false);
+  });
+
+  it('does not exact-resolve duplicate PHP type names within one file', () => {
+    const consumer = parseFile(
+      '/repo/Consumer.php',
+      '<?php use Vendor\\Package\\User; function run(): void { new User(); }',
+    )!;
+    const provider = parseFile(
+      '/repo/Types.php',
+      `<?php
+namespace Vendor\\Package { class User {} }
+namespace Other { class User {} }
+      `,
+    )!;
+
+    expect(resolveEdges([consumer, provider])).toEqual([]);
+  });
+
+  it('does not exact-resolve conflicting PHP imports scoped to different namespaces', () => {
+    const consumer = parseFile(
+      '/repo/Consumer.php',
+      `<?php
+namespace First {
+    use Vendor\\One\\User;
+    function run(User $user): void { new User(); $user->save(); }
+}
+namespace Second {
+    use Vendor\\Two\\User;
+    function execute(User $user): void { new User(); $user->save(); }
+}
+      `,
+    )!;
+    const first = parseFile(
+      '/repo/Vendor/One/User.php',
+      '<?php namespace Vendor\\One; class User { public function save(): void {} }',
+    )!;
+    const second = parseFile(
+      '/repo/Vendor/Two/User.php',
+      '<?php namespace Vendor\\Two; class User { public function save(): void {} }',
+    )!;
+
+    expect(resolveEdges([consumer, first, second])).toEqual([]);
+  });
+
+  it('resolves imports from a grouped PHP use statement', () => {
+    const consumer = parseFile(
+      '/repo/UseCase.php',
+      `<?php
+namespace App;
+
+use Vendor\\Contracts\\{DomainService, Repo};
+
+final class UseCase
+{
+    public function make(): void
+    {
+        $svc = new DomainService();
+    }
+}
+      `,
+    )!;
+    const provider = parseFile(
+      '/repo/DomainService.php',
+      '<?php namespace Vendor\\Contracts; class DomainService {}',
+    )!;
+
+    const resolved = resolveEdges([consumer, provider]);
+    expect(
+      resolved.filter(
+        (e) => e.predicate === 'IMPORTS' && e.dstFilePath === '/repo/DomainService.php',
+      ),
+    ).toHaveLength(1);
   });
 
   it('resolves a TypeScript call when the imported definition is outside the parse batch', () => {
@@ -285,6 +777,115 @@ describe('resolveEdges', () => {
       predicate: 'CALLS',
       confidence: 0.9,
     });
+  });
+
+  it('prefers configured JS/TS module targets over unrelated stem matches', () => {
+    const consumer = parseFile(
+      '/repo/src/consumer.ts',
+      'import { execute } from "@core";\nexport function run() { return execute(); }\n',
+    )!;
+    const intended = parseFile(
+      '/repo/src/adapters/worker.ts',
+      'export function execute() { return "worker"; }\n',
+    )!;
+    const unrelated = parseFile(
+      '/repo/legacy/core.ts',
+      'export function execute() { return "legacy"; }\n',
+    )!;
+
+    const resolved = resolveEdges([consumer, intended, unrelated], undefined, undefined, {
+      resolveModuleSpecifier: (_source, specifier) =>
+        specifier === '@core' ? ['/repo/src/adapters/worker.ts'] : undefined,
+    });
+
+    expect(resolved).toContainEqual(expect.objectContaining({
+      srcFilePath: '/repo/src/consumer.ts',
+      dstFilePath: '/repo/src/adapters/worker.ts',
+      predicate: 'IMPORTS',
+      confidence: 0.9,
+    }));
+    expect(resolved).toContainEqual(expect.objectContaining({
+      srcFilePath: '/repo/src/consumer.ts',
+      dstFilePath: '/repo/src/adapters/worker.ts',
+      predicate: 'CALLS',
+      confidence: 0.9,
+    }));
+    expect(resolved.some(edge => edge.dstFilePath === '/repo/legacy/core.ts')).toBe(false);
+  });
+
+  it('uses mapped runtime files for calls and declaration files for references', () => {
+    const consumer = parseFile(
+      '/repo/src/consumer.ts',
+      'import { run, type Foo } from "@pkg";\n'
+        + 'export function call() { return run(); }\n'
+        + 'export function use(value: Foo) { return value; }\n',
+    )!;
+    const runtime = parseFile('/repo/lib/index.js', 'export function run() { return 1; }\n')!;
+    const declarations = parseFile('/repo/lib/index.d.ts', 'export interface Foo { id: string; }\n')!;
+
+    const resolved = resolveEdges([consumer, runtime, declarations], undefined, undefined, {
+      resolveModuleSpecifier: (_source, _specifier, kind) =>
+        kind === 'types' ? ['/repo/lib/index.d.ts'] : ['/repo/lib/index.js'],
+    });
+
+    expect(resolved).toContainEqual(expect.objectContaining({
+      dstFilePath: '/repo/lib/index.js',
+      predicate: 'CALLS',
+      confidence: 0.9,
+    }));
+    expect(resolved).toContainEqual(expect.objectContaining({
+      dstFilePath: '/repo/lib/index.d.ts',
+      predicate: 'REFERENCES',
+      confidence: 0.9,
+    }));
+  });
+
+  it('does not fall back to a stem when a configured JS/TS import is unresolved', () => {
+    const consumer = parseFile(
+      '/repo/src/consumer.ts',
+      'import { execute } from "@core";\nexport function run() { return execute(); }\n',
+    )!;
+    const unrelated = parseFile(
+      '/repo/legacy/core.ts',
+      'export function execute() { return "legacy"; }\n',
+    )!;
+
+    expect(resolveEdges([consumer, unrelated], undefined, undefined, {
+      resolveModuleSpecifier: () => [],
+    })).toEqual([]);
+  });
+
+  it('keeps transitive resolution when a configured module target is a barrel', () => {
+    const consumer = parseFile(
+      '/repo/app/consumer.ts',
+      'import { execute } from "@pkg";\nexport function run() { return execute(); }\n',
+    )!;
+    const barrel = parseFile(
+      '/repo/pkg/index.ts',
+      'export { execute } from "./worker.js";\n',
+    )!;
+    const worker = parseFile(
+      '/repo/pkg/worker.ts',
+      'export function execute() { return "worker"; }\n',
+    )!;
+
+    const resolved = resolveEdges([consumer, barrel, worker], undefined, undefined, {
+      resolveModuleSpecifier: (_source, specifier) =>
+        specifier === '@pkg' ? ['/repo/pkg/index.ts'] : undefined,
+    });
+
+    expect(resolved).toContainEqual(expect.objectContaining({
+      srcFilePath: '/repo/app/consumer.ts',
+      dstFilePath: '/repo/pkg/index.ts',
+      predicate: 'IMPORTS',
+      confidence: 0.9,
+    }));
+    expect(resolved).toContainEqual(expect.objectContaining({
+      srcFilePath: '/repo/app/consumer.ts',
+      dstFilePath: '/repo/pkg/worker.ts',
+      predicate: 'CALLS',
+      confidence: 0.8,
+    }));
   });
 
   it('resolves a call through a provider export alias', () => {
@@ -581,6 +1182,58 @@ describe('resolveEdges', () => {
       predicate: 'REFERENCES',
       confidence: 0.9,
     });
+  });
+
+  it('resolves renamed imports used in inheritance and type references', () => {
+    const provider = parseFile(
+      '/repo/types.ts',
+      'export interface User { id: string; }\nexport class Base {}\n',
+    )!;
+    const consumer = parseFile(
+      '/repo/consumer.ts',
+      'import { type User as ExternalUser, Base as LocalBase } from "./types";\n'
+        + 'export class Child extends LocalBase {}\n'
+        + 'export function use(value: ExternalUser) { return value.id; }\n',
+    )!;
+
+    const resolved = resolveEdges([consumer, provider]);
+    expect(resolved).toContainEqual({
+      srcFilePath: '/repo/consumer.ts',
+      srcName: 'Child',
+      dstFilePath: '/repo/types.ts',
+      dstName: 'LocalBase',
+      dstQualifiedKey: 'Base',
+      predicate: 'EXTENDS',
+      confidence: 0.9,
+    });
+    expect(resolved).toContainEqual({
+      srcFilePath: '/repo/consumer.ts',
+      srcName: 'use',
+      dstFilePath: '/repo/types.ts',
+      dstName: 'ExternalUser',
+      dstQualifiedKey: 'User',
+      predicate: 'REFERENCES',
+      confidence: 0.9,
+    });
+  });
+
+  it('does not bind a default import to a provider member named "default"', () => {
+    // `imported` is the sentinel 'default' for `import run from "./m"`, not an
+    // export name. Without the guard, the renamed-import fallback matches the
+    // *method* `M.default` and emits a confident edge to the wrong member.
+    const provider = parseFile(
+      '/repo/m.ts',
+      'export class M { default() { return 1; } }\nexport default new M();\n',
+    )!;
+    const consumer = parseFile(
+      '/repo/n.ts',
+      'import run from "./m";\nexport function go() { return run(); }\n',
+    )!;
+
+    const resolved = resolveEdges([consumer, provider]);
+    expect(
+      resolved.filter((e) => e.srcName === 'go' && e.dstQualifiedKey === 'M.default'),
+    ).toEqual([]);
   });
 
   it('uses caller-supplied parse results instead of re-parsing', () => {

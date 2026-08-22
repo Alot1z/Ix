@@ -7,6 +7,40 @@ import { homedir } from "os";
 import chalk from "chalk";
 import { BACKEND_IMAGE, checkBackendImage, isNonStandardBackend } from "../backend-status.js";
 import { canRenderProgress } from "../stderr.js";
+import type { IxClient } from "../../client/api.js";
+import {
+  BACKEND_VERSION_FILE,
+  VERSION_RE,
+  fetchBackendHealth,
+  getTrackedVersion,
+  writeVersionStamp,
+} from "../backend-version.js";
+
+// Re-exported for the existing importers of this module (tests and call sites
+// that predate backend-version.ts). recordBackendRelease is deliberately NOT
+// among them: it is reached only through fetchBackendHealth, and re-exporting
+// it here would advertise a second way in.
+export { BACKEND_VERSION_FILE, VERSION_RE, writeVersionStamp } from "../backend-version.js";
+
+/**
+ * Fetch health and record what the backend says it is running.
+ *
+ * The one entry point commands use, so the cache lookup and the version
+ * comparison live in exactly one place — and so no call site can fetch health
+ * without recording, which is the mistake a grep-based guard could only detect
+ * after the fact.
+ */
+/** The newest backend release the CLI knows of; the ceiling a container may claim. */
+export function backendCeiling(): string | null {
+  return readCache()?.backendLatest ?? null;
+}
+
+export async function readBackendHealth(client: IxClient) {
+  // backendLatest, NOT latest: `latest` is the CLI's own release series, so a
+  // ceiling taken from it would refuse every legitimate container report for
+  // ever — silently reinstating the bug this exists to fix.
+  return fetchBackendHealth(client, backendCeiling(), isNewer);
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -19,7 +53,6 @@ const IX_HOME = process.env.IX_HOME || join(homedir(), ".ix");
 const VERSION_CACHE = join(IX_HOME, ".version-check.json");
 const COMPASS_DIR = join(IX_HOME, "cli", "compass");
 const COMPASS_VERSION_FILE = join(COMPASS_DIR, ".version");
-const BACKEND_VERSION_FILE = join(IX_HOME, ".backend-version");
 
 interface VersionCache {
   latest: string;
@@ -49,12 +82,22 @@ function getCurrentVersion(): string {
 // — `0.9.0-rc.1+abc1234`, valid semver — failed the test. fetchLatestRelease
 // then returned null and `ix upgrade` reported "Could not reach GitHub to check
 // for updates" and exited 1 against a perfectly reachable GitHub.
-export const VERSION_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 
-async function fetchLatestRelease(repo: string): Promise<string | null> {
+async function fetchLatestRelease(
+  repo: string,
+  timeoutMs: number = 30_000,
+): Promise<string | null> {
   try {
+    // Bounded: undici's default headersTimeout is 300s, so a proxy or captive
+    // portal that accepts the connection and never answers stalls whatever is
+    // waiting for five minutes with nothing printed. Every other fetch in this
+    // codebase bounds itself. The default stays generous because `ix upgrade`
+    // awaits three of these and the user chose to wait; the stamp path, which
+    // runs behind `ix docker start` after the containers are already up, passes
+    // a short one instead of making a slow link look like an unreachable GitHub.
     const resp = await fetch(
-      `https://api.github.com/repos/${GITHUB_ORG}/${repo}/releases/latest`
+      `https://api.github.com/repos/${GITHUB_ORG}/${repo}/releases/latest`,
+      { signal: AbortSignal.timeout(timeoutMs) }
     );
     if (!resp.ok) return null;
     const data = (await resp.json()) as { tag_name?: string };
@@ -330,12 +373,172 @@ function shouldOfferCompassUpgrade(compassLatest: string | undefined): boolean {
   return shouldOfferCompassUpgradeFor(compassLatest, installedCompass());
 }
 
-function getTrackedVersion(versionFile: string): string {
+
+
+/**
+ * Whether to tell the user their backend is behind.
+ *
+ * The two branches of `checkForUpdate` — cached and freshly fetched — each made
+ * this decision inline, so a change to one silently did not apply to the other.
+ * Pure, so the thing the user actually sees is testable without a clock, a
+ * cache file or a network.
+ *
+ * The tracked version is the whole input on purpose. It is written wherever the
+ * image is installed or pulled, so it is the record of what is running; nothing
+ * else available locally improves on it, and the one thing that looks like it
+ * would — comparing the container against `docker image inspect ...:latest` —
+ * is registry-blind and reports a months-old image as current.
+ */
+export function backendUpdateAvailable(
+  backendLatest: string | undefined,
+  trackedVersion: string,
+): boolean {
+  return !!backendLatest && isNewer(backendLatest, trackedVersion);
+}
+
+/**
+ * One wording for one condition, used by both callers that branch on
+ * `writeVersionStamp` returning false. Two literals for the same failure is how
+ * they drift.
+ *
+ * It does not promise a nag. A stamp stuck BEHIND makes the notice fire on every
+ * command; a stamp stuck AHEAD makes it stay silent through the next release
+ * the user should have been told about. Both are wrong and neither is fixable
+ * without the write, so the sentence has to cover both.
+ *
+ * Takes no file: both callers can only ever be about the backend stamp, and the
+ * sentence says "backend update notices". A parameter would make it look reusable
+ * for the compass stamp, which it is not.
+ */
+function stampFailureMessage(): string {
+  // States the consequence, not a cause: the write's errno is swallowed, so
+  // "until it is writable" would be a guess — and a wrong one for the case the
+  // tests actually reproduce, a directory sitting where the file belongs, which
+  // no permission change fixes.
+  return `[!!] Could not record the version in ${BACKEND_VERSION_FILE}; until it can be written, backend update notices will be wrong.`;
+}
+
+/**
+ * Whether the stamp disagrees with the release we just pulled.
+ *
+ * Deliberately NOT `backendUpdateAvailable`. That answers "is there an upgrade
+ * to offer", which is silent when the stamp is stuck AHEAD — a state this module
+ * documents as reachable, since the GHCR tag and the release feed are published
+ * separately — and an ahead stamp is equally wrong and equally uncorrectable
+ * once the write has failed.
+ *
+ * Compared by PRECEDENCE, not as text, and precedence is what the notice this
+ * warns about uses. The reachable divergence is a PRE-RELEASE: a stamp left at
+ * `1.0.16-rc1` by an earlier pull disagrees with a pulled `1.0.16`, and it must
+ * keep disagreeing — `backendUpdateAvailable` says an upgrade is available, so
+ * the notice really will fire. A comparison that only looked at the numeric
+ * triple would call those equal and swallow the one warning that explains it.
+ *
+ * Build metadata and leading zeros go the other way: `VERSION_RE` admits both
+ * and `splitVersion` ignores both, so `1.0.16+abc` and `1.0.16` are one release
+ * and must NOT warn. That one is reachable too, by the same route: all three
+ * writers stamp the feed's `tag_name` with only a leading `v` stripped, so a
+ * release tagged `v1.0.16+build77` lands in this file verbatim — and VERSION_RE
+ * admits it deliberately, after a tag carrying both a pre-release and build
+ * metadata once broke `ix upgrade` outright.
+ *
+ * Symmetric, so the argument order carries no meaning and a swapped call cannot
+ * change the answer; it reads (tracked, pulled) to match its name. Named and
+ * exported rather than inlined so it is testable and so its divergence from the
+ * notice predicate is visible rather than accidental.
+ */
+export function stampDisagreesWithPull(trackedVersion: string, pulled: string): boolean {
+  return isNewer(trackedVersion, pulled) || isNewer(pulled, trackedVersion);
+}
+
+
+/**
+ * Whether this compose file runs the backend from the moving `:latest` tag.
+ *
+ * The premise of stamping after a pull is that `--pull always` fetched the
+ * current release — which holds only if the file being started actually tracks
+ * `:latest`. `ix docker start` falls back to any `docker-compose.yml` in the
+ * working directory, so it may well not: a compose that pins `:1.0.13`, pins a
+ * digest, or points at a locally-built image pulls something that is not the
+ * latest release, and stamping it would put a version in the file that the
+ * running container does not have.
+ *
+ * That is the one way this file must never be wrong, so the check is on the
+ * image reference itself rather than on which path the compose came from — a
+ * user is free to edit the copy under IX_HOME, and it is what the file *says*
+ * that decides what gets pulled.
+ */
+export function composeTracksLatestBackend(composeText: string): boolean {
+  // Compared as a whole string rather than matched as a pattern: BACKEND_IMAGE
+  // is interpolated, and its dots are regex wildcards, so a pattern here would
+  // also accept `ghcrXio/...` and anything else that happened to line up.
+  const wanted = `${BACKEND_IMAGE}:latest`;
+  return composeText.split(/\r?\n/).some((line) => {
+    const declared = /^\s*image:\s*(.+?)\s*$/.exec(line);
+    if (!declared) return false;
+    return declared[1].replace(/^["']|["']$/g, "") === wanted;
+  });
+}
+
+/**
+ * Record the backend release after something has pulled `:latest`.
+ *
+ * `.backend-version` is written at install time (install.sh, install.ps1) and by
+ * `ix upgrade` — but not by `ix docker start`, which pulls `:latest` on every
+ * cold start. So anyone who took a newer image that way kept a file naming the
+ * release they installed while running a later one, and was told to upgrade on
+ * every command for ever.
+ *
+ * The fix belongs at the write, not at the read. Having just pulled `:latest`,
+ * the running image IS the current release, so the release is simply what to
+ * record; nothing has to be inferred about it afterwards. Inferring it is what
+ * cannot be done safely here — `docker image inspect ...:latest` never contacts
+ * a registry, so a container matching the local `:latest` proves only that
+ * nothing has been pulled since, which is equally true of a months-old image.
+ *
+ * Always asks the release feed rather than reading the version cache, on a short
+ * bound. Preferring the cache looked like a free saving and was not: a cache up
+ * to an hour old can name an EARLIER release than the file already holds (an
+ * installer stamps the true latest without touching the cache), so it needed a
+ * "never go backwards" rule to be safe — and that rule then pinned a file that
+ * had got AHEAD, which is a state this very module documents as reachable, since
+ * the GHCR tag and the release feed are published separately. Fetching keeps the
+ * write self-healing in both directions, and only on a cold start.
+ *
+ * If the release cannot be established the stamp is left alone: the user keeps a
+ * notice they may not need, which is the failure worth having. A write that
+ * fails says so, because "update available" for ever with no explanation is the
+ * symptom this whole change is about.
+ */
+export async function stampBackendVersionAfterPull(composeFile: string): Promise<void> {
   try {
-    if (!existsSync(versionFile)) return "0.0.0";
-    return readFileSync(versionFile, "utf-8").trim() || "0.0.0";
+    if (!composeTracksLatestBackend(readFileSync(composeFile, "utf-8"))) return;
+    // Short bound: this is awaited behind `ix docker start`, whose containers
+    // are already up, so a proxy that accepts and never answers must not hold
+    // the command open for the generous default the upgrade path wants.
+    const latest = await fetchLatestRelease(MEMORY_LAYER_DIST_REPO, 10_000);
+    // `latest` first: it decides whether there is anything to write at all, so
+    // it reads in the order it applies and does not lean on the writer's own
+    // falsy check to make a null call a no-op.
+    if (latest && !writeVersionStamp(BACKEND_VERSION_FILE, latest)) {
+      // Must not fail the start, and only worth saying when the file really is
+      // wrong: a root-owned stamp already holding what we just pulled fails to
+      // write on every cold start with nothing actually out of date.
+      //
+      // "Differs from what we pulled" rather than "is behind the release we
+      // fetched": a stamp stuck AHEAD is also wrong and also cannot be
+      // corrected here, and the notice this warns about is computed from the
+      // CACHED release, which can be up to an hour out of step with `latest`.
+      if (stampDisagreesWithPull(getTrackedVersion(BACKEND_VERSION_FILE), latest)) {
+        console.error(chalk.yellow(stampFailureMessage()));
+      }
+    }
   } catch {
-    return "0.0.0";
+    // In practice only the compose read: fetchLatestRelease and
+    // writeVersionStamp swallow their own failures, so offline and rate-limited
+    // arrive as `latest === null` on the normal path above. Kept broad rather
+    // than narrowed to that one call, because nothing here is worth failing a
+    // start the user already got containers out of.
   }
 }
 
@@ -1023,9 +1226,10 @@ export async function checkForUpdate(): Promise<void> {
   if (cache && Date.now() - cache.checkedAt < 3600_000) {
     const hasCliUpdate = isNewer(cache.latest, current);
     const hasCompassUpdate = shouldOfferCompassUpgrade(cache.compassLatest);
-    const backendCurrent = getTrackedVersion(BACKEND_VERSION_FILE);
-    const hasBackendUpdate =
-      cache.backendLatest && isNewer(cache.backendLatest, backendCurrent);
+    const hasBackendUpdate = backendUpdateAvailable(
+      cache.backendLatest,
+      getTrackedVersion(BACKEND_VERSION_FILE),
+    );
     if (hasCliUpdate || hasCompassUpdate || hasBackendUpdate) {
       printUpdateNotice(current, cache.latest, !!hasCompassUpdate, !!hasBackendUpdate);
     }
@@ -1041,9 +1245,10 @@ export async function checkForUpdate(): Promise<void> {
     writeCache(latest, compassLatest ?? undefined, backendLatest ?? undefined);
     const hasCliUpdate = isNewer(latest, current);
     const hasCompassUpdate = shouldOfferCompassUpgrade(compassLatest ?? undefined);
-    const backendCurrent = getTrackedVersion(BACKEND_VERSION_FILE);
-    const hasBackendUpdate =
-      backendLatest && isNewer(backendLatest, backendCurrent);
+    const hasBackendUpdate = backendUpdateAvailable(
+      backendLatest ?? undefined,
+      getTrackedVersion(BACKEND_VERSION_FILE),
+    );
     if (hasCliUpdate || hasCompassUpdate || hasBackendUpdate) {
       printUpdateNotice(current, latest, !!hasCompassUpdate, !!hasBackendUpdate);
     }
@@ -1321,7 +1526,7 @@ export function registerUpgradeCommand(program: Command): void {
       // ── Backend (memory-layer) upgrade ───────────────────────────────
       const backendCurrent = getTrackedVersion(BACKEND_VERSION_FILE);
       let backendImageChanged = false;
-      if (backendLatest && isNewer(backendLatest, backendCurrent)) {
+      if (backendLatest && backendUpdateAvailable(backendLatest, backendCurrent)) {
         console.log(
           `Backend update available: ${backendCurrent === "0.0.0" ? "none" : backendCurrent} → ${chalk.green(backendLatest)}`
         );
@@ -1334,10 +1539,22 @@ export function registerUpgradeCommand(program: Command): void {
               ["pull", "ghcr.io/ix-infrastructure/ix-memory-layer:latest"],
               { stdio: "inherit", timeout: 120000 }
             );
-            mkdirSync(IX_HOME, { recursive: true });
-            writeFileSync(BACKEND_VERSION_FILE, backendLatest);
+            // The pull succeeded, so the image DID change: say so, and keep
+            // backendImageChanged true — it gates the Ix#271 re-map nudge, and
+            // suppressing that would leave a new engine reading a graph written
+            // by the old one, which fails by returning empty rather than by
+            // erroring.
+            //
+            // A failed stamp is reported on its own line rather than thrown.
+            // Throwing lands in the bare catch below, which says the PULL
+            // failed and to run `ix docker restart` — a false diagnosis for a
+            // read-only IX_HOME, and one that discards the only message naming
+            // the real cause.
             backendImageChanged = true;
             console.log(`[ok] Backend image updated to ${backendLatest}`);
+            if (!writeVersionStamp(BACKEND_VERSION_FILE, backendLatest)) {
+              console.error(chalk.yellow(stampFailureMessage()));
+            }
           } catch {
             console.error("[!!] Could not pull latest backend image. Run: ix docker restart");
           }

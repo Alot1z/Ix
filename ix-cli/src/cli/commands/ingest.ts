@@ -18,8 +18,10 @@ import { loadIngestionModules } from './ingestion-loader.js';
 import { ensureWorkspaceIdState } from '../bootstrap.js';
 import { detectSystem, repoWorkspaceIdFor, lookupPackage, readPackageNames, readPackageDeps } from '../system.js';
 import { CLIENT_EXPECTED_SCHEMA_VERSION } from '../backend-status.js';
+import { readBackendHealth } from './upgrade.js';
 import { SUPPORTED_EXTENSIONS } from '../supported-extensions.js';
 import { canRenderProgress } from '../stderr.js';
+import { createTypeScriptModuleResolver } from '../ts-module-resolution.js';
 import {
   deterministicId,
   transformIssue,
@@ -163,6 +165,28 @@ function canonicalizeDiscoveredFilePath(filePath: string): string {
   }
 }
 
+/**
+ * True when `candidate` lies inside `root`.
+ *
+ * Both arguments must ALREADY be canonical (realpath'd). This is pure path
+ * arithmetic and so cannot see through a symlink itself — resolving first is
+ * what gives it meaning, and resolving both sides is what keeps it from
+ * rejecting everything when the root is itself reached through a link (macOS
+ * `/var` -> `/private/var`, a home on a network mount, a `~/code` symlink).
+ */
+export function isWithinDiscoveryRoot(root: string, candidate: string): boolean {
+  const relative = nodePath.relative(root, candidate);
+  // Compare path *segments*: a bare `startsWith('..')` also rejects a
+  // legitimate sibling whose name merely begins with dots, e.g. `..shared/`.
+  // `isAbsolute` covers Windows, where `relative` across drives is absolute.
+  return (
+    relative !== '' &&
+    relative !== '..' &&
+    !relative.startsWith(`..${nodePath.sep}`) &&
+    !nodePath.isAbsolute(relative)
+  );
+}
+
 export function dedupeDiscoveredFilePaths(
   filePaths: string[],
   canonicalize: (filePath: string) => string = canonicalizeDiscoveredFilePath,
@@ -178,7 +202,51 @@ export function dedupeDiscoveredFilePaths(
   return deduped;
 }
 
-function tryGitLsFiles(dir: string, recursive: boolean): string[] | null {
+/**
+ * Canonicalize, de-duplicate, and confine discovered paths to `root`.
+ *
+ * Discovery resolves symlinks, so a repository can name files outside itself:
+ * `git ls-files` reports a committed symlink as an ordinary entry and the
+ * `statSync` behind it describes the *target*, so `src/notes.ts` ->
+ * `~/.ssh/id_rsa` is discovered, read, parsed into the graph and sent to the
+ * configured endpoint. `ix ingest --github owner/repo` runs this over
+ * repositories nobody has read, which makes repository contents attacker input.
+ *
+ * (`walkFiles` is not the hole — readdir Dirents describe the link itself, so
+ * `isFile()` is false for a symlink and it is skipped there. Git's list is
+ * the gap.)
+ *
+ * A symlink *within* the tree still resolves and is kept, which is what
+ * monorepos that link packages around depend on. `root` is `undefined` when a
+ * single file was named explicitly: that IS the request, and there is nothing
+ * for it to escape from.
+ *
+ * Kept as one function rather than a filter at the call site so the confinement
+ * cannot be dropped without a test noticing.
+ */
+export function discoverIngestFilePaths(
+  discovered: string[],
+  root: string | undefined,
+  canonicalize: (filePath: string) => string = canonicalizeDiscoveredFilePath,
+): { files: string[]; outsideRoot: number } {
+  const canonical = dedupeDiscoveredFilePaths(discovered, canonicalize);
+  if (root === undefined) return { files: canonical, outsideRoot: 0 };
+  // Canonicalize the root too. Comparing a resolved file against an unresolved
+  // root drops everything whenever the root is itself reached through a link —
+  // macOS `/var` -> `/private/var`, a home on a network mount, a `~/code`
+  // symlink — which would look like "this repo has no source files".
+  const canonicalRoot = canonicalize(root);
+  const files = canonical.filter((candidate) => isWithinDiscoveryRoot(canonicalRoot, candidate));
+  return { files, outsideRoot: canonical.length - files.length };
+}
+
+/**
+ * Exported for the discovery tests: the symlink-containment guarantee is a
+ * property of git-listing -> canonicalize -> confine *composed*, and each step
+ * looks fine alone. A test that cannot run the real listing cannot show that a
+ * committed symlink escapes in the first place.
+ */
+export function tryGitLsFiles(dir: string, recursive: boolean): string[] | null {
   try {
     const result = spawnSync(
       'git',
@@ -770,7 +838,7 @@ export async function ingestFiles(
   const packageRegistry = detectedSystem?.packageRegistry ?? {};
   const packageOf = (mod: string): string | undefined => lookupPackage(packageRegistry, mod);
   const declaredRepoDeps = detectedSystem?.repoDeps;
-  const resolveOpts = systemId ? { repoOf, packageOf, declaredRepoDeps } : undefined;
+  const crossRepoResolveOpts = systemId ? { repoOf, packageOf, declaredRepoDeps } : undefined;
 
   // ── Path-2 separate-ingest stitcher (Ix#225 Half A) ──────────────────
   // Co-ingest already forms cross-repo edges in-batch, so the stitcher only runs
@@ -873,7 +941,7 @@ export async function ingestFiles(
   // absolute→relative source_uri migration, or folding workspace_id into ids).
   // CLIENT_EXPECTED_SCHEMA_VERSION is shared with doctor/upgrade (backend-status).
   try {
-    const health = await client.health();
+    const health = await readBackendHealth(client);
     const serverVersion = (health as any)?.schema_version;
     if (typeof serverVersion === 'number' && serverVersion !== CLIENT_EXPECTED_SCHEMA_VERSION) {
       process.stderr.write(
@@ -971,6 +1039,7 @@ export async function ingestFiles(
   let commitErrors = 0;
   let tooLarge = 0;
   let minifiedLikely = 0;
+  let outsideRoot = 0;
   let latestRev = 0;
   let entitiesParsed = 0;
   let currentWorkLabel = '';
@@ -1038,11 +1107,18 @@ export async function ingestFiles(
       throw new Error(`Path not found: ${resolvedPath}`);
     }
     const stat = fs.statSync(resolvedPath);
-    const filePaths: string[] = dedupeDiscoveredFilePaths(
+    const discovery = discoverIngestFilePaths(
       stat.isFile()
         ? (isSupportedSourceFile(resolvedPath) ? [resolvedPath] : [])
         : (tryGitLsFiles(resolvedPath, opts.recursive ?? true) ?? Array.from(walkFiles(resolvedPath, opts.recursive ?? true))),
+      stat.isFile() ? undefined : resolvedPath,
     );
+    const filePaths: string[] = discovery.files;
+    outsideRoot = discovery.outsideRoot;
+    const resolveOpts = {
+      ...crossRepoResolveOpts,
+      resolveModuleSpecifier: createTypeScriptModuleResolver(workspaceRoot, filePaths),
+    };
 
     filesDiscovered = filePaths.length;
     const discovered = performance.now();
@@ -1935,7 +2011,7 @@ export async function ingestFiles(
       filesSkipped,
       entitiesParsed,
       latestRev,
-      skipReasons: { unchanged: filesSkipped, emptyFile: 0, parseError: parseErrors, tooLarge, minifiedLikely },
+      skipReasons: { unchanged: filesSkipped, emptyFile: 0, parseError: parseErrors, tooLarge, minifiedLikely, outsideRoot },
       commitErrors,
       elapsedSeconds: parseFloat(elapsed),
       timings: {
@@ -1959,6 +2035,9 @@ export async function ingestFiles(
     if (commitErrors > 0) console.log(`  ${chalk.red('commit errors:')}     ${commitErrors}`);
     if (tooLarge > 0) console.log(`  ${chalk.dim('skipped too large:')} ${tooLarge}`);
     if (minifiedLikely > 0) console.log(`  ${chalk.dim('skipped minified:')} ${minifiedLikely}`);
+    // Not dimmed like the others: these were dropped because the repo pointed
+    // at files outside itself, which is worth a look rather than a shrug.
+    if (outsideRoot > 0) console.log(`  ${chalk.yellow('skipped outside root:')} ${outsideRoot} ${chalk.dim('(symlinks leaving the tree)')}`);
     console.log(`  rev:         ${latestRev}`);
 
     if (patchesApplied === 0 && filesDiscovered === 0) {

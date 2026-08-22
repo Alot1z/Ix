@@ -16,6 +16,7 @@ import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { IxClient } from "../client/api.js";
+import { fetchBackendHealth } from "./backend-version.js";
 
 export const BACKEND_IMAGE = "ghcr.io/ix-infrastructure/ix-memory-layer";
 const BACKEND_PORT = "8090";
@@ -136,11 +137,29 @@ export interface BackendSchemaStatus {
   matches: boolean;
 }
 
-/** Read the backend's reported schema_version and compare to what we expect. */
-export async function checkBackendSchema(client: IxClient): Promise<BackendSchemaStatus> {
+/**
+ * Read the backend's reported schema_version and compare to what we expect.
+ *
+ * Also RECORDS the release the backend reports, as a side effect of going
+ * through the shared health fetch — the same as every other health call site.
+ */
+export async function checkBackendSchema(
+  client: IxClient,
+  // REQUIRED, not defaulted. Defaults of `null` + `() => false` turn off the
+  // ceiling AND the no-ceiling fallback at once, so a caller that omitted them
+  // would record any version-shaped claim a local container made — the exact
+  // 99.0.0 case recordBackendRelease exists to refuse. This is a published
+  // export, so "a call site can get it wrong" has to be impossible, not
+  // discouraged.
+  knownLatest: string | null,
+  isNewer: (a: string, b: string) => boolean,
+): Promise<BackendSchemaStatus> {
   const expected = CLIENT_EXPECTED_SCHEMA_VERSION;
   try {
-    const health = await client.health();
+    // Through the chokepoint, so this records like every other health fetch —
+    // there is no cycle: backend-version.ts imports only node builtins and two
+    // erased `import type`s.
+    const health = await fetchBackendHealth(client, knownLatest, isNewer);
     const serverVersion = typeof health.schema_version === "number" ? health.schema_version : null;
     // No reported version (older backend) is treated as a match: we can't prove
     // staleness, and the ingest path already forces a re-ingest when it can.
